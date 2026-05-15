@@ -3,7 +3,7 @@
 package cmd
 
 import (
-	"github.com/SurgeDM/Surge/internal/tui"
+	"github.com/msh2050/fluxget/internal/tui"
 	"github.com/kardianos/service"
 )
 

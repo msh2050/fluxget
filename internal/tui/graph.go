@@ -5,8 +5,8 @@ import (
 	"image/color"
 	"strings"
 
-	"github.com/SurgeDM/Surge/internal/tui/colors"
-	"github.com/SurgeDM/Surge/internal/utils"
+	"github.com/msh2050/fluxget/internal/tui/colors"
+	"github.com/msh2050/fluxget/internal/utils"
 
 	"charm.land/lipgloss/v2"
 )

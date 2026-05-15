@@ -3,8 +3,8 @@ package tui
 import (
 	"charm.land/lipgloss/v2"
 
-	"github.com/SurgeDM/Surge/internal/tui/colors"
-	"github.com/SurgeDM/Surge/internal/tui/components"
+	"github.com/msh2050/fluxget/internal/tui/colors"
+	"github.com/msh2050/fluxget/internal/tui/components"
 )
 
 // renderDownloadsBox generates the download list box with the top-left corner search bar string.

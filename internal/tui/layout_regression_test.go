@@ -16,10 +16,10 @@ import (
 
 	"charm.land/bubbles/v2/list"
 	"charm.land/lipgloss/v2"
-	"github.com/SurgeDM/Surge/internal/engine/types"
-	"github.com/SurgeDM/Surge/internal/processing"
-	"github.com/SurgeDM/Surge/internal/tui/components"
-	"github.com/SurgeDM/Surge/internal/version"
+	"github.com/msh2050/fluxget/internal/engine/types"
+	"github.com/msh2050/fluxget/internal/processing"
+	"github.com/msh2050/fluxget/internal/tui/components"
+	"github.com/msh2050/fluxget/internal/version"
 )
 
 var stripANSI = regexp.MustCompile(`\x1b\[[0-9;]*m`)

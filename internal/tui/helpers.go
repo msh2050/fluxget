@@ -11,10 +11,10 @@ import (
 	"charm.land/bubbles/v2/key"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
-	"github.com/SurgeDM/Surge/internal/config"
-	"github.com/SurgeDM/Surge/internal/engine/types"
-	"github.com/SurgeDM/Surge/internal/processing"
-	"github.com/SurgeDM/Surge/internal/utils"
+	"github.com/msh2050/fluxget/internal/config"
+	"github.com/msh2050/fluxget/internal/engine/types"
+	"github.com/msh2050/fluxget/internal/processing"
+	"github.com/msh2050/fluxget/internal/utils"
 )
 
 // addLogEntry adds a log entry to the log viewport

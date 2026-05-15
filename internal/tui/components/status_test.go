@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/SurgeDM/Surge/internal/tui/colors"
+	"github.com/msh2050/fluxget/internal/tui/colors"
 )
 
 func init() {

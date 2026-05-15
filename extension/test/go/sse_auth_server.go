@@ -9,7 +9,7 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/SurgeDM/Surge/internal/engine/events"
+	"github.com/msh2050/fluxget/internal/engine/events"
 )
 
 func main() {

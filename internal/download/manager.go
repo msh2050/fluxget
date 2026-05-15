@@ -10,13 +10,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/SurgeDM/Surge/internal/config"
-	"github.com/SurgeDM/Surge/internal/engine/concurrent"
-	"github.com/SurgeDM/Surge/internal/engine/events"
-	"github.com/SurgeDM/Surge/internal/engine/single"
-	"github.com/SurgeDM/Surge/internal/engine/types"
-	"github.com/SurgeDM/Surge/internal/processing"
-	"github.com/SurgeDM/Surge/internal/utils"
+	"github.com/msh2050/fluxget/internal/config"
+	"github.com/msh2050/fluxget/internal/engine/concurrent"
+	"github.com/msh2050/fluxget/internal/engine/events"
+	"github.com/msh2050/fluxget/internal/engine/single"
+	"github.com/msh2050/fluxget/internal/engine/types"
+	"github.com/msh2050/fluxget/internal/processing"
+	"github.com/msh2050/fluxget/internal/utils"
 )
 
 // safeSendProgress sends msg on ch, recovering from panics caused by sending

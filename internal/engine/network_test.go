@@ -7,7 +7,7 @@ import (
 	"net/http/httptrace"
 	"testing"
 
-	"github.com/SurgeDM/Surge/internal/engine/types"
+	"github.com/msh2050/fluxget/internal/engine/types"
 )
 
 func TestNetworkPool_Reuse(t *testing.T) {

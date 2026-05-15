@@ -4,7 +4,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/SurgeDM/Surge/internal/engine/types"
+	"github.com/msh2050/fluxget/internal/engine/types"
 )
 
 // TaskQueue is a thread-safe work-stealing queue

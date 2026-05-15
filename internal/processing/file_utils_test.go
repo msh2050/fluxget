@@ -7,9 +7,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/SurgeDM/Surge/internal/config"
-	"github.com/SurgeDM/Surge/internal/engine/types"
-	"github.com/SurgeDM/Surge/internal/processing"
+	"github.com/msh2050/fluxget/internal/config"
+	"github.com/msh2050/fluxget/internal/engine/types"
+	"github.com/msh2050/fluxget/internal/processing"
 )
 
 func TestInferFilenameFromURL(t *testing.T) {

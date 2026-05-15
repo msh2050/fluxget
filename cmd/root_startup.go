@@ -5,9 +5,9 @@ import (
 	"path/filepath"
 	"sync/atomic"
 
-	"github.com/SurgeDM/Surge/internal/config"
-	"github.com/SurgeDM/Surge/internal/engine/state"
-	"github.com/SurgeDM/Surge/internal/utils"
+	"github.com/msh2050/fluxget/internal/config"
+	"github.com/msh2050/fluxget/internal/engine/state"
+	"github.com/msh2050/fluxget/internal/utils"
 )
 
 func runStartupIntegrityCheck() string {

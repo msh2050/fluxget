@@ -3,7 +3,7 @@ package download
 import (
 	"testing"
 
-	"github.com/SurgeDM/Surge/internal/engine/types"
+	"github.com/msh2050/fluxget/internal/engine/types"
 )
 
 func TestWorkerPool_GetStatus_NonExistent(t *testing.T) {

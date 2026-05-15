@@ -9,9 +9,9 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/SurgeDM/Surge/internal/config"
-	"github.com/SurgeDM/Surge/internal/core"
-	"github.com/SurgeDM/Surge/internal/utils"
+	"github.com/msh2050/fluxget/internal/config"
+	"github.com/msh2050/fluxget/internal/core"
+	"github.com/msh2050/fluxget/internal/utils"
 	"github.com/google/uuid"
 )
 
@@ -106,6 +106,15 @@ func corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+func isLoopback(r *http.Request) bool {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 func authMiddleware(token string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Allow health check without auth
@@ -120,15 +129,27 @@ func authMiddleware(token string, next http.Handler) http.Handler {
 			return
 		}
 
-		// Check for Authorization header
+		// Loopback connections (browser extension on same machine) bypass token auth
+		if isLoopback(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// Check Authorization header
 		authHeader := r.Header.Get("Authorization")
-		if authHeader != "" {
-			if strings.HasPrefix(authHeader, "Bearer ") {
-				providedToken := strings.TrimPrefix(authHeader, "Bearer ")
-				if len(providedToken) == len(token) && subtle.ConstantTimeCompare([]byte(providedToken), []byte(token)) == 1 {
-					next.ServeHTTP(w, r)
-					return
-				}
+		if strings.HasPrefix(authHeader, "Bearer ") {
+			providedToken := strings.TrimPrefix(authHeader, "Bearer ")
+			if len(providedToken) == len(token) && subtle.ConstantTimeCompare([]byte(providedToken), []byte(token)) == 1 {
+				next.ServeHTTP(w, r)
+				return
+			}
+		}
+
+		// Allow ?token= query param for browser UI access
+		if qt := r.URL.Query().Get("token"); qt != "" {
+			if len(qt) == len(token) && subtle.ConstantTimeCompare([]byte(qt), []byte(token)) == 1 {
+				next.ServeHTTP(w, r)
+				return
 			}
 		}
 

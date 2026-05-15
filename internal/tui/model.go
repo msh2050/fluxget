@@ -18,13 +18,13 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 
-	"github.com/SurgeDM/Surge/internal/config"
-	"github.com/SurgeDM/Surge/internal/core"
-	"github.com/SurgeDM/Surge/internal/engine/types"
-	"github.com/SurgeDM/Surge/internal/processing"
-	"github.com/SurgeDM/Surge/internal/tui/colors"
-	"github.com/SurgeDM/Surge/internal/tui/components"
-	"github.com/SurgeDM/Surge/internal/version"
+	"github.com/msh2050/fluxget/internal/config"
+	"github.com/msh2050/fluxget/internal/core"
+	"github.com/msh2050/fluxget/internal/engine/types"
+	"github.com/msh2050/fluxget/internal/processing"
+	"github.com/msh2050/fluxget/internal/tui/colors"
+	"github.com/msh2050/fluxget/internal/tui/components"
+	"github.com/msh2050/fluxget/internal/version"
 )
 
 // InitializeTUI prepares global TUI state like styles and component caches.

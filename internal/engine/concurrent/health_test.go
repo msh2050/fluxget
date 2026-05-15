@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/SurgeDM/Surge/internal/engine/types"
+	"github.com/msh2050/fluxget/internal/engine/types"
 )
 
 func TestHealth_LastManStanding(t *testing.T) {

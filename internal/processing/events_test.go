@@ -6,11 +6,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/SurgeDM/Surge/internal/engine/events"
-	"github.com/SurgeDM/Surge/internal/engine/state"
-	"github.com/SurgeDM/Surge/internal/engine/types"
-	"github.com/SurgeDM/Surge/internal/processing"
-	"github.com/SurgeDM/Surge/internal/testutil"
+	"github.com/msh2050/fluxget/internal/engine/events"
+	"github.com/msh2050/fluxget/internal/engine/state"
+	"github.com/msh2050/fluxget/internal/engine/types"
+	"github.com/msh2050/fluxget/internal/processing"
+	"github.com/msh2050/fluxget/internal/testutil"
 )
 
 func TestStartEventWorker_FinalizesCompletedFileUsingDestPath(t *testing.T) {

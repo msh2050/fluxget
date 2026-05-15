@@ -3,7 +3,7 @@ package core
 import (
 	"context"
 
-	"github.com/SurgeDM/Surge/internal/engine/types"
+	"github.com/msh2050/fluxget/internal/engine/types"
 )
 
 // DownloadService defines the interface for interacting with the download engine.

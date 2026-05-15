@@ -4,8 +4,8 @@ import (
 	"fmt"
 
 	"charm.land/lipgloss/v2"
-	"github.com/SurgeDM/Surge/internal/tui/colors"
-	"github.com/SurgeDM/Surge/internal/tui/components"
+	"github.com/msh2050/fluxget/internal/tui/colors"
+	"github.com/msh2050/fluxget/internal/tui/components"
 )
 
 // renderHeaderBox displays the Surge logo and the server connection status within a box.

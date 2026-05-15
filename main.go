@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/SurgeDM/Surge/cmd"
+	"github.com/msh2050/fluxget/cmd"
 )
 
 func main() {

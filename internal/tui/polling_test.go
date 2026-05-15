@@ -7,12 +7,12 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
-	"github.com/SurgeDM/Surge/internal/core"
-	"github.com/SurgeDM/Surge/internal/download"
-	"github.com/SurgeDM/Surge/internal/engine/events"
-	"github.com/SurgeDM/Surge/internal/engine/state"
-	"github.com/SurgeDM/Surge/internal/engine/types"
-	"github.com/SurgeDM/Surge/internal/processing"
+	"github.com/msh2050/fluxget/internal/core"
+	"github.com/msh2050/fluxget/internal/download"
+	"github.com/msh2050/fluxget/internal/engine/events"
+	"github.com/msh2050/fluxget/internal/engine/state"
+	"github.com/msh2050/fluxget/internal/engine/types"
+	"github.com/msh2050/fluxget/internal/processing"
 )
 
 // TestStateSync verifies that the TUI uses the shared state object

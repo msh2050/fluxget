@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/SurgeDM/Surge/internal/engine/types"
+	"github.com/msh2050/fluxget/internal/engine/types"
 )
 
 func TestFinalizeCompletedFile_OverwritesExistingDestinationOnWindows(t *testing.T) {

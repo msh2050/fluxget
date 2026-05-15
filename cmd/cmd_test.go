@@ -13,10 +13,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/SurgeDM/Surge/internal/config"
-	"github.com/SurgeDM/Surge/internal/core"
-	"github.com/SurgeDM/Surge/internal/download"
-	"github.com/SurgeDM/Surge/internal/testutil"
+	"github.com/msh2050/fluxget/internal/config"
+	"github.com/msh2050/fluxget/internal/core"
+	"github.com/msh2050/fluxget/internal/download"
+	"github.com/msh2050/fluxget/internal/testutil"
 )
 
 func init() {

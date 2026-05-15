@@ -7,7 +7,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/SurgeDM/Surge/internal/tui"
+	"github.com/msh2050/fluxget/internal/tui"
 )
 
 // configureServiceUI wires the TUI settings toggle to Termux's runit/sv

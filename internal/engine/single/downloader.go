@@ -9,9 +9,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/SurgeDM/Surge/internal/engine"
-	"github.com/SurgeDM/Surge/internal/engine/types"
-	"github.com/SurgeDM/Surge/internal/utils"
+	"github.com/msh2050/fluxget/internal/engine"
+	"github.com/msh2050/fluxget/internal/engine/types"
+	"github.com/msh2050/fluxget/internal/utils"
 )
 
 // SingleDownloader handles single-threaded downloads for servers that don't support range requests.

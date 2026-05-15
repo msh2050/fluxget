@@ -5,8 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/SurgeDM/Surge/internal/engine/state"
-	"github.com/SurgeDM/Surge/internal/engine/types"
+	"github.com/msh2050/fluxget/internal/engine/state"
+	"github.com/msh2050/fluxget/internal/engine/types"
 )
 
 func TestHandlePause_CompletionBoundary(t *testing.T) {

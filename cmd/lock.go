@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"path/filepath"
 
-	"github.com/SurgeDM/Surge/internal/config"
+	"github.com/msh2050/fluxget/internal/config"
 	"github.com/gofrs/flock"
 )
 

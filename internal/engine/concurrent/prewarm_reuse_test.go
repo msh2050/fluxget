@@ -7,9 +7,9 @@ import (
 	"net/http/httptrace"
 	"testing"
 
-	"github.com/SurgeDM/Surge/internal/engine"
-	"github.com/SurgeDM/Surge/internal/engine/types"
-	"github.com/SurgeDM/Surge/internal/testutil"
+	"github.com/msh2050/fluxget/internal/engine"
+	"github.com/msh2050/fluxget/internal/engine/types"
+	"github.com/msh2050/fluxget/internal/testutil"
 )
 
 func TestPrewarmConnections_Reuse(t *testing.T) {

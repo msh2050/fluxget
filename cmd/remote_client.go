@@ -5,7 +5,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/SurgeDM/Surge/internal/core"
+	"github.com/msh2050/fluxget/internal/core"
 )
 
 const (

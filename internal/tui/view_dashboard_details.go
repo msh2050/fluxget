@@ -1,7 +1,7 @@
 package tui
 
 import (
-	"github.com/SurgeDM/Surge/internal/tui/colors"
+	"github.com/msh2050/fluxget/internal/tui/colors"
 )
 
 // renderDetailsBox returns the file details pane as a btop box.

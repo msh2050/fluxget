@@ -1,0 +1,493 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FluxGet Dashboard</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg:       #0e0f14;
+  --surface:  #16181f;
+  --border:   rgba(255,255,255,0.08);
+  --accent:   #0078d4;
+  --accent-h: #1e90ff;
+  --text:     #e8eaf0;
+  --muted:    #7a7f96;
+  --success:  #22c55e;
+  --error:    #ef4444;
+  --warn:     #f59e0b;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.5 -apple-system, 'Segoe UI', sans-serif;
+  min-height: 100vh;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 20px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+header .logo { font-size: 17px; font-weight: 700; letter-spacing: -0.02em; }
+header .logo span { color: var(--accent); }
+.status-dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: var(--error);
+  transition: background .3s;
+  flex-shrink: 0;
+}
+.status-dot.ok { background: var(--success); }
+header .status-text { font-size: 11px; color: var(--muted); }
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 20px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+.toolbar input {
+  flex: 1;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 6px 10px;
+  font: inherit;
+  outline: none;
+  transition: border-color .15s;
+}
+.toolbar input:focus { border-color: var(--accent); }
+.btn {
+  padding: 6px 14px;
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 600;
+  font-size: 12px;
+  transition: background .12s;
+  white-space: nowrap;
+}
+.btn:hover { background: var(--accent-h); }
+.btn.ghost {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+.btn.ghost:hover { border-color: var(--accent); color: var(--text); background: none; }
+
+main { padding: 16px 20px; }
+
+.empty {
+  text-align: center;
+  padding: 60px 20px;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.download-list { display: flex; flex-direction: column; gap: 8px; }
+
+.dl-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  transition: border-color .15s;
+}
+.dl-card:hover { border-color: rgba(255,255,255,0.15); }
+
+.dl-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.dl-header .filename {
+  flex: 1;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.dl-header .state-badge {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 2px 7px;
+  border-radius: 4px;
+  flex-shrink: 0;
+}
+.state-downloading { background: rgba(0,120,212,0.25); color: #60b4ff; }
+.state-complete    { background: rgba(34,197,94,0.2);  color: #4ade80; }
+.state-error       { background: rgba(239,68,68,0.2);  color: #f87171; }
+.state-queued      { background: rgba(245,158,11,0.2); color: #fbbf24; }
+.state-paused      { background: rgba(120,120,150,0.2); color: #a0a0c0; }
+
+.progress-bar {
+  height: 4px;
+  background: rgba(255,255,255,0.08);
+  border-radius: 2px;
+  overflow: hidden;
+  margin-bottom: 8px;
+}
+.progress-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 2px;
+  transition: width .3s ease;
+}
+.progress-fill.done { background: var(--success); }
+.progress-fill.error { background: var(--error); }
+
+.dl-meta {
+  display: flex;
+  gap: 14px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.dl-meta span { white-space: nowrap; }
+
+.dl-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+}
+.action-btn {
+  padding: 3px 10px;
+  font-size: 11px;
+  font-family: inherit;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+  transition: background .1s, color .1s, border-color .1s;
+}
+.action-btn:hover { background: rgba(255,255,255,0.07); color: var(--text); border-color: rgba(255,255,255,0.2); }
+.action-btn.danger:hover { background: rgba(239,68,68,0.15); color: #f87171; border-color: rgba(239,68,68,0.3); }
+
+.add-modal-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.6);
+  z-index: 1000;
+  align-items: center;
+  justify-content: center;
+}
+.add-modal-overlay.open { display: flex; }
+.add-modal {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 20px;
+  width: min(500px, 96vw);
+  box-shadow: 0 20px 60px rgba(0,0,0,0.7);
+}
+.add-modal h2 { font-size: 15px; margin-bottom: 14px; }
+.add-modal input, .add-modal select {
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 8px 10px;
+  font: inherit;
+  outline: none;
+  margin-bottom: 10px;
+  transition: border-color .15s;
+}
+.add-modal input:focus, .add-modal select:focus { border-color: var(--accent); }
+.add-modal select option { background: var(--surface); }
+.modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 4px; }
+
+.log-section {
+  margin-top: 24px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.log-section h3 {
+  padding: 10px 14px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  border-bottom: 1px solid var(--border);
+}
+.log-lines {
+  max-height: 160px;
+  overflow-y: auto;
+  padding: 8px 14px;
+  font-size: 11px;
+  font-family: 'Cascadia Code', 'Fira Code', monospace;
+  color: var(--muted);
+}
+.log-lines p { padding: 1px 0; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="status-dot" id="statusDot"></div>
+  <div class="logo">Flux<span>Get</span></div>
+  <div class="status-text" id="statusText">Connecting…</div>
+</header>
+
+<div class="toolbar">
+  <input type="url" id="quickUrl" placeholder="Paste URL to download…" autocomplete="off">
+  <button class="btn" onclick="quickAdd()">Download</button>
+  <button class="btn ghost" onclick="openAddModal()">+ Stream</button>
+</div>
+
+<main>
+  <div id="dlList" class="download-list"></div>
+  <div id="empty" class="empty" style="display:none">No active downloads — paste a URL above or use the FluxGet browser extension.</div>
+  <div class="log-section">
+    <h3>System log</h3>
+    <div class="log-lines" id="logLines"></div>
+  </div>
+</main>
+
+<div class="add-modal-overlay" id="addModal">
+  <div class="add-modal">
+    <h2>Download Stream / Video</h2>
+    <input type="url" id="modalUrl" placeholder="https://…" autocomplete="off">
+    <input type="text" id="modalTitle" placeholder="Title (optional)">
+    <select id="modalType">
+      <option value="stream">Auto-detect (HLS/DASH/Video)</option>
+      <option value="ytdlp">Force yt-dlp</option>
+    </select>
+    <div class="modal-actions">
+      <button class="btn ghost" onclick="closeAddModal()">Cancel</button>
+      <button class="btn" onclick="submitModal()">Start</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── State ─────────────────────────────────────────────────────────────────────
+const BASE = '';
+const downloads = new Map(); // id → { filename, state, downloaded, total, speed, destPath, error }
+let sseConnected = false;
+
+// ── SSE ───────────────────────────────────────────────────────────────────────
+function connectSSE() {
+  const es = new EventSource(BASE + '/events');
+
+  es.addEventListener('queued', e => {
+    const d = JSON.parse(e.data);
+    setDownload(d.DownloadID, { filename: d.Filename, url: d.URL, state: 'queued', downloaded: 0, total: 0, speed: 0, destPath: d.DestPath });
+  });
+  es.addEventListener('started', e => {
+    const d = JSON.parse(e.data);
+    patchDownload(d.DownloadID, { state: 'downloading', filename: d.Filename || undefined });
+  });
+  es.addEventListener('progress', e => {
+    const d = JSON.parse(e.data);
+    patchDownload(d.DownloadID, { state: 'downloading', downloaded: d.Downloaded, total: d.Total, speed: d.Speed });
+  });
+  es.addEventListener('complete', e => {
+    const d = JSON.parse(e.data);
+    patchDownload(d.DownloadID, { state: 'complete', downloaded: d.Total, total: d.Total, speed: 0 });
+  });
+  es.addEventListener('error', e => {
+    const d = JSON.parse(e.data);
+    patchDownload(d.DownloadID, { state: 'error', error: d.Err });
+  });
+  es.addEventListener('paused', e => {
+    const d = JSON.parse(e.data);
+    patchDownload(d.DownloadID, { state: 'paused' });
+  });
+  es.addEventListener('resumed', e => {
+    const d = JSON.parse(e.data);
+    patchDownload(d.DownloadID, { state: 'downloading' });
+  });
+  es.addEventListener('removed', e => {
+    const d = JSON.parse(e.data);
+    downloads.delete(d.DownloadID);
+    render();
+  });
+  es.addEventListener('system', e => {
+    const d = JSON.parse(e.data);
+    addLog(d.Message);
+  });
+
+  es.onopen = () => { sseConnected = true; updateStatusDot(true); };
+  es.onerror = () => { sseConnected = false; updateStatusDot(false); setTimeout(connectSSE, 3000); es.close(); };
+}
+
+function setDownload(id, data) { downloads.set(id, data); render(); }
+function patchDownload(id, patch) {
+  const existing = downloads.get(id) || {};
+  downloads.set(id, Object.assign({}, existing, patch));
+  render();
+}
+
+// ── Render ────────────────────────────────────────────────────────────────────
+function render() {
+  const list = document.getElementById('dlList');
+  const empty = document.getElementById('empty');
+
+  if (downloads.size === 0) {
+    list.innerHTML = '';
+    empty.style.display = '';
+    return;
+  }
+  empty.style.display = 'none';
+
+  // Sort: downloading first, then queued, paused, complete, error
+  const order = { downloading: 0, queued: 1, paused: 2, complete: 3, error: 4 };
+  const sorted = [...downloads.entries()].sort((a, b) => (order[a[1].state]||9) - (order[b[1].state]||9));
+
+  list.innerHTML = sorted.map(([id, d]) => cardHTML(id, d)).join('');
+}
+
+function cardHTML(id, d) {
+  const pct = d.total > 0 ? Math.min(100, (d.downloaded / d.total) * 100) : (d.state === 'complete' ? 100 : 0);
+  const stateClass = { downloading: 'state-downloading', complete: 'state-complete', error: 'state-error', queued: 'state-queued', paused: 'state-paused' }[d.state] || 'state-queued';
+  const fillClass = d.state === 'complete' ? 'done' : d.state === 'error' ? 'error' : '';
+
+  const meta = [];
+  if (d.total > 0) meta.push(fmtBytes(d.downloaded) + ' / ' + fmtBytes(d.total));
+  else if (d.downloaded > 0) meta.push(fmtBytes(d.downloaded));
+  if (d.speed > 0) meta.push(fmtBytes(d.speed) + '/s');
+  if (d.error) meta.push('Error: ' + d.error);
+
+  const canPause   = d.state === 'downloading';
+  const canResume  = d.state === 'paused';
+  const canDelete  = true;
+
+  return `<div class="dl-card" id="dl-${id}">
+    <div class="dl-header">
+      <span class="filename" title="${esc(d.filename)}">${esc(d.filename)}</span>
+      <span class="state-badge ${stateClass}">${d.state}</span>
+    </div>
+    <div class="progress-bar"><div class="progress-fill ${fillClass}" style="width:${pct}%"></div></div>
+    <div class="dl-meta">${meta.map(m => `<span>${esc(m)}</span>`).join('')}</div>
+    <div class="dl-actions">
+      ${canPause  ? `<button class="action-btn" onclick="api('/pause','${id}')">Pause</button>` : ''}
+      ${canResume ? `<button class="action-btn" onclick="api('/resume','${id}')">Resume</button>` : ''}
+      ${canDelete ? `<button class="action-btn danger" onclick="api('/delete','${id}')">Remove</button>` : ''}
+    </div>
+  </div>`;
+}
+
+// ── API helpers ───────────────────────────────────────────────────────────────
+async function api(path, id) {
+  try {
+    await fetch(BASE + path + '?id=' + encodeURIComponent(id), { method: 'POST' });
+  } catch (e) { console.error(e); }
+}
+
+async function quickAdd() {
+  const url = document.getElementById('quickUrl').value.trim();
+  if (!url) return;
+  document.getElementById('quickUrl').value = '';
+  await startDownload(url, '', 'auto');
+}
+
+async function submitModal() {
+  const url   = document.getElementById('modalUrl').value.trim();
+  const title = document.getElementById('modalTitle').value.trim();
+  const type  = document.getElementById('modalType').value;
+  if (!url) return;
+  closeAddModal();
+  await startDownload(url, title, type);
+}
+
+async function startDownload(url, title, type) {
+  const isVideo = /\.(m3u8|mpd|mp4|mkv|webm|avi|mov|flv|m4v)(\?|$)/i.test(url)
+    || /youtube\.com|youtu\.be|vimeo\.com|dailymotion\.com|twitch\.tv|tiktok\.com/i.test(url);
+
+  const endpoint = (type === 'ytdlp' || (type === 'auto' && isVideo)) ? '/ytdlp' : '/download';
+  const body     = endpoint === '/ytdlp'
+    ? { url, title }
+    : { url, filename: title || '', skip_approval: true };
+
+  try {
+    const r = await fetch(BASE + endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) {
+      const txt = await r.text();
+      addLog('Error starting download: ' + txt);
+    }
+  } catch (e) {
+    addLog('Network error: ' + e.message);
+  }
+}
+
+// ── Add modal ─────────────────────────────────────────────────────────────────
+function openAddModal() { document.getElementById('addModal').classList.add('open'); document.getElementById('modalUrl').focus(); }
+function closeAddModal() { document.getElementById('addModal').classList.remove('open'); }
+document.getElementById('addModal').addEventListener('click', e => { if (e.target === e.currentTarget) closeAddModal(); });
+
+// ── Log ───────────────────────────────────────────────────────────────────────
+function addLog(msg) {
+  const el = document.getElementById('logLines');
+  const p = document.createElement('p');
+  p.textContent = '[' + new Date().toLocaleTimeString() + '] ' + msg;
+  el.prepend(p);
+  while (el.children.length > 80) el.removeChild(el.lastChild);
+}
+
+// ── Status dot ────────────────────────────────────────────────────────────────
+function updateStatusDot(ok) {
+  document.getElementById('statusDot').classList.toggle('ok', ok);
+  document.getElementById('statusText').textContent = ok ? 'Connected' : 'Reconnecting…';
+}
+
+// ── Load existing downloads on page open ─────────────────────────────────────
+async function loadList() {
+  try {
+    const r = await fetch(BASE + '/list');
+    if (!r.ok) return;
+    const list = await r.json();
+    (list || []).forEach(item => {
+      setDownload(item.id || item.ID, {
+        filename: item.filename || item.Filename || '',
+        state: item.status || 'downloading',
+        downloaded: item.downloaded || 0,
+        total: item.total || 0,
+        speed: item.speed || 0,
+        destPath: item.dest_path || '',
+      });
+    });
+  } catch (_) {}
+}
+
+// ── Utils ─────────────────────────────────────────────────────────────────────
+function fmtBytes(b) {
+  if (b >= 1e9) return (b/1e9).toFixed(2) + ' GB';
+  if (b >= 1e6) return (b/1e6).toFixed(1) + ' MB';
+  if (b >= 1e3) return (b/1e3).toFixed(1) + ' KB';
+  return b + ' B';
+}
+function esc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+connectSSE();
+loadList();
+</script>
+</body>
+</html>

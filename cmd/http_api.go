@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,9 +11,12 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/SurgeDM/Surge/internal/core"
-	"github.com/SurgeDM/Surge/internal/engine/events"
-	"github.com/SurgeDM/Surge/internal/utils"
+	"github.com/msh2050/fluxget/internal/core"
+	"github.com/msh2050/fluxget/internal/engine/events"
+	"github.com/msh2050/fluxget/internal/stream"
+	"github.com/msh2050/fluxget/internal/utils"
+	"github.com/msh2050/fluxget/internal/webui"
+	"github.com/msh2050/fluxget/internal/ytdlp"
 )
 
 var (
@@ -22,6 +26,10 @@ var (
 )
 
 func registerHTTPRoutes(mux *http.ServeMux, port int, defaultOutputDir string, service core.DownloadService) {
+	mux.HandleFunc("/ytdlp", func(w http.ResponseWriter, r *http.Request) {
+		handleYtDlp(w, r, defaultOutputDir, service)
+	})
+
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSONResponse(w, http.StatusOK, map[string]interface{}{
 			"status": "ok",
@@ -122,6 +130,15 @@ func registerHTTPRoutes(mux *http.ServeMux, port int, defaultOutputDir string, s
 
 		writeJSONResponse(w, http.StatusOK, map[string]string{"status": "ok", "id": id})
 	})))
+
+	// POST /stream — native HLS/DASH downloader with ffmpeg mux, yt-dlp fallback
+	mux.HandleFunc("/stream", func(w http.ResponseWriter, r *http.Request) {
+		handleStream(w, r, defaultOutputDir, service)
+	})
+
+	// GET /ui — web dashboard
+	mux.Handle("/ui", webui.Handler())
+	mux.Handle("/ui/", webui.Handler())
 
 	mux.HandleFunc("/update-url", requireMethod(http.MethodPut, withRequiredID(func(w http.ResponseWriter, r *http.Request, id string) {
 		var req map[string]string
@@ -303,4 +320,167 @@ func decodeJSONBody(r *http.Request, dst interface{}) error {
 		_ = r.Body.Close()
 	}()
 	return json.NewDecoder(r.Body).Decode(dst)
+}
+
+// handleStream handles POST /stream — auto-detects URL type and picks the best
+// download strategy: native HLS/DASH parser, YouTube adaptive formats, or yt-dlp fallback.
+func handleStream(w http.ResponseWriter, r *http.Request, defaultOutputDir string, service core.DownloadService) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if service == nil {
+		http.Error(w, "Service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	var req struct {
+		URL      string            `json:"url"`
+		Title    string            `json:"title"`
+		Path     string            `json:"path"`
+		Headers  map[string]string `json:"headers"`
+		Formats  []stream.Format   `json:"formats"`
+		YtFormat string            `json:"ytFormat"` // yt-dlp format selector, e.g. "bestvideo[height<=1080]+bestaudio/best"
+	}
+	if err := decodeJSONBody(r, &req); err != nil {
+		http.Error(w, "Invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.URL == "" {
+		http.Error(w, "url is required", http.StatusBadRequest)
+		return
+	}
+	if !strings.HasPrefix(req.URL, "http://") && !strings.HasPrefix(req.URL, "https://") {
+		http.Error(w, "Only http/https URLs supported", http.StatusBadRequest)
+		return
+	}
+
+	destDir := req.Path
+	if destDir == "" {
+		destDir = defaultOutputDir
+	}
+
+	u := strings.ToLower(req.URL)
+	isManifest := strings.Contains(u, ".m3u8") || strings.Contains(u, ".mpd") ||
+		strings.Contains(u, "mpegurl") || strings.Contains(u, "dash+xml")
+	hasFormats := len(req.Formats) > 0
+
+	// Use native stream engine for: manifest URLs, or when extension provided direct YouTube format URLs
+	if isManifest || hasFormats {
+		id, err := stream.Start(context.Background(), service, stream.Request{
+			URL:     req.URL,
+			Title:   req.Title,
+			DestDir: destDir,
+			Headers: req.Headers,
+			Formats: req.Formats,
+		})
+		if err != nil {
+			publishSystemLog("stream error: " + err.Error())
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		publishSystemLog(fmt.Sprintf("stream started: %s", req.URL))
+		writeJSONResponse(w, http.StatusOK, map[string]string{"status": "queued", "id": id})
+		return
+	}
+
+	// For platform pages (YouTube, Vimeo, etc.) fall back to yt-dlp
+	if ytdlp.NeedsYtDlp(req.URL) || req.YtFormat != "" {
+		id, err := ytdlp.Start(context.Background(), service, ytdlp.Request{
+			URL:     req.URL,
+			Title:   req.Title,
+			Format:  req.YtFormat,
+			DestDir: destDir,
+			Headers: req.Headers,
+		})
+		if err != nil {
+			publishSystemLog("yt-dlp error: " + err.Error())
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		publishSystemLog(fmt.Sprintf("yt-dlp started: %s", req.URL))
+		writeJSONResponse(w, http.StatusOK, map[string]string{"status": "queued", "id": id})
+		return
+	}
+
+	// Direct video URL — use native stream engine (single-connection download)
+	id, err := stream.Start(context.Background(), service, stream.Request{
+		URL:     req.URL,
+		Title:   req.Title,
+		DestDir: destDir,
+		Headers: req.Headers,
+	})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]string{"status": "queued", "id": id})
+}
+
+// handleYtDlp handles POST /ytdlp — starts a yt-dlp download for video URLs.
+// The extension sends video/stream URLs here; regular file downloads go to /download.
+func handleYtDlp(w http.ResponseWriter, r *http.Request, defaultOutputDir string, service core.DownloadService) {
+	// CORS preflight
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		URL     string            `json:"url"`
+		Title   string            `json:"title"`
+		Format  string            `json:"format"`
+		Path    string            `json:"path"`
+		Headers map[string]string `json:"headers"`
+	}
+	if err := decodeJSONBody(r, &req); err != nil {
+		http.Error(w, "Invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.URL == "" {
+		http.Error(w, "url is required", http.StatusBadRequest)
+		return
+	}
+	if !strings.HasPrefix(req.URL, "http://") && !strings.HasPrefix(req.URL, "https://") {
+		http.Error(w, "Only http/https URLs supported", http.StatusBadRequest)
+		return
+	}
+
+	destDir := req.Path
+	if destDir == "" {
+		destDir = defaultOutputDir
+	}
+
+	id, err := ytdlp.Start(context.Background(), service, ytdlp.Request{
+		URL:     req.URL,
+		Title:   req.Title,
+		Format:  req.Format,
+		DestDir: destDir,
+		Headers: req.Headers,
+	})
+	if err != nil {
+		publishSystemLog("yt-dlp error: " + err.Error())
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	publishSystemLog(fmt.Sprintf("yt-dlp started: %s", req.URL))
+	writeJSONResponse(w, http.StatusOK, map[string]string{
+		"status": "queued",
+		"id":     id,
+	})
 }

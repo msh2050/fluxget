@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  width: 420px; min-height: 80px; max-height: 560px;
+  font-family: -apple-system, 'Segoe UI', sans-serif;
+  background: #18191e; color: #e8eaf0; font-size: 12px;
+  overflow: hidden; display: flex; flex-direction: column;
+}
+
+/* ── Header ── */
+.header {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 14px; background: #0f1014;
+  border-bottom: 1px solid #2a2b32; flex-shrink: 0;
+}
+.logo { font-size: 13px; font-weight: 700; letter-spacing: -.02em; flex: 1; }
+.logo span { color: #0078d4; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: #e74c3c; flex-shrink: 0; }
+.dot.on { background: #2ecc71; box-shadow: 0 0 5px #2ecc71; }
+#statusText { font-size: 10px; color: #666; }
+
+/* ── Toolbar ── */
+.toolbar {
+  display: flex; align-items: center; gap: 6px;
+  padding: 7px 14px; background: #111215;
+  border-bottom: 1px solid #222; flex-shrink: 0;
+}
+.toolbar-btn {
+  display: flex; align-items: center; gap: 4px;
+  padding: 4px 10px; border-radius: 5px;
+  border: 1px solid #333; background: #1e1f26;
+  color: #ccc; font-size: 11px; cursor: pointer;
+  transition: background .12s, border-color .12s;
+}
+.toolbar-btn:hover { background: #0078d4; border-color: #0078d4; color: #fff; }
+.toolbar-btn.danger:hover { background: #c0392b; border-color: #c0392b; }
+#videoCount { font-size: 10px; color: #555; margin-left: auto; }
+
+/* ── Video list ── */
+#videoList {
+  flex: 1; overflow-y: auto; overflow-x: hidden;
+  scrollbar-width: thin; scrollbar-color: #333 transparent;
+}
+.empty {
+  display: flex; flex-direction: column; align-items: center;
+  justify-content: center; gap: 8px; padding: 28px 20px;
+  color: #444; text-align: center;
+}
+.empty-icon { font-size: 28px; opacity: .4; }
+.empty p { font-size: 11px; line-height: 1.5; color: #555; }
+
+/* ── Video item ── */
+.video-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 12px; border-bottom: 1px solid #1e1f26;
+  transition: background .1s;
+}
+.video-item:hover { background: #1c1d24; }
+
+.thumb {
+  width: 64px; height: 40px; flex-shrink: 0;
+  background: #0f1014; border-radius: 4px; overflow: hidden;
+  display: flex; align-items: center; justify-content: center;
+  position: relative; border: 1px solid #2a2b32;
+}
+.thumb img { width: 100%; height: 100%; object-fit: cover; }
+.thumb-icon { font-size: 16px; opacity: .3; }
+.duration {
+  position: absolute; bottom: 2px; right: 3px;
+  background: rgba(0,0,0,.75); color: #fff;
+  font-size: 9px; padding: 1px 3px; border-radius: 2px;
+}
+
+.video-info { flex: 1; min-width: 0; }
+.video-title {
+  font-size: 11px; font-weight: 500; color: #dde;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  max-width: 220px; margin-bottom: 5px;
+}
+.video-meta { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
+
+.fmt-badge {
+  font-size: 9px; font-weight: 700; padding: 1px 5px;
+  border-radius: 3px; flex-shrink: 0; letter-spacing: .04em;
+}
+.fmt-hls  { background: #0f4c75; color: #7ec8e3; }
+.fmt-dash { background: #2c1654; color: #c39bd3; }
+.fmt-mp4  { background: #1e4d2b; color: #7dcea0; }
+.fmt-fmt  { background: #4a3728; color: #d4a574; }
+
+.quality-select {
+  background: #1e1f26; border: 1px solid #333; color: #ccc;
+  font-size: 11px; border-radius: 4px; padding: 2px 4px;
+  cursor: pointer; max-width: 70px;
+}
+.quality-select:focus { outline: none; border-color: #0078d4; }
+
+.dl-btn {
+  display: flex; align-items: center; gap: 4px;
+  padding: 4px 10px; background: #0078d4;
+  border: none; border-radius: 5px; color: #fff;
+  font-size: 11px; font-weight: 600; cursor: pointer;
+  white-space: nowrap; flex-shrink: 0;
+  transition: background .12s;
+}
+.dl-btn:hover { background: #1e90ff; }
+.dl-btn:active { background: #005fa3; }
+
+.more-btn {
+  width: 24px; height: 24px; display: flex; align-items: center;
+  justify-content: center; background: none; border: none;
+  color: #555; cursor: pointer; border-radius: 4px;
+  font-size: 14px; flex-shrink: 0;
+  transition: background .1s, color .1s;
+}
+.more-btn:hover { background: #2a2b32; color: #ccc; }
+
+/* ── Footer ── */
+.footer {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 14px; background: #0f1014;
+  border-top: 1px solid #1e1f26; flex-shrink: 0;
+}
+.footer-tip { font-size: 10px; color: #444; flex: 1; }
+.open-ui-btn {
+  font-size: 10px; color: #0078d4; background: none;
+  border: none; cursor: pointer; padding: 0;
+  text-decoration: none;
+}
+.open-ui-btn:hover { color: #1e90ff; text-decoration: underline; }
+</style>
+</head>
+<body>
+<div class="header">
+  <div class="logo">Flux<span>Get</span></div>
+  <span id="statusText">Checking…</span>
+  <div class="dot" id="dot"></div>
+</div>
+
+<div class="toolbar">
+  <button class="toolbar-btn" id="btnRefresh">⟳ Refresh</button>
+  <button class="toolbar-btn" id="btnDlAll">⬇ Download All</button>
+  <button class="toolbar-btn danger" id="btnClear">✕ Clear</button>
+  <span id="videoCount"></span>
+</div>
+
+<div id="videoList">
+  <div class="empty" id="emptyState">
+    <div class="empty-icon">📡</div>
+    <p>No videos detected yet.<br>Browse to a page with video to capture streams.</p>
+  </div>
+</div>
+
+<div class="footer">
+  <span class="footer-tip">Right-click any link → Download with FluxGet</span>
+  <button class="open-ui-btn" id="btnOpenUI">Open Dashboard ↗</button>
+</div>
+
+<script src="popup.js"></script>
+</body>
+</html>

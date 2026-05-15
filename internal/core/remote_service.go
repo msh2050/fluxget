@@ -12,9 +12,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/SurgeDM/Surge/internal/engine/events"
-	"github.com/SurgeDM/Surge/internal/engine/types"
-	"github.com/SurgeDM/Surge/internal/utils"
+	"github.com/msh2050/fluxget/internal/engine/events"
+	"github.com/msh2050/fluxget/internal/engine/types"
+	"github.com/msh2050/fluxget/internal/utils"
 )
 
 // RemoteDownloadService implements DownloadService for a remote daemon.

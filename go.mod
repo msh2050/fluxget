@@ -1,4 +1,4 @@
-module github.com/SurgeDM/Surge
+module github.com/msh2050/fluxget
 
 go 1.25.0
 

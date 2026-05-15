@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/SurgeDM/Surge/internal/utils"
+	"github.com/msh2050/fluxget/internal/utils"
 )
 
 // Settings holds all user-configurable application settings organized by category.
@@ -247,10 +247,10 @@ func DefaultSettings() *Settings {
 		},
 		Extension: ExtensionSettings{
 			ExtensionPrompt:     true,
-			ChromeExtensionURL:  "https://github.com/SurgeDM/Surge/releases/latest",
+			ChromeExtensionURL:  "https://github.com/msh2050/fluxget/releases/latest",
 			FirefoxExtensionURL: "https://addons.mozilla.org/en-US/firefox/addon/surge/",
 			AuthToken:           "", // Handled specially in TUI
-			InstructionsURL:     "https://github.com/SurgeDM/Surge#browser-extension",
+			InstructionsURL:     "https://github.com/msh2050/fluxget#browser-extension",
 		},
 	}
 }

@@ -1,7 +1,7 @@
 package tui
 
 import (
-	"github.com/SurgeDM/Surge/internal/version"
+	"github.com/msh2050/fluxget/internal/version"
 )
 
 // notificationTickMsg is sent to check if a notification should be cleared

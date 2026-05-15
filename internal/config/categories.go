@@ -7,7 +7,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/SurgeDM/Surge/internal/utils"
+	"github.com/msh2050/fluxget/internal/utils"
 )
 
 // Category defines a download category for auto-sorting.

@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/SurgeDM/Surge/internal/testutil"
+	"github.com/msh2050/fluxget/internal/testutil"
 )
 
 // TestMirrors_CLI_Integration verifies that the processDownloads function (used by CLI)

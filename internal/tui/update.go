@@ -1,8 +1,8 @@
 package tui
 
 import (
-	"github.com/SurgeDM/Surge/internal/config"
-	"github.com/SurgeDM/Surge/internal/utils"
+	"github.com/msh2050/fluxget/internal/config"
+	"github.com/msh2050/fluxget/internal/utils"
 
 	"charm.land/lipgloss/v2"
 

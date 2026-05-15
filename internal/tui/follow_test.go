@@ -4,8 +4,8 @@ import (
 	"testing"
 
 	"charm.land/bubbles/v2/viewport"
-	"github.com/SurgeDM/Surge/internal/engine/events"
-	"github.com/SurgeDM/Surge/internal/engine/types"
+	"github.com/msh2050/fluxget/internal/engine/events"
+	"github.com/msh2050/fluxget/internal/engine/types"
 )
 
 func TestAutoFollow_BrandNewDownload(t *testing.T) {

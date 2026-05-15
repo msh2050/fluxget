@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/SurgeDM/Surge/internal/engine/types"
-	"github.com/SurgeDM/Surge/internal/testutil"
+	"github.com/msh2050/fluxget/internal/engine/types"
+	"github.com/msh2050/fluxget/internal/testutil"
 )
 
 func TestConcurrentDownloader_ProxySupport(t *testing.T) {

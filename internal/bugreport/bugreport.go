@@ -7,10 +7,10 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/SurgeDM/Surge/internal/config"
+	"github.com/msh2050/fluxget/internal/config"
 )
 
-const newIssueURL = "https://github.com/SurgeDM/Surge/issues/new"
+const newIssueURL = "https://github.com/msh2050/fluxget/issues/new"
 
 const extensionTemplate = "extension_bug_report.md"
 

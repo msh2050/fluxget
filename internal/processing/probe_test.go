@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/SurgeDM/Surge/internal/config"
-	"github.com/SurgeDM/Surge/internal/processing"
+	"github.com/msh2050/fluxget/internal/config"
+	"github.com/msh2050/fluxget/internal/processing"
 )
 
 func TestProbeServer_UsesConfiguredProxy(t *testing.T) {

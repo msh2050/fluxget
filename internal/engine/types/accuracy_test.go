@@ -3,7 +3,7 @@ package types_test
 import (
 	"testing"
 
-	"github.com/SurgeDM/Surge/internal/engine/types"
+	"github.com/msh2050/fluxget/internal/engine/types"
 )
 
 func TestChunkAccuracy(t *testing.T) {

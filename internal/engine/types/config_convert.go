@@ -1,6 +1,6 @@
 package types
 
-import "github.com/SurgeDM/Surge/internal/config"
+import "github.com/msh2050/fluxget/internal/config"
 
 // ConvertRuntimeConfig converts the app-level RuntimeConfig to the engine-level RuntimeConfig.
 func ConvertRuntimeConfig(rc *config.RuntimeConfig) *RuntimeConfig {
