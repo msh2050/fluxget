@@ -1,293 +1,262 @@
 <div align="center">
 
-# Surge
+# FluxGet
 
-**Blazing fast TUI download manager built in Go for power users**
+**Download manager with native HLS/DASH streaming and browser extension**
 
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/SurgeDM/Surge)
-[![Release](https://img.shields.io/github/v/release/SurgeDM/Surge?style=flat-square&color=blue)](https://github.com/SurgeDM/Surge/releases)
-[![Go Version](https://img.shields.io/github/go-mod/go-version/SurgeDM/Surge?style=flat-square&color=cyan)](go.mod)
+[![Go Version](https://img.shields.io/github/go-mod/go-version/msh2050/fluxget?style=flat-square&color=cyan)](go.mod)
 [![License](https://img.shields.io/badge/License-MIT-grey.svg?style=flat-square)](LICENSE)
-[![BuyMeACoffee](https://raw.githubusercontent.com/pachadotdev/buymeacoffee-badges/main/bmc-violet.svg)](https://www.buymeacoffee.com/surge.downloader)
-[![Stars](https://img.shields.io/github/stars/SurgeDM/Surge?style=social)](https://github.com/SurgeDM/Surge/stargazers)
 
-[Installation](#installation) • [Usage](#usage) • [Themes](docs/THEMES.md) • [Fonts](docs/FONTS.md) • [Benchmarks](#benchmarks) • [Extension](#browser-extension) • [Settings](docs/SETTINGS.md) • [CLI Reference](docs/USAGE.md)
+[What is this](#what-is-this) • [Why fork](#why-fork-from-surge) • [Features](#features) • [Quick Start](#quick-start) • [Browser Extension](#browser-extension) • [HTTP API](#http-api) • [Architecture](#architecture) • [Credits](#credits--acknowledgements)
 
 </div>
 
 ---
 
-## What is Surge?
+## What is this?
 
-Surge is designed for power users who prefer a keyboard-driven workflow. It features a beautiful **Terminal User Interface (TUI)**, as well as a background **Headless Server** and a **CLI tool** for automation.
+FluxGet is a **vibe-coded** download manager built in Go with a browser extension that captures video streams from YouTube, Vimeo, Twitch, and 30+ platforms. It handles HLS, DASH, and direct video downloads natively — no third-party download helper required for most sites.
 
-![Surge Demo](assets/demo.gif)
+It is forked from [Surge](https://github.com/SurgeDM/Surge), a fast multi-connection TUI downloader. FluxGet keeps the entire Surge engine and adds a full video/stream interception layer on top.
 
----
-
-## Why use Surge?
-
-Most browsers open a single connection for a download. Surge opens multiple (up to 32), splits the file, and downloads chunks in parallel. But we take it a step further:
-
-- **Blazing Fast:** Designed to maximize your bandwidth utilization and download files as quickly as possible.
-- **Multiple Mirrors:** Download from multiple sources simultaneously. Surge distributes workers across all available mirrors and automatically handles failover.
-- **Sequential Download:** Option to download files in strict order (Streaming Mode). Ideal for media files that you want to preview while downloading.
-- **Daemon Architecture:** Surge runs a single background "engine." You can open 10 different terminal tabs and queue downloads; they all funnel into one efficient manager.
-- **Beautiful TUI:** Built with Bubble Tea & Lipgloss, featuring customizable palettes and full theme engine support.
-
-For a deep dive into how we make downloads faster (like work stealing and slow worker handling), check out our **[Optimization Guide](docs/OPTIMIZATIONS.md)**.
+> **Vibe development** — this project was built through conversation with Claude (Anthropic). The goal was to build a download manager that intercepts browser video streams the same way professional download managers do, using open standards and public browser APIs.
 
 ---
 
-## Support the Project
+## Why fork from Surge?
 
-We are just two CS students building Surge in between classes and exams. We love working on this, but maintaining a project of this scale takes time and resources. That's where you come in!
+[Surge](https://github.com/SurgeDM/Surge) is an excellent multi-connection file downloader with a beautiful TUI. We forked it because our additions are too different in scope for a PR:
 
-If Surge saves you time, consider supporting the development! Donations go directly toward:
+- Surge is a **file downloader** with a TUI — keyboard-driven, terminal-native
+- FluxGet adds a **video stream interception layer**, browser extension, HLS/DASH native engine, and an HTTP API designed to be called from a browser extension
 
-- **Publishing the Extension:** Paying the Chrome Web Store fee so you can finally install the extension officially (no more sideloading!).
-- **Dev Tools:** Licenses for tools like **GoReleaser Pro** to help us automate our builds.
-- **Debrid Integration:** Covering subscription costs so we can test and build native Debrid support.
+The Surge engine (parallel chunks, mirrors, speed graphs, TUI) is entirely intact. FluxGet just wraps it with a video-capture interface on top.
 
-[**☕ Buy us a coffee**](https://www.buymeacoffee.com/surge.downloader)
-
-_Totally optional—your stars, issues, and contributions already mean the world to us! :)_
+If you just want a fast terminal downloader, use [Surge](https://github.com/SurgeDM/Surge). If you want to capture and download video streams from your browser, use FluxGet.
 
 ---
 
-## Installation
+## Features
 
-Surge is available on multiple platforms. Choose the method that works best for you.
+### What FluxGet adds over Surge
 
-| Platform / Method                  | Command / Instructions                                                           | Notes                                        |
-| :--------------------------------- | :------------------------------------------------------------------------------- | :------------------------------------------- |
-| **Prebuilt Binary**          | [Download from Releases](https://github.com/SurgeDM/Surge/releases/latest) | Easiest method. Just download and run.       |
-| **Arch Linux (AUR)**         | `yay -S surge`                                                                 | Managed via AUR.                             |
-| **macOS / Linux (Homebrew)** | `brew install SurgeDM/tap/surge`                                      | Recommended for Mac/Linux users.             |
-| **Nix / NixOS**              | `nix run github:SurgeDM/Surge`                                        | Via Nix flake. NixOS config: `inputs.surge.packages.${pkgs.system}.default` |
-| **Windows**         | `winget install surge-downloader.surge`<br />or<br />`scoop install surge` | Recommended for Windows users.               |
-| **Dockerfile**               | [See instructions](#4-server-mode-with-docker-compose)                              | Run Surge in server mode with Docker Compose |
-| **Go Install**               | `go install github.com/SurgeDM/Surge@latest`                          | Requires Go 1.25+                           |
+| Feature | Details |
+|---|---|
+| **Native HLS downloader** | Parses `.m3u8` master + media playlists, picks best variant, downloads segments in parallel |
+| **Native DASH downloader** | Parses MPD XML, handles `$Number$` / `$Time$` / `$Bandwidth$` template expansion |
+| **AES-128-CBC decryption** | Reads `#EXT-X-KEY` tags, fetches key, derives IV from sequence number when not explicit |
+| **YouTube adaptive streams** | Reads `ytInitialPlayerResponse` directly from the page — no API key, no yt-dlp for YouTube |
+| **yt-dlp fallback** | For Vimeo, Twitch, TikTok, and 30+ known platforms where no manifest URL is captured |
+| **ffmpeg mux** | Lossless `-c copy` container remux — HLS segments → MP4, video+audio → MKV |
+| **Browser extension** | MV3 Chrome/Edge extension: intercepts downloads, captures video streams from any site |
+| **Floating download button** | Appears on `<video>` elements with quality picker (Best / 1080p / 720p / 480p / Audio) |
+| **Popup stream list** | Shows all detected streams per tab with format badges, thumbnails, quality dropdown |
+| **Web dashboard** | SSE-connected dark UI at `http://127.0.0.1:1700/ui` — no token needed from localhost |
+| **Referer passthrough** | CDN-protected streams: captures `documentUrl` and sends it as `Referer` header |
+| **JWPlayer interception** | Hooks `jwplayer().setup()` in MAIN world to capture HLS/DASH before blob: conversion |
+| **Video.js interception** | Same for `videojs()` player setup |
 
----
+### What Surge brings (unchanged)
 
-## Usage
-
-Surge has two main modes: **TUI (Interactive)** and **Server (Headless)**.
-
-For a full reference, see the **[Themes Guide](docs/THEMES.md)**, **[Settings &amp; Configuration Guide](docs/SETTINGS.md)** and the **[CLI Usage Guide](docs/USAGE.md)**.
-
-### 1. Interactive TUI Mode
-
-Just run `surge` to enter the dashboard. This is where you can visualize progress, manage the queue, and see speed graphs. If you encounter any issues, press `?` to open the bug reporting wizard.
-
-```bash
-# Start the TUI
-surge
-
-# Start TUI with downloads queued
-surge https://example.com/file1.zip https://example.com/file2.zip
-
-# Combine URLs and batch file
-surge https://example.com/file.zip --batch urls.txt
-```
-
-### 2. Server Mode (Headless)
-
-Great for servers, Raspberry Pis, or background processes.
-
-```bash
-# Start the server
-surge server
-
-# Start the server with a download
-surge server https://url.com/file.zip
-
-# Start with explicit API token
-surge server --token <token>
-```
-
-### 3. Auto-Start Service
-
-Surge provides an official way to manage it as a system service (daemon). This is the recommended way for servers and reproducible deployments.
-
-```bash
-# Install Surge as a system service
-surge service install
-
-# Manage the service
-surge service start
-surge service stop
-surge service status
-
-# Uninstall the service
-surge service uninstall
-```
-
-> [!NOTE]
-> On Linux, these commands may require `sudo`. On Windows, they should be run in an elevated (Administrator) terminal.
-
-### 4. Remote TUI
-
-`surge` and `surge server` bind the HTTP API to `0.0.0.0` (all interfaces) by default.
-This means the server is accessible via `localhost` (127.0.0.1) as well as your local network IP.
-
-The API is token-protected. Generate/read your token by running:
-
-```bash
-surge token
-```
-
-Alternatively, you can find it in the TUI under **Settings > Extension**.
-
-### 3. Remote TUI
-
-Connect to a running Surge daemon (local or remote).
-
-```bash
-# Connect to local server (auto-detected)
-surge connect
-
-# Connect to a remote daemon
-surge connect 192.168.1.10:1700 --token <token>
-
-# Equivalent global-flag form
-surge --host 192.168.1.10:1700 --token <token>
-```
-
-By default, `surge connect` uses:
-
-- `http://` for loopback and private IP targets
-- `https://` for public/hostname targets
-
-### 4. Global Connection Flags (CLI + TUI)
-
-These global flags are available on all commands:
-
-- `--host <host:port>`: target server for TUI and CLI operations.
-- `--token <token>`: bearer token for authentication.
-
-Environment variable fallbacks:
-
-- `SURGE_HOST`
-- `SURGE_TOKEN`
-
-### 5. Server Mode with Docker Compose
-
-Download the compose file and start the container:
-
-```bash
-wget https://raw.githubusercontent.com/SurgeDM/Surge/refs/heads/main/docker/compose.yml
-docker compose up -d
-```
-
-Get the API token:
-
-```bash
-docker compose exec surge surge token
-```
-
-Save this token - you'll need it to authenticate API requests and connect remotely.
-
-Check downloads/API availability:
-
-```bash
-docker compose exec surge surge ls
-```
-
-View logs:
-
-```bash
-docker compose logs -f surge
-```
+- Multi-connection parallel chunk download (up to 32 workers)
+- Mirror support with automatic failover
+- Sequential/streaming mode for media preview while downloading
+- Beautiful TUI (Bubble Tea + Lip Gloss)
+- Headless server mode + CLI
+- System service install
 
 ---
 
-## Fonts
+## Quick Start
 
-Surge ships a bundled Nerd Font for the TUI, but your terminal controls the
-actual font selection. See [docs/FONTS.md](docs/FONTS.md) for install steps and
-licensing details.
+### Requirements
 
----
+- **Go 1.25+** — to build from source
+- **ffmpeg** — for HLS/DASH mux (`sudo apt install ffmpeg`)
+- **yt-dlp** — for fallback platform support (`pip install yt-dlp`)
+- **Node.js** — required by yt-dlp for some platforms (`nvm install node`)
 
-## Benchmarks
+### Build and Run
 
-We tested Surge against standard tools. Because of our connection optimization logic, Surge significantly outperforms single-connection tools.
+```bash
+# Clone
+git clone https://github.com/msh2050/fluxget
+cd fluxget
 
-| Tool            | Time             | Speed                | Comparison    |
-| --------------- | ---------------- | -------------------- | ------------- |
-| **Surge** | **28.93s** | **35.40 MB/s** | **—**  |
-| aria2c          | 40.04s           | 25.57 MB/s           | 1.38× slower |
-| curl            | 57.57s           | 17.79 MB/s           | 1.99× slower |
-| wget            | 61.81s           | 16.57 MB/s           | 2.14× slower |
+# Build
+go build -o fluxget .
 
-> _Test details: 1GB file, Windows 11, Ryzen 5 5600X, 360 Mbps Network. Results averaged over 5 runs._
+# Run with TUI
+./fluxget
 
-We would love to see you benchmark Surge on your system!
+# OR headless server
+./fluxget server start --port 1700
+
+# Verify
+curl http://127.0.0.1:1700/health
+# → {"status":"ok","port":1700}
+```
+
+### Load the Browser Extension
+
+1. Open Chrome/Edge → `chrome://extensions`
+2. Enable **Developer mode** (top right)
+3. Click **Load unpacked**
+4. Select the `extension-nexload/` folder
+5. The FluxGet icon appears in your toolbar — it shows **Connected** when the backend is running
+
+> No auth token needed — the extension talks to `127.0.0.1:1700` directly, and loopback connections bypass authentication.
+
+### Web Dashboard
+
+```
+http://127.0.0.1:1700/ui
+```
+
+Live SSE-connected download list. Works from localhost without a token.
 
 ---
 
 ## Browser Extension
 
-The Surge extension intercepts browser downloads and sends them straight to your terminal. It communicates with the Surge client on port **1700** by default.
+The extension has three layers:
 
-> [!IMPORTANT]
-> An **Auth Token** is required to connect the extension to your Surge server. This can be obtained from the TUI under **Settings > Extension** or by running `surge token`.
+```
+document.js  (MAIN world)
+  Reads ytInitialPlayerResponse, patches fetch/XHR/MediaSource,
+  hooks JWPlayer and Video.js setup calls.
+  Sends data via window.postMessage(__fluxget)
+        ↓
+content.js   (extension world)
+  Relays postMessage to background, injects floating ▶ button
+  on <video> elements with quality picker panel.
+        ↓
+background.js (service worker)
+  Intercepts chrome.downloads, captures network requests,
+  routes to /download or /stream based on 5-level priority:
+  1. YouTube adaptive formats (ytInitialPlayerResponse)
+  2. Captured HLS/DASH manifest URL
+  3. Captured direct video URL
+  4. Known platform → yt-dlp
+  5. Notify user — nothing found
+        ↓
+Backend  http://127.0.0.1:1700
+  Go engine, ffmpeg mux, SSE events, web UI
+```
 
-### Chrome / Edge / Brave
+### How video detection works
 
-1. Download `extension-chrome.zip` from the latest GitHub release.
-2. Unzip it somewhere on disk.
-3. Open your browser and navigate to `chrome://extensions`.
-4. Enable **"Developer mode"** in the top right corner.
-5. Click **"Load unpacked"**.
-6. Select the unzipped `extension-chrome` folder.
-7. Click the Surge icon in your browser toolbar and enter your **Auth Token** in the settings.
+- **YouTube**: `document.js` reads `window.ytInitialPlayerResponse` which contains signed CDN URLs for every quality level — video and audio separately. Sent directly to `/stream` as `formats[]`; no yt-dlp involved.
+- **HLS sites**: `fetch()` and `XMLHttpRequest` are patched in MAIN world. Any `.m3u8` or `.mpd` response is captured and forwarded to the backend.
+- **JWPlayer sites**: `jwplayer().setup(cfg)` is hooked before the player initializes, extracting the playlist source URLs.
+- **Unknown sites**: Falls back to webRequest capture — any video-like response (by MIME type or extension) is captured.
 
-### Firefox
+### Popup
 
-1. **Stable:** [Get the Add-on](https://addons.mozilla.org/en-US/firefox/addon/surge/)
-2. **Development:**
-   - Download `extension-firefox.zip` from the latest GitHub release.
-   - Navigate to `about:debugging#/runtime/this-firefox`.
-   - Click **"Load Temporary Add-on..."**.
-   - Select the zip file (or unzip and select `manifest.json`).
-   - Click the Surge icon in your browser toolbar and enter your **Auth Token** in the settings.
+Click the FluxGet toolbar icon to see all video streams detected on the current tab:
+
+- Format badge (HLS / DASH / MP4 / WebM)
+- Quality dropdown (Best / 1080p / 720p / 480p / 360p / Audio)
+- Download button → sends to backend
+- Copy URL button (⋮)
+- **Download All** button for batch downloads
 
 ---
 
-## Acknowledgements
+## HTTP API
 
-Huge thanks to the teams and sponsors helping us build and ship Surge:
+The backend runs on port **1700** by default.
 
-- [Charm](https://charm.sh/) for the incredible terminal UI ecosystem (Bubble Tea, Lip Gloss, and more).
-- [GoReleaser Pro](https://goreleaser.com/pro/) for release automation (provided free for open source).
+| Method | Endpoint | Description |
+|---|---|---|
+| GET | `/health` | `{"status":"ok","port":1700}` |
+| GET | `/events` | SSE stream of all download events |
+| POST | `/download` | Queue file download (multi-connection engine) |
+| POST | `/stream` | Queue video/stream (native HLS/DASH or yt-dlp fallback) |
+| POST | `/ytdlp` | Queue explicitly via yt-dlp |
+| GET | `/ui` | Web dashboard |
+| GET | `/list` | Active downloads |
+| GET | `/history` | Completed downloads |
+| POST | `/pause?id=` | Pause download |
+| POST | `/resume?id=` | Resume download |
+| POST | `/delete?id=` | Remove download |
+| PUT | `/update-url?id=` | Update stale URL |
+| POST | `/open-file?id=` | Open file (loopback only) |
+| POST | `/open-folder?id=` | Open folder (loopback only) |
+
+### /stream routing logic
+
+```
+1. formats[] present  →  native adaptive (YouTube CDN direct → video + audio → ffmpeg mux)
+2. .m3u8 / mpegurl   →  native HLS (parse → parallel segments → AES-128 decrypt → ffmpeg concat)
+3. .mpd / dash+xml   →  native DASH (parse MPD → parallel segments → ffmpeg mux)
+4. known platform    →  yt-dlp subprocess
+5. direct video URL  →  single-connection download
+```
+
+### /stream request body
+
+```json
+{
+  "url": "https://example.com/master.m3u8",
+  "title": "My Video",
+  "ytFormat": "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
+  "headers": {
+    "Referer": "https://example.com/watch"
+  },
+  "formats": []
+}
+```
+
+`formats[]` is the YouTube adaptive format array from `ytInitialPlayerResponse`. When present, the backend picks the best video+audio pair and muxes them with ffmpeg.
 
 ---
 
-## Community & Contributing
+## Architecture
 
-We love community contributions! Whether it's a bug fix, a new feature, or just cleaning up typos.
-PRs are always welcome. For a quick guide, see [CONTRIBUTING.md](CONTRIBUTING.md).
+```
+fluxget/
+├── main.go
+├── cmd/
+│   ├── http_api.go          HTTP routes — all endpoints + SSE
+│   ├── root_downloads.go    /download handler
+│   ├── root_http_server.go  Port 1700, loopback auth bypass, ?token= support
+│   └── server.go            server start/stop/status subcommands
+├── internal/
+│   ├── stream/
+│   │   ├── hls.go           HLS m3u8 parser (master + media, AES-128 key handling)
+│   │   ├── dash.go          DASH MPD XML parser (template expansion)
+│   │   └── downloader.go    Parallel segment fetcher, AES-128-CBC decrypt, ffmpeg mux
+│   ├── webui/
+│   │   ├── ui.go            go:embed wrapper
+│   │   └── ui.html          Dark SSE-connected dashboard
+│   ├── ytdlp/
+│   │   └── ytdlp.go         yt-dlp subprocess runner + NeedsYtDlp() dispatch
+│   ├── engine/              Surge multi-connection engine (unchanged)
+│   └── processing/          Download lifecycle manager (unchanged)
+└── extension-nexload/       Browser extension (MV3, load unpacked)
+    ├── manifest.json
+    ├── document.js          MAIN world: ytInitialPlayerResponse, fetch/XHR/JWPlayer hooks
+    ├── background.js        Service worker: intercept, capture, route
+    ├── content.js           Injected: floating button, quality picker, postMessage relay
+    └── popup.html / popup.js   Toolbar popup: stream list per tab
+```
 
-You can check out the [Discussions](https://github.com/SurgeDM/Surge/discussions) for any questions or ideas, or follow us on [X (Twitter)](https://x.com/SurgeDownloader)!
+---
+
+## Credits & Acknowledgements
+
+FluxGet builds on the work of many great open source projects:
+
+- **[Surge](https://github.com/SurgeDM/Surge)** — the Go download engine this project is forked from. Multi-connection HTTP, TUI, CLI, service management — all from Surge. Go give them a star.
+- **[yt-dlp](https://github.com/yt-dlp/yt-dlp)** — used as a subprocess fallback for platforms like Vimeo, Twitch, TikTok, and others where native manifest capture is not enough.
+- **[ffmpeg](https://ffmpeg.org/)** — lossless container remux for HLS/DASH segments (`-c copy`).
+- **[Bubble Tea](https://github.com/charmbracelet/bubbletea)** and **[Lip Gloss](https://github.com/charmbracelet/lipgloss)** — the TUI framework powering the terminal interface (via Surge).
+
+---
 
 ## License
 
-Distributed under the MIT License. See [LICENSE](https://github.com/SurgeDM/Surge/blob/main/LICENSE) for more information.
+MIT — see [LICENSE](LICENSE).
 
----
-
-<div align="center">
-<a href="https://star-history.com/#SurgeDM/Surge&Date">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=SurgeDM/Surge&type=Date&theme=dark" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=SurgeDM/Surge&type=Date" />
-   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=SurgeDM/Surge&type=Date" />
- </picture>
-</a>
-
-<br />
-If Surge saved you some time, consider giving it a ⭐ to help others find it!
-</div>
+FluxGet is an independent fork and is not affiliated with SurgeDM or Tonec Inc.
