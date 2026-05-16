@@ -1,10 +1,12 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"path/filepath"
@@ -40,6 +42,17 @@ func registerHTTPRoutes(mux *http.ServeMux, port int, defaultOutputDir string, s
 	mux.HandleFunc("/events", eventsHandler(service))
 
 	mux.HandleFunc("/download", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			var peek struct {
+				URL     string            `json:"url"`
+				Headers map[string]string `json:"headers"`
+			}
+			if body, err2 := io.ReadAll(r.Body); err2 == nil {
+				_ = json.Unmarshal(body, &peek)
+				utils.Debug("[download] url=%s headers=%v", peek.URL, peek.Headers)
+				r.Body = io.NopCloser(bytes.NewReader(body))
+			}
+		}
 		handleDownload(w, r, defaultOutputDir, service)
 	})
 

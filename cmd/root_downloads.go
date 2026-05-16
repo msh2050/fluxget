@@ -116,6 +116,12 @@ func decodeAndValidateDownloadRequest(r *http.Request) (DownloadRequest, error) 
 	if req.URL == "" {
 		return req, fmt.Errorf("url is required")
 	}
+	// If filename has no extension, extract one from the URL
+	if req.Filename != "" && !strings.Contains(req.Filename, ".") {
+		if ext := extFromURL(req.URL); ext != "" {
+			req.Filename += ext
+		}
+	}
 	if strings.Contains(req.Filename, "..") {
 		return req, fmt.Errorf("invalid filename")
 	}
@@ -417,4 +423,19 @@ func mapClientWindowsPath(reqPath string, relativeToDefaultDir bool, defaultOutp
 
 func shouldFallbackUnmappedWindowsPath(relativeToDefaultDir bool, hostOS string) bool {
 	return relativeToDefaultDir || hostOS != "windows"
+}
+
+func extFromURL(u string) string {
+	parts := strings.Split(u, "?")
+	path := parts[0]
+	dot := strings.LastIndexByte(path, '.')
+	if dot < 0 {
+		return ""
+	}
+	ext := strings.ToLower(path[dot:])
+	switch ext {
+	case ".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv", ".mp3", ".aac", ".ogg", ".opus", ".flac", ".wav":
+		return ext
+	}
+	return ""
 }

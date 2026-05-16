@@ -72,11 +72,13 @@
   // Catches any .m3u8 / .mpd response the page fetches itself.
   const _fetch = window.fetch;
   window.fetch = async function (...args) {
+    const reqUrl = typeof args[0] === "string"
+      ? args[0]
+      : (args[0] instanceof Request ? args[0].url : "");
+    // Skip non-http schemes (magnet:, blob:, data:, etc.) — native fetch rejects them too
+    if (reqUrl && !/^https?:\/\//i.test(reqUrl)) return _fetch.apply(this, args);
     const res = await _fetch.apply(this, args);
     try {
-      const reqUrl = typeof args[0] === "string"
-        ? args[0]
-        : (args[0] instanceof Request ? args[0].url : "");
       const ct = res.headers.get("content-type") || "";
       if (isManifestUrl(reqUrl) || isManifestCT(ct)) {
         res.clone().text().then(body => {

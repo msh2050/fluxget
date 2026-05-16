@@ -6,7 +6,9 @@ package ytdlp
 import (
 	"bufio"
 	"context"
+	"io"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,6 +19,30 @@ import (
 	"github.com/msh2050/fluxget/internal/engine/events"
 	"github.com/google/uuid"
 )
+
+var debugLog *log.Logger
+
+func init() {
+	home, _ := os.UserHomeDir()
+	logPath := filepath.Join(home, "Downloads", "fluxget-debug.log")
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		debugLog = log.New(io.Discard, "", 0)
+		return
+	}
+	debugLog = log.New(f, "[ytdlp] ", log.LstdFlags)
+}
+
+// cookiePlatforms lists hosts where we pass --cookies-from-browser
+// because login state is required for private/member-only content.
+var cookiePlatforms = []string{
+	"facebook.com", "fb.watch",
+	"instagram.com",
+	"twitter.com", "x.com",
+	"tiktok.com",
+	"reddit.com",
+	"youtube.com", "youtu.be",
+}
 
 // Publisher is the subset of core.DownloadService we need.
 type Publisher interface {
@@ -195,11 +221,23 @@ func Start(ctx context.Context, pub Publisher, req Request) (string, error) {
 		"--no-playlist",
 		"--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
 		"--js-runtimes", "node",
+		"--extractor-retries", "3",
+		"--fragment-retries", "10",
+		"--trim-filenames", "180",
+	}
+	// Pass browser cookies for platforms that require login state
+	u := strings.ToLower(req.URL)
+	for _, h := range cookiePlatforms {
+		if strings.Contains(u, h) {
+			args = append(args, "--cookies-from-browser", "edge")
+			break
+		}
 	}
 	for k, v := range req.Headers {
 		args = append(args, "--add-header", fmt.Sprintf("%s:%s", k, v))
 	}
 	args = append(args, req.URL)
+	debugLog.Printf("start url=%s args=%v", req.URL, args)
 
 	// Announce queued
 	filename := req.Title
@@ -220,6 +258,8 @@ func Start(ctx context.Context, pub Publisher, req Request) (string, error) {
 			_ = pub.Publish(events.DownloadErrorMsg{DownloadID: id, Filename: filename, Err: err})
 			return
 		}
+		var stderrBuf strings.Builder
+		cmd.Stderr = &stderrBuf
 		if err := cmd.Start(); err != nil {
 			_ = pub.Publish(events.DownloadErrorMsg{DownloadID: id, Filename: filename, Err: err})
 			return
@@ -268,13 +308,29 @@ func Start(ctx context.Context, pub Publisher, req Request) (string, error) {
 		}
 
 		if err := cmd.Wait(); err != nil {
+			stderr := strings.TrimSpace(stderrBuf.String())
+			debugLog.Printf("error url=%s\nstderr:\n%s", req.URL, stderr)
+			errMsg := fmt.Errorf("yt-dlp: %w", err)
+			if stderr != "" {
+				// Surface the last meaningful line of stderr to the UI
+				lines := strings.Split(stderr, "\n")
+				for i := len(lines) - 1; i >= 0; i-- {
+					if l := strings.TrimSpace(lines[i]); l != "" {
+						errMsg = fmt.Errorf("yt-dlp: %s", l)
+						break
+					}
+				}
+			}
 			_ = pub.Publish(events.DownloadErrorMsg{
 				DownloadID: id,
 				Filename:   filename,
 				DestPath:   destDir,
-				Err:        fmt.Errorf("yt-dlp: %w", err),
+				Err:        errMsg,
 			})
 			return
+		}
+		if s := strings.TrimSpace(stderrBuf.String()); s != "" {
+			debugLog.Printf("stderr (non-fatal) url=%s\n%s", req.URL, s)
 		}
 
 		elapsed := time.Since(start)

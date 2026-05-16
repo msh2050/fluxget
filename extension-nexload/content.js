@@ -223,14 +223,60 @@
     resetBtn(btn);
     btn.title = "Download with FluxGet";
 
-    btn.addEventListener("click", (e) => {
+    btn.addEventListener("click", async (e) => {
       e.stopPropagation();
       e.preventDefault();
 
-      // Always show the quality picker — use fallback yt-dlp options if no YouTube data
       const existing = document.querySelector(".fg-quality-panel");
       if (existing) { existing.remove(); return; }
-      const pickerQualities = qualities.length > 0 ? qualities : FALLBACK_QUALITIES;
+
+      let pickerQualities = qualities;
+
+      // No YouTube data — check if we have a captured HLS manifest for this tab
+      if (pickerQualities.length === 0) {
+        const captured = await new Promise(resolve =>
+          chrome.runtime.sendMessage({ action: "get_captured" }, r => resolve(r || {}))
+        );
+        const hlsItem = (captured.captured || []).find(v =>
+          /\.m3u8/i.test(v.url) || /mpegurl/i.test(v.type || "")
+        );
+        if (hlsItem) {
+          // Parse real variants from the manifest
+          try {
+            const res  = await fetch(hlsItem.url);
+            const body = await res.text();
+            if (body.includes("#EXT-X-STREAM-INF")) {
+              const lines = body.split("\n");
+              const variants = [];
+              let pending = null;
+              for (const line of lines) {
+                const l = line.trim();
+                if (l.startsWith("#EXT-X-STREAM-INF:")) {
+                  const bw  = (l.match(/BANDWIDTH=(\d+)/)      || [])[1];
+                  const rh  = (l.match(/RESOLUTION=\d+x(\d+)/) || [])[1];
+                  pending = { bandwidth: bw ? parseInt(bw) : 0, height: rh ? parseInt(rh) : 0 };
+                } else if (pending && l && !l.startsWith("#")) {
+                  try { pending.url = new URL(l, hlsItem.url).href; } catch { pending.url = l; }
+                  variants.push(pending);
+                  pending = null;
+                }
+              }
+              variants.sort((a, b) => b.bandwidth - a.bandwidth);
+              pickerQualities = variants.map((v, i) => ({
+                label:    v.height ? `${v.height}p${i === 0 ? " (Best)" : ""}` : `Stream ${i+1}`,
+                height:   v.height,
+                codec:    "HLS",
+                type:     "video",
+                videoUrl: v.url,
+                audioUrl: "",
+                ytFormat: "",
+              }));
+            }
+          } catch {}
+        }
+      }
+
+      if (pickerQualities.length === 0) pickerQualities = FALLBACK_QUALITIES;
       const panel = makeQualityPanel(video, btn, pickerQualities);
       positionPanel(panel, btn);
     });

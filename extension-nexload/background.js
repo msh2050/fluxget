@@ -261,11 +261,20 @@ chrome.downloads.onCreated.addListener((item) => {
     chrome.downloads.erase({ id: item.id });
   });
 
+  // Build Referer header — CDNs return 403 without it.
+  // chrome.downloads gives us item.referrer (the page URL) directly.
+  // Fall back to the captured webRequest referer if item.referrer is empty.
+  const tabId = item.tabId >= 0 ? item.tabId : null;
+  const captured = tabId != null ? (capturedVideos.get(tabId) || []) : [];
+  const capEntry = captured.find(v => v.url === item.url);
+  const referer  = item.referrer || capEntry?.referer || "";
+  const dlHeaders = referer ? { Referer: referer } : {};
+
   // Route to the right FluxGet endpoint
   if (VIDEO_EXT_RE.test(filename) || VIDEO_MIME_RE.test(mime) || isManifestURL(item.url)) {
-    sendStream(item.url, filename);
+    sendStream(item.url, filename, dlHeaders);
   } else {
-    sendDownload(item.url, filename, {});
+    sendDownload(item.url, filename, dlHeaders);
   }
 
   notify("FluxGet", `Downloading: ${filename}`);
@@ -379,10 +388,11 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
     case "fg_link": {
       const url = info.linkUrl || "";
       if (!url) return;
+      const pageRef = tab?.url ? { Referer: tab.url } : {};
       if (isManifestURL(url) || isKnownVideoHost(url)) {
-        sendStream(url, url.split("/").pop().split("?")[0] || "video");
+        sendStream(url, url.split("/").pop().split("?")[0] || "video", pageRef);
       } else {
-        sendDownload(url, url.split("/").pop().split("?")[0] || "file", {});
+        sendDownload(url, url.split("/").pop().split("?")[0] || "file", pageRef);
       }
       break;
     }
@@ -400,9 +410,10 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
     case "fg_selection": {
       const url = (info.selectionText || "").trim();
       if (!url.startsWith("http")) return;
+      const pageRef = tab?.url ? { Referer: tab.url } : {};
       isKnownVideoHost(url) || isManifestURL(url)
-        ? sendStream(url, "")
-        : sendDownload(url, url.split("/").pop().split("?")[0] || "file", {});
+        ? sendStream(url, "", pageRef)
+        : sendDownload(url, url.split("/").pop().split("?")[0] || "file", pageRef);
       break;
     }
     case "fg_open_ui": {

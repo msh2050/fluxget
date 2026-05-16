@@ -47,15 +47,32 @@ function guessTitle(url) {
   } catch (_) { return url.slice(0, 40); }
 }
 
-// Quality options for HLS/DASH (backend will parse manifest and pick)
-const QUALITY_OPTIONS = [
-  { label: "Best",  value: "" },
-  { label: "1080p", value: "bestvideo[height<=1080]+bestaudio/best[height<=1080]" },
-  { label: "720p",  value: "bestvideo[height<=720]+bestaudio/best[height<=720]" },
-  { label: "480p",  value: "bestvideo[height<=480]+bestaudio/best[height<=480]" },
-  { label: "360p",  value: "bestvideo[height<=360]+bestaudio/best[height<=360]" },
-  { label: "Audio", value: "bestaudio/best" },
-];
+// Parse HLS master playlist and return variants sorted best-first.
+// Returns [] if it's a media playlist (no #EXT-X-STREAM-INF).
+async function fetchHLSVariants(url) {
+  try {
+    const res = await fetch(url);
+    const body = await res.text();
+    if (!body.includes("#EXT-X-STREAM-INF")) return [];
+    const lines = body.split("\n");
+    const variants = [];
+    let pending = null;
+    for (const line of lines) {
+      const l = line.trim();
+      if (l.startsWith("#EXT-X-STREAM-INF:")) {
+        const bw  = (l.match(/BANDWIDTH=(\d+)/)  || [])[1];
+        const res = (l.match(/RESOLUTION=\d+x(\d+)/) || [])[1];
+        pending = { bandwidth: bw ? parseInt(bw) : 0, height: res ? parseInt(res) : 0 };
+      } else if (pending && l && !l.startsWith("#")) {
+        try { pending.url = new URL(l, url).href; } catch { pending.url = l; }
+        variants.push(pending);
+        pending = null;
+      }
+    }
+    variants.sort((a, b) => b.bandwidth - a.bandwidth);
+    return variants;
+  } catch { return []; }
+}
 
 // ── Render ────────────────────────────────────────────────────────────────────
 function renderList() {
@@ -72,9 +89,10 @@ function renderList() {
   emptyState.style.display = "none";
   videoCount.textContent = detectedItems.length + " video" + (detectedItems.length > 1 ? "s" : "");
 
-  detectedItems.forEach((item, idx) => {
+  detectedItems.forEach(async (item, idx) => {
     const fmt  = detectFmt(item.url, item.type);
-    const isManifest = fmt === "HLS" || fmt === "DASH";
+    const isHLS  = fmt === "HLS";
+    const isDASH = fmt === "DASH";
     const title = item.title || guessTitle(item.url);
 
     const row = document.createElement("div");
@@ -117,15 +135,36 @@ function renderList() {
     badge.textContent = fmt;
     meta.appendChild(badge);
 
-    // Quality selector
+    // Quality selector — real variants for HLS, hidden for direct files
     const sel = document.createElement("select");
     sel.className = "quality-select";
-    QUALITY_OPTIONS.forEach(opt => {
-      const o = document.createElement("option");
-      o.value = opt.value;
-      o.textContent = opt.label;
-      sel.appendChild(o);
-    });
+
+    // Placeholder while fetching
+    const bestOpt = document.createElement("option");
+    bestOpt.value = "";
+    bestOpt.textContent = "Best";
+    sel.appendChild(bestOpt);
+
+    if (isHLS) {
+      // Async: fetch real variants from manifest
+      fetchHLSVariants(item.url).then(variants => {
+        if (variants.length > 1) {
+          sel.innerHTML = "";
+          variants.forEach((v, i) => {
+            const o = document.createElement("option");
+            o.value = v.url;
+            o.textContent = v.height ? `${v.height}p` : `Stream ${i + 1}`;
+            if (i === 0) o.textContent += " (Best)";
+            sel.appendChild(o);
+          });
+        }
+        // If only 1 variant or media playlist — keep "Best" (no choice needed)
+      });
+    } else if (!isDASH) {
+      // Direct file — no quality choice
+      sel.style.display = "none";
+    }
+
     meta.appendChild(sel);
 
     if (item.size) {
@@ -142,7 +181,14 @@ function renderList() {
     const dlBtn = document.createElement("button");
     dlBtn.className = "dl-btn";
     dlBtn.innerHTML = "⬇ Download";
-    dlBtn.addEventListener("click", () => downloadItem(item, fmt, sel.value));
+    dlBtn.addEventListener("click", () => {
+      // For HLS with real variant selected, override item URL with specific variant
+      const selectedVariantUrl = isHLS && sel.value ? sel.value : "";
+      const itemToDownload = selectedVariantUrl
+        ? { ...item, url: selectedVariantUrl }
+        : item;
+      downloadItem(itemToDownload, fmt, "");
+    });
     row.appendChild(dlBtn);
 
     // More (⋮)

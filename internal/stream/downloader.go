@@ -7,6 +7,7 @@ import (
 	"crypto/cipher"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -19,11 +20,32 @@ import (
 	"github.com/google/uuid"
 )
 
+var debugLog *log.Logger
+
+func init() {
+	home, _ := os.UserHomeDir()
+	logPath := filepath.Join(home, "Downloads", "fluxget-debug.log")
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		debugLog = log.New(io.Discard, "", 0)
+		return
+	}
+	debugLog = log.New(f, "", log.LstdFlags)
+	debugLog.Printf("=== FluxGet started ===")
+}
+
 const (
-	segWorkers = 16              // concurrent segment downloads
-	maxRetries = 3
-	retryDelay = 500 * time.Millisecond
+	segWorkers    = 4                    // conservative — Google Drive and similar CDNs rate-limit hard
+	maxRetries    = 12                   // more retries for flaky/rate-limited CDNs
+	retryDelay    = 500 * time.Millisecond
+	maxRetryDelay = 60 * time.Second
 )
+
+// errRateLimit is returned when a CDN responds with HTTP 429.
+// It carries the suggested wait duration so the worker can back off.
+type errRateLimit struct{ wait time.Duration }
+
+func (e errRateLimit) Error() string { return fmt.Sprintf("429 rate limited (retry in %v)", e.wait) }
 
 // Publisher is the interface stream.Downloader uses to emit SSE events.
 // Satisfied by core.DownloadService.
@@ -209,6 +231,14 @@ func runHLS(ctx context.Context, pub Publisher, id, title, destDir string, req R
 		return fmt.Errorf("stream: HLS playlist has no segments")
 	}
 
+	encrypted := 0
+	for _, s := range segments {
+		if s.Key != nil {
+			encrypted++
+		}
+	}
+	debugLog.Printf("[%s] HLS url=%s segments=%d encrypted=%d", id[:8], req.URL, len(segments), encrypted)
+
 	tmp, err := os.MkdirTemp("", "fluxget-*")
 	if err != nil {
 		return err
@@ -217,8 +247,10 @@ func runHLS(ctx context.Context, pub Publisher, id, title, destDir string, req R
 
 	segFiles, err := downloadAndDecryptSegments(ctx, pub, id, segments, req.Headers, tmp, start)
 	if err != nil {
+		debugLog.Printf("[%s] segment download error: %v", id[:8], err)
 		return err
 	}
+	debugLog.Printf("[%s] segments downloaded: %d files", id[:8], len(segFiles))
 
 	outFile := outputPath(destDir, sanitizeFilename(title), ".mp4")
 	return muxConcat(ctx, pub, id, title, segFiles, outFile, start)
@@ -286,6 +318,7 @@ func runDASH(ctx context.Context, pub Publisher, id, title, destDir string, req 
 // ── Direct file download ──────────────────────────────────────────────────────
 
 func runDirect(ctx context.Context, pub Publisher, id, title, destDir string, req Request, start time.Time) error {
+	debugLog.Printf("[%s] direct url=%s headers=%v", id[:8], req.URL, req.Headers)
 	ext := extFromURL(req.URL)
 	if ext == "" {
 		ext = ".mp4"
@@ -368,7 +401,10 @@ func downloadAndDecryptSegments(ctx context.Context, pub Publisher, id string, s
 		return nil, err
 	}
 
-	// Decrypt each encrypted segment in-place
+	// Decrypt each encrypted segment in-place.
+	// PKCS#7 padding only exists on the last segment — intermediate segments
+	// are exact AES block multiples. Unpadding every segment corrupts the stream.
+	lastIdx := len(segments) - 1
 	for i, seg := range segments {
 		if seg.Key == nil || i >= len(rawFiles) {
 			continue
@@ -390,14 +426,28 @@ func downloadAndDecryptSegments(ctx context.Context, pub Publisher, id string, s
 		}
 		mode := cipher.NewCBCDecrypter(block, seg.Key.IV)
 		mode.CryptBlocks(data, data)
-		// Remove PKCS#7 padding from last segment
-		data = pkcs7Unpad(data)
+		if i == lastIdx {
+			data = pkcs7Unpad(data)
+		}
+		// Strip any junk before the first MPEG-TS sync byte (0x47)
+		data = syncByteAlign(data)
 		if err := os.WriteFile(rawFiles[i], data, 0o600); err != nil {
 			return nil, fmt.Errorf("hls: write decrypted segment %d: %w", i, err)
 		}
 	}
 
 	return rawFiles, nil
+}
+
+// syncByteAlign strips any junk bytes before the first MPEG-TS sync byte (0x47).
+// Some CDNs prepend garbage to encrypted segments; ffmpeg chokes on it.
+func syncByteAlign(data []byte) []byte {
+	for i, b := range data {
+		if b == 0x47 {
+			return data[i:]
+		}
+	}
+	return data
 }
 
 // pkcs7Unpad removes PKCS#7 padding.
@@ -446,6 +496,7 @@ func downloadSegments(ctx context.Context, pub Publisher, id string, urls []stri
 		go func() {
 			defer wg.Done()
 			client := &http.Client{Timeout: 120 * time.Second}
+			backoff := retryDelay // per-worker backoff, grows on 429
 			for job := range jobs {
 				if ctx.Err() != nil {
 					errs <- ctx.Err()
@@ -469,9 +520,31 @@ func downloadSegments(ctx context.Context, pub Publisher, id string, urls []stri
 							Elapsed:           time.Since(start),
 							ActiveConnections: segWorkers,
 						})
+						backoff = retryDelay // reset on success
 						lastErr = nil
 						break
 					}
+
+					// 429: honour the CDN's Retry-After and back off exponentially
+					if e, ok := err.(errRateLimit); ok {
+						wait := e.wait
+						if backoff > wait {
+							wait = backoff
+						}
+						debugLog.Printf("[%s] 429 on seg %d — waiting %v (attempt %d)", id[:8], job.idx, wait, attempt+1)
+						select {
+						case <-ctx.Done():
+							errs <- ctx.Err()
+							return
+						case <-time.After(wait):
+						}
+						backoff *= 2
+						if backoff > maxRetryDelay {
+							backoff = maxRetryDelay
+						}
+						continue // retry without counting as a normal failure
+					}
+
 					lastErr = err
 					if attempt < maxRetries-1 {
 						select {
@@ -483,11 +556,10 @@ func downloadSegments(ctx context.Context, pub Publisher, id string, urls []stri
 					}
 				}
 				if lastErr != nil {
-					// For DASH with fixed-duration segs we may hit 404 at stream end — stop gracefully
+					// 404 at end of open-ended DASH stream — stop gracefully
 					if strings.Contains(lastErr.Error(), "404") {
-						// Trim urls slice to actual downloaded count
 						mu.Lock()
-						done = total // signal done
+						done = total
 						mu.Unlock()
 						return
 					}
@@ -533,6 +605,7 @@ func downloadSegment(ctx context.Context, client *http.Client, u string, headers
 	if err != nil {
 		return 0, err
 	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
@@ -543,6 +616,14 @@ func downloadSegment(ctx context.Context, client *http.Client, u string, headers
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
 		return 0, fmt.Errorf("404: %s", u)
+	}
+	if resp.StatusCode == http.StatusTooManyRequests {
+		wait := 5 * time.Second
+		var n int
+		if _, err2 := fmt.Sscanf(resp.Header.Get("Retry-After"), "%d", &n); err2 == nil && n > 0 {
+			wait = time.Duration(n) * time.Second
+		}
+		return 0, errRateLimit{wait: wait}
 	}
 	if resp.StatusCode >= 400 {
 		return 0, fmt.Errorf("HTTP %d: %s", resp.StatusCode, u)
@@ -591,6 +672,7 @@ func downloadFileDirect(ctx context.Context, pub Publisher, id, u, dest string, 
 	if err != nil {
 		return err
 	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
@@ -672,8 +754,10 @@ func mux(ctx context.Context, pub Publisher, id, title string, inputs []string, 
 
 	cmd := exec.CommandContext(ctx, ffmpeg, args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
+		debugLog.Printf("[%s] ffmpeg mux error: %v\n%s", id[:8], err, out)
 		return fmt.Errorf("stream: ffmpeg: %w\n%s", err, out)
 	}
+	debugLog.Printf("[%s] ffmpeg mux OK → %s", id[:8], outFile)
 
 	return publishComplete(pub, id, title, outFile, start)
 }
@@ -712,8 +796,10 @@ func muxConcat(ctx context.Context, pub Publisher, id, title string, segFiles []
 		"-c", "copy", outFile,
 	)
 	if out, err := cmd.CombinedOutput(); err != nil {
+		debugLog.Printf("[%s] ffmpeg concat error: %v\n%s", id[:8], err, out)
 		return fmt.Errorf("stream: ffmpeg concat: %w\n%s", err, out)
 	}
+	debugLog.Printf("[%s] ffmpeg concat OK → %s", id[:8], outFile)
 
 	return publishComplete(pub, id, title, outFile, start)
 }
