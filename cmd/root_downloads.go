@@ -116,8 +116,9 @@ func decodeAndValidateDownloadRequest(r *http.Request) (DownloadRequest, error) 
 	if req.URL == "" {
 		return req, fmt.Errorf("url is required")
 	}
-	// If filename has no extension, extract one from the URL
-	if req.Filename != "" && !strings.Contains(req.Filename, ".") {
+	// If filename has no proper extension (e.g. a page title like "Mr. X 2026"),
+	// try to append one from the URL before the processing pipeline runs.
+	if req.Filename != "" && !filenameHasKnownExt(req.Filename) {
 		if ext := extFromURL(req.URL); ext != "" {
 			req.Filename += ext
 		}
@@ -423,6 +424,15 @@ func mapClientWindowsPath(reqPath string, relativeToDefaultDir bool, defaultOutp
 
 func shouldFallbackUnmappedWindowsPath(relativeToDefaultDir bool, hostOS string) bool {
 	return relativeToDefaultDir || hostOS != "windows"
+}
+
+func filenameHasKnownExt(filename string) bool {
+	dot := strings.LastIndexByte(filename, '.')
+	if dot < 0 {
+		return false
+	}
+	ext := filename[dot:]
+	return len(ext) >= 2 && len(ext) <= 6 && !strings.ContainsAny(ext, " \t")
 }
 
 func extFromURL(u string) string {

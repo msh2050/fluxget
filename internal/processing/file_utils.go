@@ -160,14 +160,53 @@ func GetCategoryPath(filename, defaultDir string, settings *config.Settings) (st
 // most authoritative source available before uniqueness is applied.
 func getBaseFilename(url, candidate string, probe *ProbeResult) string {
 	if candidate != "" {
+		if hasKnownExtension(candidate) {
+			return candidate
+		}
+		// Candidate is a page title with no proper extension (e.g. "Mr. X 2026").
+		// Borrow the extension detected by the probe or inferred from the URL.
+		ext := ""
+		if probe != nil && probe.DetectedFilename != "" {
+			ext = filepath.Ext(probe.DetectedFilename)
+		}
+		if ext == "" {
+			ext = urlMediaExt(url)
+		}
+		if ext != "" {
+			return candidate + ext
+		}
 		return candidate
 	}
-	if probe != nil {
-		if probe.DetectedFilename != "" {
-			return probe.DetectedFilename
-		}
+	if probe != nil && probe.DetectedFilename != "" {
+		return probe.DetectedFilename
 	}
 	return InferFilenameFromURL(url)
+}
+
+// hasKnownExtension returns true when the filename ends with a short,
+// space-free suffix that looks like a real file extension (e.g. ".mp4", ".pdf").
+// "Mr. Smith" returns false; "movie.mp4" returns true.
+func hasKnownExtension(filename string) bool {
+	ext := filepath.Ext(filename)
+	return len(ext) >= 2 && len(ext) <= 6 && !strings.ContainsAny(ext, " \t")
+}
+
+// urlMediaExt strips the query string from a URL and returns its file extension
+// if it matches a known media or download format.
+func urlMediaExt(u string) string {
+	if i := strings.IndexByte(u, '?'); i >= 0 {
+		u = u[:i]
+	}
+	ext := strings.ToLower(filepath.Ext(u))
+	switch ext {
+	case ".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv",
+		".mp3", ".aac", ".ogg", ".opus", ".flac", ".wav",
+		".zip", ".rar", ".7z", ".gz", ".bz2", ".xz",
+		".pdf", ".exe", ".msi", ".dmg", ".apk",
+		".jpg", ".jpeg", ".png", ".gif", ".webp":
+		return ext
+	}
+	return ""
 }
 
 // ResolveDestination centralizes routing and naming so CLI, TUI, and API
