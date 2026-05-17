@@ -96,10 +96,10 @@ func ParseHLSMedia(body, baseURL string) ([]HLSSegment, error) {
 
 		if strings.HasPrefix(line, "#EXT-X-KEY:") {
 			attrs := parseHLSAttrs(line[len("#EXT-X-KEY:"):])
-			method := attrs["METHOD"]
-			if method == "NONE" {
+			switch method := attrs["METHOD"]; method {
+			case "NONE":
 				currentKey = nil
-			} else if method == "AES-128" {
+			case "AES-128":
 				keyURI, _ := resolveURL(baseURL, attrs["URI"])
 				var iv []byte
 				if ivStr := attrs["IV"]; ivStr != "" {

@@ -817,7 +817,7 @@ func catFiles(paths []string, dest string) error {
 			return err
 		}
 		_, err = io.Copy(out, f)
-		f.Close()
+		_ = f.Close()
 		if err != nil {
 			return err
 		}
@@ -839,7 +839,7 @@ func fetchText(ctx context.Context, u string, headers map[string]string) (string
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 400 {
 		return "", fmt.Errorf("HTTP %d fetching %s", resp.StatusCode, u)
 	}
