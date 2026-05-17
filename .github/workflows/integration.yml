@@ -99,25 +99,14 @@ jobs:
           echo "$HEALTH" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['status']=='ok', 'health check failed'"
           echo "PASS: /health"
 
-          # 2. Auth rejection without token
-          echo "--- Testing auth enforcement ---"
+          # 2. Loopback access (browser extension on same machine bypasses token auth)
+          echo "--- Testing loopback access ---"
           STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:1700/list || true)
-          if [ "$STATUS" != "401" ]; then
-            echo "FAIL: Expected 401 without auth, got $STATUS"
-            exit 1
-          fi
-          echo "PASS: auth enforcement"
-
-          # 3. Auth acceptance with Bearer token
-          echo "--- Testing Bearer auth ---"
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-            -H "Authorization: Bearer test-integration-token" \
-            http://127.0.0.1:1700/list || true)
           if [ "$STATUS" != "200" ]; then
-            echo "FAIL: Expected 200 with auth, got $STATUS"
+            echo "FAIL: Expected 200 for loopback (no-token) request, got $STATUS"
             exit 1
           fi
-          echo "PASS: Bearer auth"
+          echo "PASS: loopback access"
 
           # 4. CORS headers (extension cross-origin fetch)
           echo "--- Testing CORS headers ---"

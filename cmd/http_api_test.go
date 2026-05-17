@@ -164,8 +164,14 @@ func TestEventsEndpoint_RequiresAuthAndStreamsSSE(t *testing.T) {
 
 	mux := http.NewServeMux()
 	registerHTTPRoutes(mux, 0, "", service)
-	handler := corsMiddleware(authMiddleware("test-token", mux))
-	server := httptest.NewServer(handler)
+	// remoteAddrOverride makes requests appear to come from a non-loopback IP
+	// so the auth middleware's loopback bypass does not mask token enforcement.
+	remoteAddrOverride := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r2 := r.Clone(r.Context())
+		r2.RemoteAddr = "203.0.113.1:12345"
+		corsMiddleware(authMiddleware("test-token", mux)).ServeHTTP(w, r2)
+	})
+	server := httptest.NewServer(remoteAddrOverride)
 	defer server.Close()
 
 	noAuthResp, err := server.Client().Get(server.URL + "/events")

@@ -173,7 +173,7 @@ func runAdaptive(ctx context.Context, pub Publisher, id, title, destDir string, 
 	if err != nil {
 		return fmt.Errorf("stream: mktemp: %w", err)
 	}
-	defer os.RemoveAll(tmp)
+	defer func() { _ = os.RemoveAll(tmp) }()
 
 	outFile := outputPath(destDir, sanitizeFilename(title), ".mp4")
 
@@ -243,7 +243,7 @@ func runHLS(ctx context.Context, pub Publisher, id, title, destDir string, req R
 	if err != nil {
 		return err
 	}
-	defer os.RemoveAll(tmp)
+	defer func() { _ = os.RemoveAll(tmp) }()
 
 	segFiles, err := downloadAndDecryptSegments(ctx, pub, id, segments, req.Headers, tmp, start)
 	if err != nil {
@@ -280,7 +280,7 @@ func runDASH(ctx context.Context, pub Publisher, id, title, destDir string, req 
 	if err != nil {
 		return err
 	}
-	defer os.RemoveAll(tmp)
+	defer func() { _ = os.RemoveAll(tmp) }()
 
 	var inputs []string
 
@@ -387,7 +387,7 @@ func downloadAndDecryptSegments(ctx context.Context, pub Publisher, id string, s
 			return nil, fmt.Errorf("hls: fetch key %s: %w", seg.Key.URI, err)
 		}
 		keyBytes, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if err != nil || len(keyBytes) != 16 {
 			return nil, fmt.Errorf("hls: invalid AES key from %s (got %d bytes)", seg.Key.URI, len(keyBytes))
 		}
@@ -613,7 +613,7 @@ func downloadSegment(ctx context.Context, client *http.Client, u string, headers
 	if err != nil {
 		return 0, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode == http.StatusNotFound {
 		return 0, fmt.Errorf("404: %s", u)
 	}
@@ -632,7 +632,7 @@ func downloadSegment(ctx context.Context, client *http.Client, u string, headers
 	if err != nil {
 		return 0, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	n, err := io.Copy(f, resp.Body)
 	return n, err
 }
@@ -681,7 +681,7 @@ func downloadFileDirect(ctx context.Context, pub Publisher, id, u, dest string, 
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 400 {
 		return fmt.Errorf("HTTP %d fetching %s", resp.StatusCode, u)
 	}
@@ -692,7 +692,7 @@ func downloadFileDirect(ctx context.Context, pub Publisher, id, u, dest string, 
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	buf := make([]byte, 256*1024)
 	var downloaded int64
@@ -788,7 +788,7 @@ func muxConcat(ctx context.Context, pub Publisher, id, title string, segFiles []
 	if err := os.WriteFile(listFile, []byte(sb.String()), 0o600); err != nil {
 		return err
 	}
-	defer os.Remove(listFile)
+	defer func() { _ = os.Remove(listFile) }()
 
 	cmd := exec.CommandContext(ctx, ffmpeg,
 		"-y", "-f", "concat", "-safe", "0",
@@ -810,7 +810,7 @@ func catFiles(paths []string, dest string) error {
 	if err != nil {
 		return err
 	}
-	defer out.Close()
+	defer func() { _ = out.Close() }()
 	for _, p := range paths {
 		f, err := os.Open(p)
 		if err != nil {
