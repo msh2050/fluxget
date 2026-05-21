@@ -42,6 +42,7 @@
   "permissions": [
     "alarms",
     "contextMenus",
+    "cookies",
     "downloads",
     "notifications",
     "scripting",

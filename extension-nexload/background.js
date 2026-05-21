@@ -220,9 +220,28 @@ function sendDownload(url, filename, headers) {
   return apiPost("/download", { url, filename: filename || "", headers: headers || {}, skip_approval: true });
 }
 
+// getCookiesForURL returns the browser's Cookie header string for a given URL's
+// domain. This lets FluxGet authenticate with CDNs that require session cookies
+// (e.g. turbosplayer, streamtape) even though the download runs outside the browser.
+async function getCookiesForURL(url) {
+  try {
+    const { hostname } = new URL(url);
+    const cookies = await chrome.cookies.getAll({ domain: hostname });
+    if (cookies.length === 0) return "";
+    return cookies.map(c => `${c.name}=${c.value}`).join("; ");
+  } catch {
+    return "";
+  }
+}
+
 // Video / stream → /stream (uses FluxGet's native HLS/DASH engine or yt-dlp fallback)
-function sendStream(url, title, headers, formats) {
-  return apiPost("/stream", { url, title: title || "", headers: headers || {}, formats: formats || [] });
+// Automatically forwards browser cookies for the stream domain so CDN-authenticated
+// HLS/DASH streams (e.g. turbosplayer.com) work outside the browser context.
+async function sendStream(url, title, headers, formats) {
+  const cookie = await getCookiesForURL(url);
+  const allHeaders = { ...(headers || {}) };
+  if (cookie) allHeaders.Cookie = cookie;
+  return apiPost("/stream", { url, title: title || "", headers: allHeaders, formats: formats || [] });
 }
 
 // ── Notification helper ───────────────────────────────────────────────────────

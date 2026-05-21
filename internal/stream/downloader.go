@@ -321,15 +321,22 @@ func runHLS(ctx context.Context, pub Publisher, id, title, destDir string, req R
 	if err != nil {
 		return err
 	}
-	// Always keep segments for 24h in ~/Downloads/.fluxget-debug/ so we can
-	// inspect them whether the download succeeded or failed (file may play but
-	// look corrupted, or succeed but produce a broken output).
-	defer func() { keepTempForDebug(tmp, id, "hls") }()
+	// keepOnce ensures only one keepTempForDebug call fires per download so the
+	// defer fallback does not try to copy a dir that an explicit error path already
+	// moved and deleted.
+	var kept bool
+	keepOnce := func(reason string) {
+		if !kept {
+			kept = true
+			keepTempForDebug(tmp, id, reason)
+		}
+	}
+	defer func() { keepOnce("hls") }()
 
 	segFiles, err := downloadAndDecryptSegments(ctx, pub, id, segments, req.Headers, tmp, start)
 	if err != nil {
 		debugLog.Printf("[%s] segment download error: %v", id[:8], err)
-		keepTempForDebug(tmp, id, "seg-error")
+		keepOnce("seg-error")
 		return err
 	}
 
@@ -343,7 +350,7 @@ func runHLS(ctx context.Context, pub Publisher, id, title, destDir string, req R
 
 	if len(segFiles) > 0 {
 		if err := validateVideoSegment(segFiles[0]); err != nil {
-			keepTempForDebug(tmp, id, "invalid-seg")
+			keepOnce("invalid-seg")
 			return err
 		}
 	}
@@ -354,7 +361,7 @@ func runHLS(ctx context.Context, pub Publisher, id, title, destDir string, req R
 		if fi, statErr := os.Stat(outFile); statErr != nil || fi.Size() == 0 {
 			_ = os.Remove(outFile)
 		}
-		keepTempForDebug(tmp, id, "mux-error")
+		keepOnce("mux-error")
 		return err
 	}
 	if fi, e := os.Stat(outFile); e == nil {
@@ -387,7 +394,14 @@ func runDASH(ctx context.Context, pub Publisher, id, title, destDir string, req 
 	if err != nil {
 		return err
 	}
-	defer func() { keepTempForDebug(tmp, id, "dash") }()
+	var kept bool
+	keepOnce := func(reason string) {
+		if !kept {
+			kept = true
+			keepTempForDebug(tmp, id, reason)
+		}
+	}
+	defer func() { keepOnce("dash") }()
 
 	var inputs []string
 
@@ -395,10 +409,12 @@ func runDASH(ctx context.Context, pub Publisher, id, title, destDir string, req 
 		allURLs := prependInit(video.InitURL, video.SegURLs)
 		segFiles, err := downloadSegments(ctx, pub, id, allURLs, req.Headers, tmp, start)
 		if err != nil {
+			keepOnce("seg-error")
 			return fmt.Errorf("stream: DASH video segments: %w", err)
 		}
 		if len(segFiles) > 0 {
 			if err := validateVideoSegment(segFiles[0]); err != nil {
+				keepOnce("invalid-seg")
 				return err
 			}
 		}
