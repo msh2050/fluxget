@@ -32,6 +32,46 @@ func init() {
 	}
 	debugLog = log.New(f, "", log.LstdFlags)
 	debugLog.Printf("=== FluxGet started ===")
+	go cleanupOldDebugDirs()
+}
+
+// debugDir returns the path used to preserve failed download segments for 24h.
+func debugDir() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, "Downloads", ".fluxget-debug")
+}
+
+// keepTempForDebug moves a failed temp dir to the debug directory so segments
+// can be inspected. The dir is auto-deleted after 24h by cleanupOldDebugDirs.
+func keepTempForDebug(tmp, id, reason string) {
+	dest := filepath.Join(debugDir(), fmt.Sprintf("%s-%s-%s",
+		time.Now().Format("20060102-150405"), id[:8], reason))
+	_ = os.MkdirAll(debugDir(), 0o755)
+	if err := os.Rename(tmp, dest); err != nil {
+		debugLog.Printf("debug-keep: failed to move segments: %v", err)
+		return
+	}
+	debugLog.Printf("debug-keep: segments saved → %s (auto-delete in 24h)", dest)
+}
+
+// cleanupOldDebugDirs removes debug segment dirs older than 24h.
+func cleanupOldDebugDirs() {
+	dir := debugDir()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-24 * time.Hour)
+	for _, e := range entries {
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().Before(cutoff) {
+			_ = os.RemoveAll(filepath.Join(dir, e.Name()))
+			debugLog.Printf("debug-keep: removed old debug dir %s", e.Name())
+		}
+	}
 }
 
 const (
@@ -217,6 +257,7 @@ func runHLS(ctx context.Context, pub Publisher, id, title, destDir string, req R
 	if len(variants) > 0 {
 		best := HLSBestVariant(variants)
 		mediaURL = best.URL
+		debugLog.Printf("[%s] HLS best variant: %dx%d %d kbps → %s", id[:8], best.Width, best.Height, best.Bandwidth/1000, mediaURL)
 		body, err = fetchText(ctx, mediaURL, req.Headers)
 		if err != nil {
 			return fmt.Errorf("stream: fetch HLS media playlist: %w", err)
@@ -243,32 +284,45 @@ func runHLS(ctx context.Context, pub Publisher, id, title, destDir string, req R
 	if err != nil {
 		return err
 	}
-	defer func() { _ = os.RemoveAll(tmp) }()
+	// Always keep segments for 24h in ~/Downloads/.fluxget-debug/ so we can
+	// inspect them whether the download succeeded or failed (file may play but
+	// look corrupted, or succeed but produce a broken output).
+	defer func() { keepTempForDebug(tmp, id, "hls") }()
 
 	segFiles, err := downloadAndDecryptSegments(ctx, pub, id, segments, req.Headers, tmp, start)
 	if err != nil {
 		debugLog.Printf("[%s] segment download error: %v", id[:8], err)
+		keepTempForDebug(tmp, id, "seg-error")
 		return err
 	}
-	debugLog.Printf("[%s] segments downloaded: %d files", id[:8], len(segFiles))
+
+	var totalBytes int64
+	for _, sf := range segFiles {
+		if fi, e := os.Stat(sf); e == nil {
+			totalBytes += fi.Size()
+		}
+	}
+	debugLog.Printf("[%s] segments downloaded: %d files, total=%s", id[:8], len(segFiles), formatBytes(totalBytes))
 
 	if len(segFiles) > 0 {
 		if err := validateVideoSegment(segFiles[0]); err != nil {
+			keepTempForDebug(tmp, id, "invalid-seg")
 			return err
 		}
 	}
 
 	outFile := outputPath(destDir, sanitizeFilename(title), ".mp4")
-	var ok bool
-	defer func() {
-		if !ok {
+	debugLog.Printf("[%s] muxing %d segs → %s", id[:8], len(segFiles), outFile)
+	if err := muxConcat(ctx, pub, id, title, segFiles, outFile, start); err != nil {
+		if fi, statErr := os.Stat(outFile); statErr != nil || fi.Size() == 0 {
 			_ = os.Remove(outFile)
 		}
-	}()
-	if err := muxConcat(ctx, pub, id, title, segFiles, outFile, start); err != nil {
+		keepTempForDebug(tmp, id, "mux-error")
 		return err
 	}
-	ok = true
+	if fi, e := os.Stat(outFile); e == nil {
+		debugLog.Printf("[%s] output OK: %s (%s)", id[:8], outFile, formatBytes(fi.Size()))
+	}
 	return nil
 }
 
@@ -296,7 +350,7 @@ func runDASH(ctx context.Context, pub Publisher, id, title, destDir string, req 
 	if err != nil {
 		return err
 	}
-	defer func() { _ = os.RemoveAll(tmp) }()
+	defer func() { keepTempForDebug(tmp, id, "dash") }()
 
 	var inputs []string
 
@@ -333,16 +387,16 @@ func runDASH(ctx context.Context, pub Publisher, id, title, destDir string, req 
 	}
 
 	outFile := outputPath(destDir, sanitizeFilename(title), ".mp4")
-	var ok bool
-	defer func() {
-		if !ok {
+	debugLog.Printf("[%s] muxing → %s", id[:8], outFile)
+	if err := mux(ctx, pub, id, title, inputs, outFile, start); err != nil {
+		if fi, statErr := os.Stat(outFile); statErr != nil || fi.Size() == 0 {
 			_ = os.Remove(outFile)
 		}
-	}()
-	if err := mux(ctx, pub, id, title, inputs, outFile, start); err != nil {
 		return err
 	}
-	ok = true
+	if fi, e := os.Stat(outFile); e == nil {
+		debugLog.Printf("[%s] output OK: %s (%s)", id[:8], outFile, formatBytes(fi.Size()))
+	}
 	return nil
 }
 
@@ -542,6 +596,19 @@ func downloadSegments(ctx context.Context, pub Publisher, id string, urls []stri
 						downloadedBytes += n
 						d := done
 						db := downloadedBytes
+						if d == 1 || d%100 == 0 {
+							elapsed := time.Since(start).Seconds()
+							speed := float64(db) / max1(elapsed)
+							estimatedTotal := db * total / max64(d, 1)
+							eta := int64(0)
+							if speed > 0 {
+								eta = int64(float64(estimatedTotal-db) / speed)
+							}
+							debugLog.Printf("seg progress: %d/%d segs (%.0f%%) | %s / ~%s | %.1f MB/s | ETA ~%ds",
+								d, total, float64(d)/float64(total)*100,
+								formatBytes(db), formatBytes(estimatedTotal),
+								speed/1e6, eta)
+						}
 						mu.Unlock()
 						_ = pub.Publish(events.ProgressMsg{
 							DownloadID:        id,
@@ -645,6 +712,9 @@ func downloadSegment(ctx context.Context, client *http.Client, u string, headers
 		return 0, err
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		debugLog.Printf("seg HTTP %d CT=%s url=%s", resp.StatusCode, resp.Header.Get("Content-Type"), u)
+	}
 	if resp.StatusCode == http.StatusNotFound {
 		return 0, fmt.Errorf("404: %s", u)
 	}
@@ -830,7 +900,11 @@ func muxConcat(ctx context.Context, pub Publisher, id, title string, segFiles []
 		debugLog.Printf("[%s] ffmpeg concat error: %v\n%s", id[:8], err, out)
 		return fmt.Errorf("stream: ffmpeg concat: %w\n%s", err, out)
 	}
-	debugLog.Printf("[%s] ffmpeg concat OK → %s", id[:8], outFile)
+	if fi, e := os.Stat(outFile); e == nil {
+		debugLog.Printf("[%s] ffmpeg concat OK → %s (%s)", id[:8], outFile, formatBytes(fi.Size()))
+	} else {
+		debugLog.Printf("[%s] ffmpeg concat OK but output missing: %v", id[:8], e)
+	}
 
 	return publishComplete(pub, id, title, outFile, start)
 }
@@ -950,6 +1024,19 @@ func sanitizeFilename(s string) string {
 	return strings.TrimSpace(string(runes))
 }
 
+func formatBytes(b int64) string {
+	switch {
+	case b >= 1<<30:
+		return fmt.Sprintf("%.2f GB", float64(b)/(1<<30))
+	case b >= 1<<20:
+		return fmt.Sprintf("%.1f MB", float64(b)/(1<<20))
+	case b >= 1<<10:
+		return fmt.Sprintf("%.0f KB", float64(b)/(1<<10))
+	default:
+		return fmt.Sprintf("%d B", b)
+	}
+}
+
 // validateVideoSegment reads the first bytes of a downloaded segment and returns
 // an error if the content is clearly not video (e.g. a PNG/JPEG tracking pixel
 // returned by a CDN when the request lacks authentication).
@@ -968,12 +1055,14 @@ func validateVideoSegment(path string) error {
 
 	// MPEG-TS sync byte
 	if hdr[0] == 0x47 {
+		debugLog.Printf("validateVideoSegment: MPEG-TS OK (%s)", path)
 		return nil
 	}
 	// fMP4 / MP4 box (4-byte size + 4-byte type)
 	if n >= 8 {
 		switch string(hdr[4:8]) {
 		case "ftyp", "moof", "styp", "mdat", "moov":
+			debugLog.Printf("validateVideoSegment: fMP4 OK box=%s (%s)", string(hdr[4:8]), path)
 			return nil
 		}
 	}
