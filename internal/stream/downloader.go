@@ -1012,9 +1012,21 @@ func fetchText(ctx context.Context, u string, headers map[string]string) (string
 	if err != nil {
 		return "", err
 	}
+	// Set browser-like defaults before applying caller headers so CDNs like
+	// turbosplayer.com don't detect Go-http-client and serve a fallback playlist.
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
+	cookie := req.Header.Get("Cookie")
+	if cookie == "" {
+		cookie = "(none)"
+	} else if len(cookie) > 120 {
+		cookie = cookie[:120] + "…"
+	}
+	debugLog.Printf("fetchText %s | Cookie: %s | Referer: %s", u, cookie, req.Header.Get("Referer"))
 	resp, err := (&http.Client{Timeout: 120 * time.Second}).Do(req)
 	if err != nil {
 		return "", err

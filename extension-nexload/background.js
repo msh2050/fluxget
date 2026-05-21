@@ -298,15 +298,29 @@ async function sniffHLSSegmentCookies(manifestUrl) {
 }
 
 // Video / stream → /stream (uses FluxGet's native HLS/DASH engine or yt-dlp fallback)
-// Forwards browser cookies for both the manifest domain and any CDN domain hosting
-// the actual segments (e.g. lh3.googleusercontent.com for turbosplayer streams).
+// Cookie strategy (mirrors IDM's onBeforeSendHeaders approach):
+//  1. Live-captured cookies from onBeforeSendHeaders (most accurate — includes
+//     partitioned/SameSite cookies the chrome.cookies API misses)
+//  2. Fallback: chrome.cookies.getAll({url}) for both manifest and segment domains
+// The user must play the video for a few seconds so the browser makes real
+// requests to the CDN and we can capture the authenticated Cookie headers.
 async function sendStream(url, title, headers, formats) {
   const allHeaders = { ...(headers || {}) };
   const cookieParts = [];
 
-  const manifestCookie = await getCookiesForURL(url);
-  if (manifestCookie) cookieParts.push(manifestCookie);
+  // Manifest domain cookies — try live capture first, then cookies API
+  try {
+    const manifestHost = new URL(url).hostname;
+    const live = capturedDomainCookies.get(manifestHost);
+    if (live) {
+      cookieParts.push(live);
+    } else {
+      const c = await getCookiesForURL(url);
+      if (c) cookieParts.push(c);
+    }
+  } catch {}
 
+  // Segment domain cookies (may differ from manifest domain, e.g. turbosplayer CDN)
   if (isManifestURL(url)) {
     const segCookie = await sniffHLSSegmentCookies(url);
     if (segCookie) cookieParts.push(segCookie);
