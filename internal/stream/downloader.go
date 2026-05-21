@@ -41,17 +41,54 @@ func debugDir() string {
 	return filepath.Join(home, "Downloads", ".fluxget-debug")
 }
 
-// keepTempForDebug moves a failed temp dir to the debug directory so segments
-// can be inspected. The dir is auto-deleted after 24h by cleanupOldDebugDirs.
+// keepTempForDebug copies a temp dir to the debug directory so segments can be
+// inspected. Uses copy+delete instead of os.Rename to handle cross-filesystem
+// moves (e.g. /tmp on tmpfs → ~/Downloads on ext4).
+// The dir is auto-deleted after 24h by cleanupOldDebugDirs.
 func keepTempForDebug(tmp, id, reason string) {
 	dest := filepath.Join(debugDir(), fmt.Sprintf("%s-%s-%s",
 		time.Now().Format("20060102-150405"), id[:8], reason))
 	_ = os.MkdirAll(debugDir(), 0o755)
-	if err := os.Rename(tmp, dest); err != nil {
-		debugLog.Printf("debug-keep: failed to move segments: %v", err)
+	if err := copyDir(tmp, dest); err != nil {
+		debugLog.Printf("debug-keep: failed to copy segments: %v", err)
 		return
 	}
+	_ = os.RemoveAll(tmp)
 	debugLog.Printf("debug-keep: segments saved → %s (auto-delete in 24h)", dest)
+}
+
+// copyDir recursively copies src directory to dst.
+func copyDir(src, dst string) error {
+	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		if info.IsDir() {
+			return os.MkdirAll(target, info.Mode())
+		}
+		return copyFile(path, target, info.Mode())
+	})
+}
+
+// copyFile copies a single file from src to dst with the given permissions.
+func copyFile(src, dst string, mode os.FileMode) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = in.Close() }()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = out.Close() }()
+	_, err = io.Copy(out, in)
+	return err
 }
 
 // cleanupOldDebugDirs removes debug segment dirs older than 24h.
