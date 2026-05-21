@@ -220,13 +220,11 @@ function sendDownload(url, filename, headers) {
   return apiPost("/download", { url, filename: filename || "", headers: headers || {}, skip_approval: true });
 }
 
-// getCookiesForURL returns the browser's Cookie header string for a given URL's
-// domain. This lets FluxGet authenticate with CDNs that require session cookies
-// (e.g. turbosplayer, streamtape) even though the download runs outside the browser.
+// getCookiesForURL returns the browser's Cookie header string for a given URL.
+// Uses the url parameter (not domain) so parent-domain cookies are included.
 async function getCookiesForURL(url) {
   try {
-    const { hostname } = new URL(url);
-    const cookies = await chrome.cookies.getAll({ domain: hostname });
+    const cookies = await chrome.cookies.getAll({ url });
     if (cookies.length === 0) return "";
     return cookies.map(c => `${c.name}=${c.value}`).join("; ");
   } catch {
@@ -234,13 +232,77 @@ async function getCookiesForURL(url) {
   }
 }
 
+// sniffHLSSegmentCookies fetches an HLS manifest in the browser's authenticated
+// context (credentials:include), follows one level of indirection for master→media
+// playlists, discovers the domain(s) hosting actual video segments, and returns
+// browser cookies for those domains. This handles CDNs like lh3.googleusercontent.com
+// where segments are on a different host than the manifest.
+async function sniffHLSSegmentCookies(manifestUrl) {
+  const baseHost = new URL(manifestUrl).hostname;
+  const seen = new Set([baseHost]);
+  const cookieParts = [];
+
+  const collectCookiesFor = async (segUrl) => {
+    try {
+      const h = new URL(segUrl).hostname;
+      if (seen.has(h)) return;
+      seen.add(h);
+      const c = await getCookiesForURL(segUrl);
+      if (c) cookieParts.push(c);
+    } catch {}
+  };
+
+  const firstNonCommentURL = (text, base) => {
+    for (const line of text.split("\n")) {
+      const t = line.trim();
+      if (!t || t.startsWith("#")) continue;
+      try { return t.startsWith("http") ? t : new URL(t, base).href; } catch {}
+    }
+    return null;
+  };
+
+  try {
+    const r = await fetch(manifestUrl, { credentials: "include", cache: "force-cache" });
+    if (!r.ok) return "";
+    const text = await r.text();
+    const firstUrl = firstNonCommentURL(text, manifestUrl);
+    if (!firstUrl) return "";
+
+    if (/\.m3u8(\?|#|$)/i.test(firstUrl)) {
+      // Master playlist — follow the first variant to find segment domain
+      await collectCookiesFor(firstUrl);
+      try {
+        const vr = await fetch(firstUrl, { credentials: "include", cache: "force-cache" });
+        if (vr.ok) {
+          const segUrl = firstNonCommentURL(await vr.text(), firstUrl);
+          if (segUrl) await collectCookiesFor(segUrl);
+        }
+      } catch {}
+    } else {
+      // Already a segment URL
+      await collectCookiesFor(firstUrl);
+    }
+  } catch {}
+
+  return cookieParts.join("; ");
+}
+
 // Video / stream → /stream (uses FluxGet's native HLS/DASH engine or yt-dlp fallback)
-// Automatically forwards browser cookies for the stream domain so CDN-authenticated
-// HLS/DASH streams (e.g. turbosplayer.com) work outside the browser context.
+// Forwards browser cookies for both the manifest domain and any CDN domain hosting
+// the actual segments (e.g. lh3.googleusercontent.com for turbosplayer streams).
 async function sendStream(url, title, headers, formats) {
-  const cookie = await getCookiesForURL(url);
   const allHeaders = { ...(headers || {}) };
-  if (cookie) allHeaders.Cookie = cookie;
+  const cookieParts = [];
+
+  const manifestCookie = await getCookiesForURL(url);
+  if (manifestCookie) cookieParts.push(manifestCookie);
+
+  if (isManifestURL(url)) {
+    const segCookie = await sniffHLSSegmentCookies(url);
+    if (segCookie) cookieParts.push(segCookie);
+  }
+
+  if (cookieParts.length > 0) allHeaders.Cookie = cookieParts.join("; ");
   return apiPost("/stream", { url, title: title || "", headers: allHeaders, formats: formats || [] });
 }
 

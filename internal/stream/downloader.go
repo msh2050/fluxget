@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -770,7 +771,15 @@ func downloadSegment(ctx context.Context, client *http.Client, u string, headers
 		return 0, err
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+	segHost := hostOf(u)
 	for k, v := range headers {
+		// Strip the Referer when it points to a different domain than the segment.
+		// CDNs like lh3.googleusercontent.com return PNG placeholders for requests
+		// with cross-origin Referer; sending no Referer (as the browser does via
+		// referrerpolicy="no-referrer" on the <video> element) is the correct behaviour.
+		if strings.EqualFold(k, "referer") && hostOf(v) != segHost {
+			continue
+		}
 		req.Header.Set(k, v)
 	}
 	resp, err := client.Do(req)
@@ -1188,4 +1197,13 @@ func max1(f float64) float64 {
 		return 1
 	}
 	return f
+}
+
+// hostOf returns the hostname from a URL string, or "" on parse error.
+func hostOf(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	return u.Hostname()
 }
