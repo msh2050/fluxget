@@ -252,8 +252,24 @@ func runHLS(ctx context.Context, pub Publisher, id, title, destDir string, req R
 	}
 	debugLog.Printf("[%s] segments downloaded: %d files", id[:8], len(segFiles))
 
+	if len(segFiles) > 0 {
+		if err := validateVideoSegment(segFiles[0]); err != nil {
+			return err
+		}
+	}
+
 	outFile := outputPath(destDir, sanitizeFilename(title), ".mp4")
-	return muxConcat(ctx, pub, id, title, segFiles, outFile, start)
+	var ok bool
+	defer func() {
+		if !ok {
+			_ = os.Remove(outFile)
+		}
+	}()
+	if err := muxConcat(ctx, pub, id, title, segFiles, outFile, start); err != nil {
+		return err
+	}
+	ok = true
+	return nil
 }
 
 // ── DASH ──────────────────────────────────────────────────────────────────────
@@ -290,6 +306,11 @@ func runDASH(ctx context.Context, pub Publisher, id, title, destDir string, req 
 		if err != nil {
 			return fmt.Errorf("stream: DASH video segments: %w", err)
 		}
+		if len(segFiles) > 0 {
+			if err := validateVideoSegment(segFiles[0]); err != nil {
+				return err
+			}
+		}
 		vconcat := filepath.Join(tmp, "video.mp4")
 		if err := catFiles(segFiles, vconcat); err != nil {
 			return err
@@ -312,7 +333,17 @@ func runDASH(ctx context.Context, pub Publisher, id, title, destDir string, req 
 	}
 
 	outFile := outputPath(destDir, sanitizeFilename(title), ".mp4")
-	return mux(ctx, pub, id, title, inputs, outFile, start)
+	var ok bool
+	defer func() {
+		if !ok {
+			_ = os.Remove(outFile)
+		}
+	}()
+	if err := mux(ctx, pub, id, title, inputs, outFile, start); err != nil {
+		return err
+	}
+	ok = true
+	return nil
 }
 
 // ── Direct file download ──────────────────────────────────────────────────────
@@ -917,6 +948,50 @@ func sanitizeFilename(s string) string {
 		runes = runes[:200]
 	}
 	return strings.TrimSpace(string(runes))
+}
+
+// validateVideoSegment reads the first bytes of a downloaded segment and returns
+// an error if the content is clearly not video (e.g. a PNG/JPEG tracking pixel
+// returned by a CDN when the request lacks authentication).
+func validateVideoSegment(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+
+	hdr := make([]byte, 8)
+	n, _ := f.Read(hdr)
+	if n < 4 {
+		return fmt.Errorf("stream: segment too small (%d bytes) — not valid video", n)
+	}
+
+	// MPEG-TS sync byte
+	if hdr[0] == 0x47 {
+		return nil
+	}
+	// fMP4 / MP4 box (4-byte size + 4-byte type)
+	if n >= 8 {
+		switch string(hdr[4:8]) {
+		case "ftyp", "moof", "styp", "mdat", "moov":
+			return nil
+		}
+	}
+	// PNG magic: 89 50 4E 47
+	if hdr[0] == 0x89 && hdr[1] == 0x50 && hdr[2] == 0x4E && hdr[3] == 0x47 {
+		return fmt.Errorf("stream: CDN returned a PNG image instead of video — the stream URL requires authentication (missing cookies or signed token)")
+	}
+	// JPEG magic: FF D8
+	if hdr[0] == 0xFF && hdr[1] == 0xD8 {
+		return fmt.Errorf("stream: CDN returned a JPEG image instead of video — the stream URL requires authentication")
+	}
+	// HTML error page
+	if strings.HasPrefix(string(hdr[:n]), "<!") || strings.HasPrefix(string(hdr[:n]), "<ht") {
+		return fmt.Errorf("stream: CDN returned an HTML error page instead of video — the stream URL requires authentication")
+	}
+	// Unknown but not obviously video — warn but allow (could be a codec we don't recognise)
+	debugLog.Printf("validateVideoSegment: unknown segment header %x — continuing", hdr[:n])
+	return nil
 }
 
 func extFromURL(u string) string {
