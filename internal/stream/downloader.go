@@ -600,6 +600,11 @@ func downloadSegments(ctx context.Context, pub Publisher, id string, urls []stri
 	var mu sync.Mutex
 	var downloadedBytes int64
 
+	// Derive a cancellable context so we can abort all workers when segment 0
+	// fails validation (e.g. CDN returns PNG tracking pixels instead of video).
+	dCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	type work struct {
 		idx int
 		url string
@@ -620,13 +625,12 @@ func downloadSegments(ctx context.Context, pub Publisher, id string, urls []stri
 			client := &http.Client{Timeout: 120 * time.Second}
 			backoff := retryDelay // per-worker backoff, grows on 429
 			for job := range jobs {
-				if ctx.Err() != nil {
-					errs <- ctx.Err()
+				if dCtx.Err() != nil {
 					return
 				}
 				var lastErr error
 				for attempt := 0; attempt < maxRetries; attempt++ {
-					n, err := downloadSegment(ctx, client, job.url, headers, files[job.idx])
+					n, err := downloadSegment(dCtx, client, job.url, headers, files[job.idx])
 					if err == nil {
 						mu.Lock()
 						done++
@@ -647,6 +651,17 @@ func downloadSegments(ctx context.Context, pub Publisher, id string, urls []stri
 								speed/1e6, eta)
 						}
 						mu.Unlock()
+						// Validate the first segment immediately so we can abort
+						// early if the CDN is returning error pages (PNG/HTML) instead
+						// of real video data.
+						if job.idx == 0 {
+							if verr := validateVideoSegment(files[0]); verr != nil {
+								debugLog.Printf("[%s] seg0 invalid — aborting all workers: %v", id[:8], verr)
+								cancel()
+								errs <- verr
+								return
+							}
+						}
 						_ = pub.Publish(events.ProgressMsg{
 							DownloadID:        id,
 							Downloaded:        db,
@@ -668,8 +683,7 @@ func downloadSegments(ctx context.Context, pub Publisher, id string, urls []stri
 						}
 						debugLog.Printf("[%s] 429 on seg %d — waiting %v (attempt %d)", id[:8], job.idx, wait, attempt+1)
 						select {
-						case <-ctx.Done():
-							errs <- ctx.Err()
+						case <-dCtx.Done():
 							return
 						case <-time.After(wait):
 						}
@@ -683,8 +697,7 @@ func downloadSegments(ctx context.Context, pub Publisher, id string, urls []stri
 					lastErr = err
 					if attempt < maxRetries-1 {
 						select {
-						case <-ctx.Done():
-							errs <- ctx.Err()
+						case <-dCtx.Done():
 							return
 						case <-time.After(retryDelay):
 						}
