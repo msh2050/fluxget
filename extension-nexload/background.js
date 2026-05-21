@@ -106,6 +106,12 @@ const capturedVideos = new Map();
 // tabId → { dashUrl, hlsUrl, formats, title }  from document.js
 const pageVideoData  = new Map();
 
+// hostname → cookie string captured live from onBeforeSendHeaders.
+// Mirrors IDM's approach: intercept the actual Cookie headers the browser sends
+// for CDN segment requests (e.g. lh3.googleusercontent.com) as the video plays,
+// so FluxGet can use authentic Google/CDN session cookies for downloading.
+const capturedDomainCookies = new Map();
+
 // Settings (loaded from chrome.storage.local)
 let settings = {
   interceptDownloads: true,  // intercept browser file downloads
@@ -247,6 +253,10 @@ async function sniffHLSSegmentCookies(manifestUrl) {
       const h = new URL(segUrl).hostname;
       if (seen.has(h)) return;
       seen.add(h);
+      // Prefer live-captured headers (exact cookies browser sent while playing)
+      const live = capturedDomainCookies.get(h);
+      if (live) { cookieParts.push(live); return; }
+      // Fallback: chrome.cookies API (works for non-third-party cookies)
       const c = await getCookiesForURL(segUrl);
       if (c) cookieParts.push(c);
     } catch {}
@@ -395,6 +405,28 @@ chrome.webRequest.onResponseStarted.addListener(
   },
   { urls: ["<all_urls>"], types: ["media", "xmlhttprequest", "other"] },
   ["responseHeaders"]
+);
+
+// Live capture of CDN request cookies — mirrors IDM's onBeforeSendHeaders approach.
+// As the browser plays a video it fetches HLS/DASH segments; we intercept those
+// requests and store the Cookie header per-hostname so FluxGet can use the exact
+// same authenticated headers when it downloads the same segments later.
+// Requires "extraHeaders" to access the Cookie header (Chrome MV3 observational mode).
+chrome.webRequest.onBeforeSendHeaders.addListener(
+  (details) => {
+    if (details.tabId < 0) return;
+    try {
+      const cookieHdr = (details.requestHeaders || []).find(
+        h => h.name.toLowerCase() === "cookie"
+      );
+      if (cookieHdr?.value) {
+        const host = new URL(details.url).hostname;
+        capturedDomainCookies.set(host, cookieHdr.value);
+      }
+    } catch {}
+  },
+  { urls: ["<all_urls>"], types: ["media", "xmlhttprequest", "other"] },
+  ["requestHeaders", "extraHeaders"]
 );
 
 chrome.tabs.onRemoved.addListener(id => {
