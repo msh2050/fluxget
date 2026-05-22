@@ -436,6 +436,8 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
       if (cookieHdr?.value) {
         const host = new URL(details.url).hostname;
         capturedDomainCookies.set(host, cookieHdr.value);
+        // Persist to session storage so the cookie survives MV3 service worker suspension.
+        chrome.storage.session.set({ [`cdncookie_${host}`]: cookieHdr.value }).catch(() => {});
       }
     } catch {}
   },
@@ -686,3 +688,14 @@ chrome.storage.local.get("fluxget_settings", (res) => {
 chrome.storage.onChanged.addListener((changes) => {
   if (changes.fluxget_settings) Object.assign(settings, changes.fluxget_settings.newValue || {});
 });
+
+// Restore CDN cookies captured before the service worker was last suspended.
+// MV3 service workers lose in-memory Maps on suspension; chrome.storage.session
+// persists for the browser session so we get the cookies back on next wake.
+chrome.storage.session.get(null).then(all => {
+  for (const [k, v] of Object.entries(all)) {
+    if (k.startsWith("cdncookie_") && v) {
+      capturedDomainCookies.set(k.slice("cdncookie_".length), v);
+    }
+  }
+}).catch(() => {});
