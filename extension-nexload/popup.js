@@ -12,6 +12,7 @@ let currentTabId    = null;
 let currentTabUrl   = "";
 let currentTabTitle = "";
 let detectedItems   = [];
+let interceptEnabled = true;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 function fmtSize(bytes) {
@@ -368,6 +369,37 @@ async function init() {
       const url   = token ? `${BASE_URL}/ui?token=${token}` : `${BASE_URL}/ui`;
       chrome.tabs.create({ url });
     });
+  });
+
+  // ── Disable / Enable toggle ──────────────────────────────────────────────────
+  const btnToggle = document.getElementById("btnToggle");
+
+  function updateToggleBtn() {
+    if (interceptEnabled) {
+      btnToggle.textContent = "⏸ Disable";
+      btnToggle.className   = "toolbar-btn";
+      btnToggle.title       = "Disable FluxGet download interception";
+    } else {
+      btnToggle.textContent = "▶ Enable";
+      btnToggle.className   = "toolbar-btn disabled-state";
+      btnToggle.title       = "Enable FluxGet download interception";
+    }
+  }
+
+  // Load current state from settings
+  chrome.storage.local.get("fluxget_settings", (res) => {
+    interceptEnabled = (res.fluxget_settings?.interceptDownloads !== false);
+    updateToggleBtn();
+  });
+
+  btnToggle.addEventListener("click", () => {
+    interceptEnabled = !interceptEnabled;
+    chrome.storage.local.get("fluxget_settings", (res) => {
+      const s = Object.assign({ interceptDownloads: true }, res.fluxget_settings || {});
+      s.interceptDownloads = interceptEnabled;
+      chrome.storage.local.set({ fluxget_settings: s });
+    });
+    updateToggleBtn();
   });
 }
 

@@ -7,13 +7,22 @@
 
   // ── Styles ────────────────────────────────────────────────────────────────────
   const STYLE = `
-    .fg-btn {
+    .fg-btn-wrap {
       position: fixed;
       z-index: 2147483640;
+      display: flex;
+      align-items: stretch;
+      pointer-events: auto;
+      user-select: none;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.55);
+      border-radius: 7px;
+    }
+    .fg-btn {
       background: rgba(15,15,20,0.92);
       color: #fff;
       border: 1px solid rgba(255,255,255,0.15);
-      border-radius: 7px;
+      border-right: none;
+      border-radius: 7px 0 0 7px;
       padding: 5px 12px;
       font-size: 12px;
       font-family: -apple-system, 'Segoe UI', sans-serif;
@@ -22,7 +31,6 @@
       display: flex;
       align-items: center;
       gap: 6px;
-      box-shadow: 0 4px 16px rgba(0,0,0,0.55);
       transition: background 0.12s, border-color 0.12s;
       white-space: nowrap;
       pointer-events: auto;
@@ -31,6 +39,24 @@
     }
     .fg-btn:hover { background: rgba(0,112,200,0.92); border-color: rgba(0,160,255,0.6); }
     .fg-btn svg  { flex-shrink: 0; }
+    .fg-close {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 22px;
+      background: rgba(15,15,20,0.92);
+      color: rgba(255,255,255,0.4);
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 0 7px 7px 0;
+      cursor: pointer;
+      font-size: 15px;
+      line-height: 1;
+      transition: background 0.12s, color 0.12s, border-color 0.12s;
+      flex-shrink: 0;
+      padding: 0;
+      font-family: inherit;
+    }
+    .fg-close:hover { background: rgba(180,30,30,0.9); color: #fff; border-color: rgba(255,80,80,0.5); }
 
     .fg-quality-panel {
       position: fixed;
@@ -218,6 +244,9 @@
   }
 
   function makeButton(video) {
+    const wrap = document.createElement("div");
+    wrap.className = "fg-btn-wrap";
+
     const btn = document.createElement("button");
     btn.className = "fg-btn";
     resetBtn(btn);
@@ -281,8 +310,26 @@
       positionPanel(panel, btn);
     });
 
-    document.documentElement.appendChild(btn);
-    return btn;
+    // Close "×" — dismisses the overlay for this video without downloading
+    const closeBtn = document.createElement("button");
+    closeBtn.className = "fg-close";
+    closeBtn.textContent = "×";
+    closeBtn.title = "Close";
+    closeBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+      const entry = tracked.get(video);
+      if (entry) {
+        cancelAnimationFrame(entry.rafId);
+        tracked.delete(video);
+      }
+      wrap.remove();
+    });
+
+    wrap.appendChild(btn);
+    wrap.appendChild(closeBtn);
+    document.documentElement.appendChild(wrap);
+    return { wrap, btn };
   }
 
   function positionButton(video, btn) {
@@ -299,15 +346,15 @@
 
   function trackVideo(video) {
     if (tracked.has(video)) return;
-    const btn = makeButton(video);
+    const { wrap, btn } = makeButton(video);
 
     function loop() {
-      if (!document.contains(video)) { btn.remove(); tracked.delete(video); return; }
-      positionButton(video, btn);
+      if (!document.contains(video)) { wrap.remove(); tracked.delete(video); return; }
+      positionButton(video, wrap);
       tracked.get(video).rafId = requestAnimationFrame(loop);
     }
 
-    const entry = { btn, rafId: null };
+    const entry = { btn, wrap, rafId: null };
     tracked.set(video, entry);
     entry.rafId = requestAnimationFrame(loop);
   }
