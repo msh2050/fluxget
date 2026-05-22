@@ -375,7 +375,8 @@ func (d *ConcurrentDownloader) downloadTask(ctx context.Context, rawurl string, 
 
 				activeTask.SpeedMu.Lock()
 				alpha := d.Runtime.GetSpeedEmaAlpha()
-				if activeTask.Speed == 0 {
+				if alpha <= 0 || activeTask.Speed == 0 {
+					// Alpha 0 disables smoothing and uses the latest measured speed directly.
 					activeTask.Speed = recentSpeed
 				} else {
 					activeTask.Speed = (1-alpha)*activeTask.Speed + alpha*recentSpeed
@@ -529,7 +530,7 @@ func (d *ConcurrentDownloader) HedgeWork(queue *TaskQueue) bool {
 	}
 
 	queue.Push(hedgedTask)
-	utils.Debug("Balancer: hedged %s (range: %d-%d) — idle worker will race on fresh connection",
+	utils.Debug("Balancer: hedged %s (range: %d-%d) - idle worker will race on fresh connection",
 		utils.ConvertBytesToHumanReadable(hedgedTask.Length), hedgedTask.Offset, hedgedTask.Offset+hedgedTask.Length)
 
 	return true

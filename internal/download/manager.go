@@ -10,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/msh2050/fluxget/internal/config"
 	"github.com/msh2050/fluxget/internal/engine/concurrent"
 	"github.com/msh2050/fluxget/internal/engine/events"
 	"github.com/msh2050/fluxget/internal/engine/single"
@@ -75,6 +74,9 @@ func uniqueFilePath(path string) string {
 // TUIDownload is the main entry point for downloads executed by the Engine pool
 func TUIDownload(ctx context.Context, cfg *types.DownloadConfig) error {
 	start := time.Now()
+	if cfg.Runtime == nil {
+		cfg.Runtime = types.DefaultRuntimeConfig()
+	}
 	// Engine expects cfg.OutputPath and cfg.Filename to be fully resolved by the processing layer
 	destPath := cfg.OutputPath
 	finalFilename := cfg.Filename
@@ -163,7 +165,7 @@ func TUIDownload(ctx context.Context, cfg *types.DownloadConfig) error {
 			utils.Debug("Probing %d mirrors", len(mirrors))
 			// Always check primary + mirrors to ensure we are using the best set
 			allToCheck := append([]string{cfg.URL}, mirrors...)
-			runCfg := &config.RuntimeConfig{
+			runCfg := &types.RuntimeConfig{
 				ProxyURL:  cfg.Runtime.ProxyURL,
 				CustomDNS: cfg.Runtime.CustomDNS,
 			}
@@ -196,7 +198,7 @@ func TUIDownload(ctx context.Context, cfg *types.DownloadConfig) error {
 		// Determine if we should attempt a fallback to single-threaded mode.
 		// We fallback if concurrent failed, but it wasn't a clean pause or external cancellation.
 		if downloadErr != nil && !errors.Is(downloadErr, types.ErrPaused) && !errors.Is(downloadErr, context.Canceled) && !errors.Is(downloadErr, context.DeadlineExceeded) {
-			utils.Debug("Concurrent download failed: %v — falling back to single-threaded", downloadErr)
+			utils.Debug("Concurrent download failed: %v - falling back to single-threaded", downloadErr)
 			useConcurrent = false // Trigger sequential block below
 
 			// Reset progress state cleanly for single-stream restart from byte 0
@@ -287,10 +289,6 @@ func Download(ctx context.Context, url string, outPath string, progressCh chan<-
 		State:      nil,
 	}
 	// Default runtime config
-	cfg.Runtime = &types.RuntimeConfig{
-		MaxConnectionsPerHost: types.PerHostMax,
-		MinChunkSize:          types.MinChunk,
-		WorkerBufferSize:      types.WorkerBuffer,
-	}
+	cfg.Runtime = types.DefaultRuntimeConfig()
 	return TUIDownload(ctx, &cfg)
 }

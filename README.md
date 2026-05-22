@@ -65,6 +65,10 @@ If you just want a fast terminal downloader, use [Surge](https://github.com/Surg
 - Headless server mode + CLI
 - System service install
 
+[**☕ Buy us a coffee**](https://www.buymeacoffee.com/surge.downloader)
+
+_Totally optional — your stars, issues, and contributions already mean the world to us! :)_
+
 ---
 
 ## Quick Start
@@ -114,6 +118,16 @@ http://127.0.0.1:1700/ui
 ```
 
 Live SSE-connected download list. Works from localhost without a token.
+
+### Auto-Start Service
+
+```bash
+# Install as a system service
+./fluxget service install
+./fluxget service start
+./fluxget service stop
+./fluxget service status
+```
 
 ---
 

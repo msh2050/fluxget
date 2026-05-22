@@ -310,11 +310,11 @@ func TestNewSingleDownloader(t *testing.T) {
 }
 
 func TestNewSingleDownloader_TransportReuse(t *testing.T) {
-	runtime := &types.RuntimeConfig{MaxConnectionsPerHost: 8}
-	t1 := engine.DefaultNetworkPool.AcquireTransport(runtime.ProxyURL, runtime.CustomDNS, runtime.GetMaxConnectionsPerHost())
+	runtime := &types.RuntimeConfig{MaxConnectionsPerDownload: 8}
+	t1 := engine.DefaultNetworkPool.AcquireTransport(runtime.ProxyURL, runtime.CustomDNS, runtime.GetMaxConnectionsPerDownload())
 	defer engine.DefaultNetworkPool.ReleaseTransport(t1)
 
-	t2 := engine.DefaultNetworkPool.AcquireTransport(runtime.ProxyURL, runtime.CustomDNS, runtime.GetMaxConnectionsPerHost())
+	t2 := engine.DefaultNetworkPool.AcquireTransport(runtime.ProxyURL, runtime.CustomDNS, runtime.GetMaxConnectionsPerDownload())
 	defer engine.DefaultNetworkPool.ReleaseTransport(t2)
 
 	if t1 != t2 {
@@ -326,10 +326,10 @@ func TestNewSingleDownloader_TransportIsolationByProxy(t *testing.T) {
 	r1 := &types.RuntimeConfig{ProxyURL: "http://127.0.0.1:8080"}
 	r2 := &types.RuntimeConfig{ProxyURL: "http://127.0.0.1:9090"}
 
-	t1 := engine.DefaultNetworkPool.AcquireTransport(r1.ProxyURL, r1.CustomDNS, r1.GetMaxConnectionsPerHost())
+	t1 := engine.DefaultNetworkPool.AcquireTransport(r1.ProxyURL, r1.CustomDNS, r1.GetMaxConnectionsPerDownload())
 	defer engine.DefaultNetworkPool.ReleaseTransport(t1)
 
-	t2 := engine.DefaultNetworkPool.AcquireTransport(r2.ProxyURL, r2.CustomDNS, r2.GetMaxConnectionsPerHost())
+	t2 := engine.DefaultNetworkPool.AcquireTransport(r2.ProxyURL, r2.CustomDNS, r2.GetMaxConnectionsPerDownload())
 	defer engine.DefaultNetworkPool.ReleaseTransport(t2)
 
 	if t1 == t2 {
@@ -597,7 +597,7 @@ func TestSingleDownloader_Download_ContentIntegrity(t *testing.T) {
 }
 
 // =============================================================================
-// PreallocateFailure — file handle release
+// PreallocateFailure - file handle release
 // =============================================================================
 
 func TestSingleDownloader_PreallocateFailure_ReleasesFileHandle(t *testing.T) {
@@ -641,13 +641,13 @@ func TestSingleDownloader_PreallocateFailure_ReleasesFileHandle(t *testing.T) {
 		t.Fatal("Expected error when preallocate fails on read-only file")
 	}
 	if !strings.Contains(err.Error(), "preallocate") && !strings.Contains(err.Error(), "permission") {
-		t.Logf("Got error: %v (acceptable — file handle should still be released)", err)
+		t.Logf("Got error: %v (acceptable - file handle should still be released)", err)
 	}
 
 	// Verificar que o file handle foi liberado: o arquivo pode ser removido
 	_ = os.Chmod(surgePath, 0o644)
 	if err := os.Remove(surgePath); err != nil {
-		t.Errorf("Failed to remove .surge file after preallocate failure — possible file handle leak: %v", err)
+		t.Errorf("Failed to remove .surge file after preallocate failure - possible file handle leak: %v", err)
 	}
 }
 

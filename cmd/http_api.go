@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/msh2050/fluxget/internal/config"
 	"github.com/msh2050/fluxget/internal/core"
 	"github.com/msh2050/fluxget/internal/engine/events"
 	"github.com/msh2050/fluxget/internal/stream"
@@ -321,7 +322,7 @@ func ensureOpenActionRequestAllowed(r *http.Request) error {
 	}
 
 	settings := getSettings()
-	if settings != nil && settings.General.AllowRemoteOpenActions {
+	if settings != nil && config.Resolve[bool](settings.General.AllowRemoteOpenActions) {
 		return nil
 	}
 

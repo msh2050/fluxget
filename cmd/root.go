@@ -87,7 +87,10 @@ var (
 	globalEnqueueMu         sync.Mutex
 )
 
-func buildPoolIsNameActive(getAll func() []types.DownloadConfig) processing.IsNameActiveFunc {
+// buildActiveDownloadChecker bridges the lifecycle manager and the worker pool.
+// LifecycleManager has no direct reference to the pool, so we inject this closure
+// at construction time to let it detect file-name collisions with in-flight downloads.
+func buildActiveDownloadChecker(getAll func() []types.DownloadConfig) processing.IsNameActiveFunc {
 	if getAll == nil {
 		return nil
 	}
@@ -138,7 +141,7 @@ func newLocalLifecycleManager(service core.DownloadService, getAll func() []type
 		addWithIDFunc = service.AddWithID
 	}
 
-	return processing.NewLifecycleManager(addFunc, addWithIDFunc, buildPoolIsNameActive(getAll))
+	return processing.NewLifecycleManager(addFunc, addWithIDFunc, buildActiveDownloadChecker(getAll))
 }
 
 func startLifecycleEventWorker(service core.DownloadService, mgr *processing.LifecycleManager) (func(), error) {
@@ -437,7 +440,7 @@ var rootCmd = &cobra.Command{
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
 		GlobalProgressCh = make(chan any, 100)
 		globalSettings = getSettings()
-		GlobalPool = download.NewWorkerPool(GlobalProgressCh, globalSettings.Network.MaxConcurrentDownloads)
+		GlobalPool = download.NewWorkerPool(GlobalProgressCh, config.Resolve[int](globalSettings.Network.MaxConcurrentDownloads))
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if ranRemote, err := maybeRunRemoteTUI(cmd, args); err != nil {
