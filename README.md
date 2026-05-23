@@ -7,7 +7,7 @@
 [![Go Version](https://img.shields.io/github/go-mod/go-version/msh2050/fluxget?style=flat-square&color=cyan)](go.mod)
 [![License](https://img.shields.io/badge/License-MIT-grey.svg?style=flat-square)](LICENSE)
 
-[Screenshots](#screenshots) • [What is this](#what-is-this) • [Why fork](#why-fork-from-surge) • [Features](#features) • [Quick Start](#quick-start) • [GUI](#gui-wails-desktop-app) • [Browser Extension](#browser-extension) • [HTTP API](#http-api) • [Architecture](#architecture) • [Credits](#credits--acknowledgements)
+[**Download**](https://github.com/msh2050/fluxget/releases/latest) • [Screenshots](#screenshots) • [What is this](#what-is-this) • [Why fork](#why-fork-from-surge) • [Features](#features) • [Quick Start](#quick-start) • [GUI](#gui-wails-desktop-app) • [Browser Extension](#browser-extension) • [HTTP API](#http-api) • [Architecture](#architecture) • [Credits](#credits--acknowledgements)
 
 </div>
 
@@ -107,10 +107,14 @@ If you just want a fast terminal downloader, use [Surge](https://github.com/Surg
 | **Browser extension** | MV3 Chrome/Edge extension: intercepts downloads, captures video streams from any site |
 | **Floating download button** | Appears on `<video>` elements with quality picker (Best / 1080p / 720p / 480p / Audio) |
 | **Popup stream list** | Shows all detected streams per tab with format badges, thumbnails, quality dropdown |
+| **Desktop GUI** | Native Wails + WebKit2GTK app: dark dashboard, live speed graph, queue management, per-item controls |
+| **Settings REST API** | `GET /settings` / `PUT /settings` — engine config over HTTP, persisted to `~/.config/fluxget/settings.json` |
+| **Chrome TLS fingerprint** | `utls` client with `HelloChrome_Auto` — bypasses Cloudflare Bot Management on CDN-protected streams |
 | **Web dashboard** | SSE-connected dark UI at `http://127.0.0.1:1700/ui` — no token needed from localhost |
 | **Referer passthrough** | CDN-protected streams: captures `documentUrl` and sends it as `Referer` header |
 | **JWPlayer interception** | Hooks `jwplayer().setup()` in MAIN world to capture HLS/DASH before blob: conversion |
 | **Video.js interception** | Same for `videojs()` player setup |
+| **Windows support** | CLI cross-compiles to Windows natively; GUI cross-compilable via mingw-w64 |
 
 ### What Surge brings (unchanged)
 
@@ -129,14 +133,38 @@ _Totally optional — your stars, issues, and contributions already mean the wor
 
 ## Quick Start
 
-### Requirements
+### Download pre-built release
+
+**[→ GitHub Releases](https://github.com/msh2050/fluxget/releases/latest)**
+
+| File | Platform | Notes |
+|---|---|---|
+| `fluxget-linux-amd64` | Linux | CLI / TUI / headless server |
+| `fluxget-gui-linux-amd64` | Linux | Desktop app (requires `libwebkit2gtk-4.1`) |
+| `fluxget_1.0.0_amd64.deb` | Debian / Ubuntu | Installs both binaries + desktop entry |
+| `fluxget-windows-amd64.exe` | Windows | CLI / headless server |
+| `fluxget-extension.zip` | Chrome / Edge | Load unpacked in `chrome://extensions` |
+
+```bash
+# Linux .deb install — easiest
+sudo apt install ffmpeg
+sudo dpkg -i fluxget_1.0.0_amd64.deb
+fluxget-gui          # desktop app
+fluxget server start # OR headless on port 1700
+```
+
+---
+
+### Build from source
+
+#### Requirements
 
 - **Go 1.25+** — to build from source
 - **ffmpeg** — for HLS/DASH mux (`sudo apt install ffmpeg`)
 - **yt-dlp** — for fallback platform support (`pip install yt-dlp`)
 - **Node.js** — required by yt-dlp for some platforms (`nvm install node`)
 
-### Build and Run
+#### CLI / headless server
 
 ```bash
 # Clone
@@ -155,6 +183,12 @@ go build -o fluxget .
 # Verify
 curl http://127.0.0.1:1700/health
 # → {"status":"ok","port":1700}
+```
+
+#### Windows (cross-compile from Linux)
+
+```bash
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o fluxget.exe .
 ```
 
 ### Load the Browser Extension
@@ -275,6 +309,8 @@ The backend runs on port **1700** by default.
 | PUT | `/update-url?id=` | Update stale URL |
 | POST | `/open-file?id=` | Open file (loopback only) |
 | POST | `/open-folder?id=` | Open folder (loopback only) |
+| GET | `/settings` | Read engine config as JSON |
+| PUT | `/settings` | Write engine config (persisted to `~/.config/fluxget/settings.json`) |
 
 ### /stream routing logic
 
@@ -310,28 +346,48 @@ The backend runs on port **1700** by default.
 fluxget/
 ├── main.go
 ├── cmd/
-│   ├── http_api.go          HTTP routes — all endpoints + SSE
-│   ├── root_downloads.go    /download handler
-│   ├── root_http_server.go  Port 1700, loopback auth bypass, ?token= support
-│   └── server.go            server start/stop/status subcommands
+│   ├── http_api.go           HTTP routes — all endpoints + SSE
+│   ├── embedded.go           StartEmbedded / ShutdownEmbedded — Wails GUI integration point
+│   ├── settings_api.go       GET /settings · PUT /settings — REST config over HTTP
+│   ├── root_downloads.go     /download handler
+│   ├── root_http_server.go   Port 1700, loopback auth bypass, ?token= support
+│   └── server.go             server start/stop/status subcommands
 ├── internal/
 │   ├── stream/
-│   │   ├── hls.go           HLS m3u8 parser (master + media, AES-128 key handling)
-│   │   ├── dash.go          DASH MPD XML parser (template expansion)
-│   │   └── downloader.go    Parallel segment fetcher, AES-128-CBC decrypt, ffmpeg mux
+│   │   ├── hls.go              HLS m3u8 parser (master + media, best-variant selection)
+│   │   ├── dash.go             DASH MPD XML parser ($Number$/$Time$/$Bandwidth$ expansion)
+│   │   ├── downloader.go       Parallel segment fetcher, AES-128-CBC decrypt, ffmpeg mux
+│   │   └── chrome_transport.go utls client with HelloChrome_Auto — bypasses Cloudflare JA3/JA4
 │   ├── webui/
-│   │   ├── ui.go            go:embed wrapper
-│   │   └── ui.html          Dark SSE-connected dashboard
+│   │   ├── ui.go               go:embed wrapper
+│   │   └── ui.html             Dark SSE-connected dashboard
 │   ├── ytdlp/
-│   │   └── ytdlp.go         yt-dlp subprocess runner + NeedsYtDlp() dispatch
-│   ├── engine/              Surge multi-connection engine (unchanged)
-│   └── processing/          Download lifecycle manager (unchanged)
-└── extension-nexload/       Browser extension (MV3, load unpacked)
+│   │   └── ytdlp.go            yt-dlp subprocess runner, NeedsYtDlp() dispatch logic
+│   ├── config/
+│   │   ├── settings.go         Settings struct, load/save ~/.config/fluxget/settings.json
+│   │   ├── settings_schema.go  JSON schema for the settings REST API
+│   │   └── paths.go            Platform-aware config/data directory resolution
+│   ├── download/
+│   │   ├── pool.go             WorkerPool — goroutine pool for concurrent downloads
+│   │   └── manager.go          Download state machine
+│   ├── engine/
+│   │   └── network.go          HTTP chunk fetcher with mirror failover (from Surge)
+│   └── processing/
+│       ├── manager.go          Download lifecycle coordination
+│       ├── pause_resume.go     Pause/resume/cancel lifecycle hooks
+│       └── probe.go            HEAD probe for file size and range support
+├── gui/                        Wails desktop app
+│   ├── main.go                 Wails entry point
+│   ├── app.go                  startup/shutdown; JSC signal-handler polling goroutine
+│   ├── signal_fix_linux.go     CGo: patches SA_ONSTACK on JSC handlers (Go 1.25 + WebKit2GTK)
+│   ├── signal_fix_other.go     No-op stub for Windows / macOS builds
+│   └── frontend/               Vite + vanilla JS dashboard (no framework)
+└── extension-nexload/          Browser extension (MV3, load unpacked — no build step)
     ├── manifest.json
-    ├── document.js          MAIN world: ytInitialPlayerResponse, fetch/XHR/JWPlayer hooks
-    ├── background.js        Service worker: intercept, capture, route
-    ├── content.js           Injected: floating button, quality picker, postMessage relay
-    └── popup.html / popup.js   Toolbar popup: stream list per tab
+    ├── document.js              MAIN world: ytInitialPlayerResponse, fetch/XHR/JWPlayer hooks
+    ├── background.js            Service worker: intercept, capture, route to /download or /stream
+    ├── content.js               Injected: floating button, quality picker, postMessage relay
+    └── popup.html / popup.js    Toolbar popup: stream list per tab
 ```
 
 ---
@@ -344,6 +400,8 @@ FluxGet builds on the work of many great open source projects:
 - **[yt-dlp](https://github.com/yt-dlp/yt-dlp)** — used as a subprocess fallback for platforms like Vimeo, Twitch, TikTok, and others where native manifest capture is not enough.
 - **[ffmpeg](https://ffmpeg.org/)** — lossless container remux for HLS/DASH segments (`-c copy`).
 - **[Bubble Tea](https://github.com/charmbracelet/bubbletea)** and **[Lip Gloss](https://github.com/charmbracelet/lipgloss)** — the TUI framework powering the terminal interface (via Surge).
+- **[Wails](https://wails.io/)** — Go + WebView desktop framework powering the native GUI on Linux (WebKit2GTK) and Windows (WebView2).
+- **[utls](https://github.com/refraction-networking/utls)** — Chrome TLS fingerprint spoofing used in the Chrome transport layer for Cloudflare-protected CDNs.
 
 ---
 
