@@ -17,14 +17,17 @@
 
 <div align="center">
 
-### Dashboard — live queue, speed graph, connection heatmap
-![Dashboard](docs/screenshots/dashboard.png)
+### Desktop GUI — live dashboard (3.4 MB/s active download, 60s network graph)
+![GUI Dashboard](docs/screenshots/gui-dashboard.png)
 
-### Completed — full history with size, speed, duration
-![Completed](docs/screenshots/completed.png)
+### Browser extension popup — streams detected on the current tab
+![Extension Popup](docs/screenshots/extension-popup.png)
 
-### Settings — per-engine configuration
-![Settings](docs/screenshots/settings.png)
+### Floating download button — appears on every `<video>` element
+![Floating Button](docs/screenshots/floating-button.png)
+
+### Quality picker — one-click quality selection per stream
+![Quality Picker](docs/screenshots/quality-picker.png)
 
 </div>
 
@@ -37,6 +40,42 @@ FluxGet is a **vibe-coded** download manager built in Go with a browser extensio
 It is forked from [Surge](https://github.com/SurgeDM/Surge), a fast multi-connection TUI downloader. FluxGet keeps the entire Surge engine and adds a full video/stream interception layer on top.
 
 > **Vibe development** — this project was built through conversation with Claude (Anthropic). The goal was to build a download manager that intercepts browser video streams the same way professional download managers do, using open standards and public browser APIs.
+
+---
+
+## What's been built
+
+The project is working end-to-end. Here is a summary of what's fully functional:
+
+### Desktop GUI (Wails + WebKit2GTK)
+- Native Linux desktop app wrapping the full FluxGet engine
+- Dark-themed dashboard with live speed graph (60s rolling network history)
+- Live queue: active, paused, queued, errored, and completed tabs with per-item actions
+- Stats bar: total throughput, active count, queue ETA, active connections heatmap
+- Per-item controls: pause, resume, retry, open file, open folder, info panel, remove
+- All operations (pause/resume/delete) persist correctly across restarts
+- Runs the HTTP engine on port 1700 automatically on startup
+- Resolved a Go 1.25 + WebKit2GTK/JSC signal-handler incompatibility that caused crashes
+  when JavaScript executed — fixed by polling and patching `SA_ONSTACK` on JSC's signal handlers
+
+### Browser Extension (MV3, Chrome/Edge)
+- Floating **FluxGet** button injects on every `<video>` element in the page
+- Clicking it opens a quality picker: **1080p HD / 720p HD / 480p / 360p / Audio only**
+- Extension toolbar popup lists all streams detected on the current tab
+- Shows format badge (HLS / DASH / MP4 / WebM), quality dropdown, Download button, Copy URL
+- **Download All** batch download from popup
+- YouTube adaptive streams captured directly from `ytInitialPlayerResponse` — no yt-dlp
+- HLS/DASH manifest URLs captured by patching `fetch()` and `XHR` in MAIN world
+- JWPlayer and Video.js setups hooked before player initialization
+- Connection status indicator in the popup (green Connected / red Not running)
+
+### Download Engine
+- Native HLS parser: master + media playlists, best-variant selection, AES-128-CBC decryption
+- Native DASH parser: MPD XML, `$Number$` / `$Time$` / `$Bandwidth$` template expansion
+- YouTube adaptive: picks best video + audio pair, muxes with ffmpeg `-c copy`
+- yt-dlp fallback for Vimeo, Twitch, TikTok, and 30+ known platforms
+- Multi-connection parallel chunk engine (up to 32 workers) from Surge, fully intact
+- Full download history persisted in SQLite
 
 ---
 
