@@ -17,7 +17,7 @@
 
 <div align="center">
 
-### Desktop GUI — live dashboard (3.4 MB/s active download, 60s network graph)
+### Desktop GUI — live dashboard with 60s rolling network graph (speed shown is the author's ISP max)
 ![GUI Dashboard](docs/screenshots/gui-dashboard.png)
 
 ### Browser extension popup — streams detected on the current tab
@@ -125,9 +125,9 @@ If you just want a fast terminal downloader, use [Surge](https://github.com/Surg
 - Headless server mode + CLI
 - System service install
 
-[**☕ Buy us a coffee**](https://www.buymeacoffee.com/surge.downloader)
+[**☕ Buy them a coffee**](https://www.buymeacoffee.com/surge.downloader)
 
-_Totally optional — your stars, issues, and contributions already mean the world to us! :)_
+_Surge powers FluxGet's download engine — if it's useful to you, consider supporting the original authors._
 
 ---
 
@@ -376,7 +376,7 @@ fluxget/
 │       ├── manager.go          Download lifecycle coordination
 │       ├── pause_resume.go     Pause/resume/cancel lifecycle hooks
 │       └── probe.go            HEAD probe for file size and range support
-├── gui/                        Wails desktop app
+├── gui/                        ★ Wails v2 desktop app (WebKit2GTK on Linux, WebView2 on Windows)
 │   ├── main.go                 Wails entry point
 │   ├── app.go                  startup/shutdown; JSC signal-handler polling goroutine
 │   ├── signal_fix_linux.go     CGo: patches SA_ONSTACK on JSC handlers (Go 1.25 + WebKit2GTK)
