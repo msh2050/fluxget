@@ -7,7 +7,24 @@
 [![Go Version](https://img.shields.io/github/go-mod/go-version/msh2050/fluxget?style=flat-square&color=cyan)](go.mod)
 [![License](https://img.shields.io/badge/License-MIT-grey.svg?style=flat-square)](LICENSE)
 
-[What is this](#what-is-this) • [Why fork](#why-fork-from-surge) • [Features](#features) • [Quick Start](#quick-start) • [Browser Extension](#browser-extension) • [HTTP API](#http-api) • [Architecture](#architecture) • [Credits](#credits--acknowledgements)
+[Screenshots](#screenshots) • [What is this](#what-is-this) • [Why fork](#why-fork-from-surge) • [Features](#features) • [Quick Start](#quick-start) • [GUI](#gui-wails-desktop-app) • [Browser Extension](#browser-extension) • [HTTP API](#http-api) • [Architecture](#architecture) • [Credits](#credits--acknowledgements)
+
+</div>
+
+---
+
+## Screenshots
+
+<div align="center">
+
+### Dashboard — live queue, speed graph, connection heatmap
+![Dashboard](docs/screenshots/dashboard.png)
+
+### Completed — full history with size, speed, duration
+![Completed](docs/screenshots/completed.png)
+
+### Settings — per-engine configuration
+![Settings](docs/screenshots/settings.png)
 
 </div>
 
@@ -111,13 +128,35 @@ curl http://127.0.0.1:1700/health
 
 > No auth token needed — the extension talks to `127.0.0.1:1700` directly, and loopback connections bypass authentication.
 
+### GUI (Wails Desktop App)
+
+```bash
+# Requirements: libwebkit2gtk-4.1-dev, wails
+sudo apt install libwebkit2gtk-4.1-dev build-essential
+go install github.com/wailsapp/wails/v2/cmd/wails@latest
+
+# Build the native desktop app
+cd gui
+wails build -tags webkit2_41 -o ../fluxget-gui
+
+# Run
+./fluxget-gui
+```
+
+The GUI automatically starts the backend engine on port 1700. Features:
+
+- **Dashboard** — live queue with speed graph, connection heatmap, 60s network history
+- **Completed** — full download history with avg speed, duration, file size
+- **Settings** — per-engine config (Surge, HLS/DASH, yt-dlp, Browser Extension), saved to `~/.config/fluxget/settings.json`
+- **Per-item actions** — pause/resume, retry (on error), open file, open folder, info panel (source URL + dest path), remove
+
 ### Web Dashboard
 
 ```
 http://127.0.0.1:1700/ui
 ```
 
-Live SSE-connected download list. Works from localhost without a token.
+Same UI served as a webpage. Works from localhost without a token.
 
 ### Auto-Start Service
 

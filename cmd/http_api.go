@@ -174,6 +174,32 @@ func registerHTTPRoutes(mux *http.ServeMux, port int, defaultOutputDir string, s
 
 		writeJSONResponse(w, http.StatusOK, map[string]string{"status": "updated", "id": id, "url": newURL})
 	})))
+
+	// GET /settings — return flat settings for the GUI
+	// POST /settings — update settings from the GUI
+	mux.HandleFunc("/settings", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet, "":
+			s := getSettings()
+			writeJSONResponse(w, http.StatusOK, flattenSettings(s))
+		case http.MethodPost:
+			var flat flatSettings
+			if err := decodeJSONBody(r, &flat); err != nil {
+				http.Error(w, "Invalid body: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			s := getSettings()
+			applyFlatSettings(s, flat)
+			if err := config.SaveSettings(s); err != nil {
+				http.Error(w, "Failed to save: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			globalSettings = s
+			writeJSONResponse(w, http.StatusOK, map[string]string{"status": "saved"})
+		default:
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
 }
 
 func eventsHandler(service core.DownloadService) http.HandlerFunc {

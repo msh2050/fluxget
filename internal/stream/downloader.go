@@ -633,13 +633,22 @@ func downloadSegments(ctx context.Context, pub Publisher, id string, urls []stri
 	}
 	close(jobs)
 
+	// Use Chrome-fingerprinted TLS for all segment fetches. Cloudflare Bot Management
+	// ties __cf_bm to the browser's JA3/JA4 fingerprint; Go's TLS ClientHello is
+	// identifiably different and causes 403s even with valid cookies.
+	segClient := newChromeClient(120 * time.Second)
+	// Strip cookies that are bound to Chrome's TLS session fingerprint. Replaying
+	// __cf_bm / __cf_clearance from a browser session through Go's (now Chrome-disguised)
+	// TLS does work, but belt-and-suspenders: scrub them so we always start fresh.
+	segHeaders := stripCloudflareCookies(headers)
+
 	errs := make(chan error, segWorkers)
 	var wg sync.WaitGroup
 	for w := 0; w < segWorkers; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			client := &http.Client{Timeout: 120 * time.Second}
+			client := segClient
 			backoff := retryDelay // per-worker backoff, grows on 429
 			for job := range jobs {
 				if dCtx.Err() != nil {
@@ -647,7 +656,7 @@ func downloadSegments(ctx context.Context, pub Publisher, id string, urls []stri
 				}
 				var lastErr error
 				for attempt := 0; attempt < maxRetries; attempt++ {
-					n, err := downloadSegment(dCtx, client, job.url, headers, files[job.idx])
+					n, err := downloadSegment(dCtx, client, job.url, segHeaders, files[job.idx])
 					if err == nil {
 						mu.Lock()
 						done++
@@ -771,15 +780,7 @@ func downloadSegment(ctx context.Context, client *http.Client, u string, headers
 		return 0, err
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-	segHost := hostOf(u)
 	for k, v := range headers {
-		// Strip the Referer when it points to a different domain than the segment.
-		// CDNs like lh3.googleusercontent.com return PNG placeholders for requests
-		// with cross-origin Referer; sending no Referer (as the browser does via
-		// referrerpolicy="no-referrer" on the <video> element) is the correct behaviour.
-		if strings.EqualFold(k, "referer") && hostOf(v) != segHost {
-			continue
-		}
 		req.Header.Set(k, v)
 	}
 	resp, err := client.Do(req)
@@ -1209,6 +1210,39 @@ func max1(f float64) float64 {
 		return 1
 	}
 	return f
+}
+
+// stripCloudflareCookies returns a copy of headers with Cloudflare session-fingerprint
+// cookies (__cf_bm, __cf_clearance, _cfuvid) removed from the Cookie value.
+// These cookies are cryptographically tied to Chrome's TLS session fingerprint;
+// replaying them from any other client triggers an immediate 403 from Cloudflare WAF.
+// With the Chrome-fingerprinted transport we start fresh sessions and Cloudflare
+// issues new cookies — there is no need to forward the browser-captured ones.
+func stripCloudflareCookies(headers map[string]string) map[string]string {
+	out := make(map[string]string, len(headers))
+	for k, v := range headers {
+		if strings.EqualFold(k, "cookie") {
+			var kept []string
+			for _, part := range strings.Split(v, ";") {
+				part = strings.TrimSpace(part)
+				name := part
+				if i := strings.IndexByte(part, '='); i >= 0 {
+					name = strings.TrimSpace(part[:i])
+				}
+				if name == "__cf_bm" || name == "__cf_clearance" || name == "_cfuvid" {
+					continue
+				}
+				kept = append(kept, part)
+			}
+			if len(kept) == 0 {
+				continue
+			}
+			out[k] = strings.Join(kept, "; ")
+			continue
+		}
+		out[k] = v
+	}
+	return out
 }
 
 // hostOf returns the hostname from a URL string, or "" on parse error.
