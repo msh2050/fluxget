@@ -35,5 +35,3 @@ result-*
 # local dev artifacts
 design_handoff_fluxget_gui/
 .claude/
-gui/frontend/wailsjs/
-fluxget-gui
