@@ -9,7 +9,7 @@
   const STYLE = `
     .fg-btn-wrap {
       position: fixed;
-      z-index: 2147483640;
+      z-index: 2147483647;
       display: flex;
       align-items: stretch;
       pointer-events: auto;
@@ -116,8 +116,9 @@
   (document.head || document.documentElement).appendChild(styleEl);
 
   // ── State ─────────────────────────────────────────────────────────────────────
-  const tracked  = new Map(); // video → { btn, panel, rafId }
-  let   qualities = [];       // picker options from background.js
+  const tracked   = new Map(); // video → { btn, panel, rafId }
+  const dismissed = new Set(); // videos the user explicitly closed — not re-shown until SPA nav
+  let   qualities = [];        // picker options from background.js
   let   pageTitle = "";
 
   // Fallback quality options when YouTube data isn't captured (uses yt-dlp format selectors)
@@ -310,21 +311,29 @@
       positionPanel(panel, btn);
     });
 
-    // Close "×" — dismisses the overlay for this video without downloading
+    // Close "×" — dismisses the overlay for this video without downloading.
+    // Uses pointerdown+capture so player overlays that intercept click events
+    // (common on sites like missav) cannot swallow the dismiss action.
     const closeBtn = document.createElement("button");
     closeBtn.className = "fg-close";
+    closeBtn.type = "button";
     closeBtn.textContent = "×";
     closeBtn.title = "Close";
-    closeBtn.addEventListener("click", (e) => {
+
+    function doClose(e) {
       e.stopPropagation();
+      e.stopImmediatePropagation();
       e.preventDefault();
+      dismissed.add(video); // prevent MutationObserver from re-adding it
       const entry = tracked.get(video);
       if (entry) {
         cancelAnimationFrame(entry.rafId);
         tracked.delete(video);
       }
       wrap.remove();
-    });
+    }
+    closeBtn.addEventListener("pointerdown", doClose, { capture: true });
+    closeBtn.addEventListener("click",       doClose, { capture: true });
 
     wrap.appendChild(btn);
     wrap.appendChild(closeBtn);
@@ -346,6 +355,7 @@
 
   function trackVideo(video) {
     if (tracked.has(video)) return;
+    if (dismissed.has(video)) return;
     const { wrap, btn } = makeButton(video);
 
     function loop() {
@@ -448,6 +458,7 @@
     if (location.href !== lastHref) {
       lastHref = location.href;
       qualities = [];       // clear stale quality data on navigation
+      dismissed.clear();    // allow overlay to reappear on new page/video
       tracked.forEach(({ btn }) => resetBtn(btn));
       setTimeout(scanForVideos, 1500);
     }
