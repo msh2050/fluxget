@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"time"
 
 	fluxcmd "github.com/msh2050/fluxget/cmd"
 	"github.com/msh2050/fluxget/internal/config"
@@ -21,9 +22,20 @@ func NewApp() *App {
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
 
-	// Belt-and-suspenders: patch any signal handlers registered before our
-	// process-wide sigaction() override (signal_fix_linux.go) became active.
-	fixWebKitSignalHandlers()
+	// JSC installs SIGSEGV/SIGBUS/SIGILL handlers lazily when JS first executes
+	// (not at WebView init time), so a one-shot patch at startup misses them.
+	// Poll rapidly at first, then slowly forever to catch the installation and
+	// any future re-registrations. Each call is 3 sigaction syscalls — negligible.
+	go func() {
+		for i := 0; i < 500; i++ { // first 5 seconds: every 10ms
+			time.Sleep(10 * time.Millisecond)
+			fixWebKitSignalHandlers()
+		}
+		for { // afterwards: every 500ms
+			time.Sleep(500 * time.Millisecond)
+			fixWebKitSignalHandlers()
+		}
+	}()
 
 	outputDir := config.GetDownloadsDir()
 	if outputDir == "" {
