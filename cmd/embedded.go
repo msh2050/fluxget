@@ -1,5 +1,10 @@
 package cmd
 
+import (
+	"github.com/msh2050/fluxget/internal/config"
+	"github.com/msh2050/fluxget/internal/download"
+)
+
 // StartEmbedded starts the FluxGet HTTP server for embedded use (Wails GUI).
 // It initialises the download engine, binds to port, and begins serving.
 // Call ShutdownEmbedded when the host application exits.
@@ -8,6 +13,11 @@ func StartEmbedded(port int, outputDir string) error {
 	if err := initializeGlobalState(); err != nil {
 		return err
 	}
+
+	// Mirror what cobra's PersistentPreRun does for CLI mode.
+	GlobalProgressCh = make(chan any, 100)
+	globalSettings = getSettings()
+	GlobalPool = download.NewWorkerPool(GlobalProgressCh, config.Resolve[int](globalSettings.Network.MaxConcurrentDownloads))
 
 	_, listener, err := bindServerListener(port)
 	if err != nil {
