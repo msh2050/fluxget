@@ -138,6 +138,7 @@ func NeedsYtDlp(rawURL string) bool {
 
 	// Additional platforms not in IDMNetMon but supported by yt-dlp
 	ytdlpPlatforms := []string{
+		"huggingface.co",
 		"twitch.tv", "twitch.com",
 		"dailymotion.com",
 		"tiktok.com",
@@ -310,6 +311,80 @@ func Start(ctx context.Context, pub Publisher, req Request) (string, error) {
 		if err := cmd.Wait(); err != nil {
 			stderr := strings.TrimSpace(stderrBuf.String())
 			debugLog.Printf("error url=%s\nstderr:\n%s", req.URL, stderr)
+
+			// If the chosen format selector is too specific for this site's
+			// available formats, retry once with the simplest possible selector.
+			if strings.Contains(stderr, "Requested format is not available") && format != "best" {
+				debugLog.Printf("format not available, retrying with --format best url=%s", req.URL)
+				retryArgs := make([]string, 0, len(args))
+				skipNext := false
+				for i, a := range args {
+					if skipNext {
+						skipNext = false
+						continue
+					}
+					if a == "-f" && i+1 < len(args) {
+						retryArgs = append(retryArgs, "-f", "best")
+						skipNext = true
+						continue
+					}
+					retryArgs = append(retryArgs, a)
+				}
+				retryCmd := exec.CommandContext(ctx, bin, retryArgs...)
+				var retryStderr strings.Builder
+				retryCmd.Stderr = &retryStderr
+				retryOut, _ := retryCmd.StdoutPipe()
+				if retryCmd.Start() == nil {
+					scanner2 := bufio.NewScanner(retryOut)
+					for scanner2.Scan() {
+						line := scanner2.Text()
+						parts := strings.Split(line, "\t")
+						if len(parts) < 5 {
+							continue
+						}
+						status := strings.TrimSpace(parts[0])
+						downloaded := parseInt64(parts[1])
+						total := parseInt64(parts[2])
+						speed := parseFloat64(parts[3])
+						if downloaded > 0 {
+							lastDownloaded = downloaded
+						}
+						if total > 0 {
+							lastTotal = total
+						}
+						if status == "downloading" || status == "finished" {
+							_ = pub.Publish(events.ProgressMsg{
+								DownloadID:        id,
+								Downloaded:        lastDownloaded,
+								Total:             lastTotal,
+								Speed:             speed,
+								Elapsed:           time.Since(start),
+								ActiveConnections: 1,
+							})
+						}
+					}
+					if retryCmd.Wait() == nil {
+						elapsed := time.Since(start)
+						avgSpeed := 0.0
+						if elapsed.Seconds() > 0 && lastTotal > 0 {
+							avgSpeed = float64(lastTotal) / elapsed.Seconds()
+						}
+						_ = pub.Publish(events.DownloadCompleteMsg{
+							DownloadID: id,
+							Filename:   filename,
+							Elapsed:    elapsed,
+							Total:      lastTotal,
+							AvgSpeed:   avgSpeed,
+						})
+						return
+					}
+					// retry also failed — fall through and report the original error
+					if s := strings.TrimSpace(retryStderr.String()); s != "" {
+						stderr = s
+					}
+				}
+			}
+
 			errMsg := fmt.Errorf("yt-dlp: %w", err)
 			if stderr != "" {
 				// Surface the last meaningful line of stderr to the UI

@@ -17,6 +17,9 @@ import (
 //go:embed all:frontend/dist
 var assets embed.FS
 
+//go:embed appicon48.png
+var windowIcon []byte
+
 // apiPaths are the backend routes proxied to the FluxGet HTTP server on :1700.
 var apiPaths = []string{
 	"/events", "/list", "/history", "/pause", "/resume",
@@ -27,6 +30,16 @@ var apiPaths = []string{
 func backendProxy() func(http.Handler) http.Handler {
 	target, _ := url.Parse("http://localhost:1700")
 	proxy := httputil.NewSingleHostReverseProxy(target)
+	// httputil.ReverseProxy adds X-Forwarded-For by default. The backend's
+	// open-file/open-folder guard rejects requests that have this header even
+	// when the underlying connection is loopback. Strip it so the backend sees
+	// a pure loopback request and allows the action.
+	orig := proxy.Director
+	proxy.Director = func(req *http.Request) {
+		orig(req)
+		req.Header.Del("X-Forwarded-For")
+		req.Header.Del("X-Real-IP")
+	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			for _, p := range apiPaths {
@@ -52,11 +65,14 @@ func main() {
 			Assets:     assets,
 			Middleware: backendProxy(),
 		},
-		BackgroundColour: &options.RGBA{R: 11, G: 11, B: 12, A: 255},
-		OnStartup:        app.startup,
-		OnShutdown:       app.shutdown,
+		BackgroundColour:   &options.RGBA{R: 11, G: 11, B: 12, A: 255},
+		HideWindowOnClose: true,
+		OnStartup:         app.startup,
+		OnShutdown:        app.shutdown,
 		Bind:             []interface{}{app},
 		Linux: &linux.Options{
+			ProgramName:         "fluxget-gui",
+			Icon:                windowIcon,
 			WindowIsTranslucent: false,
 			WebviewGpuPolicy:    linux.WebviewGpuPolicyOnDemand,
 		},

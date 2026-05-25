@@ -47,6 +47,8 @@ func (a *App) startup(ctx context.Context) {
 			log.Printf("FluxGet engine error: %v", err)
 		}
 	}()
+
+	go InitTray(a)
 }
 
 func (a *App) shutdown(ctx context.Context) {

@@ -31,6 +31,9 @@ type flatSettings struct {
 	// Browser extension
 	Port     int  `json:"port"`
 	AutoPair bool `json:"autoPair"`
+
+	// HuggingFace
+	HFToken string `json:"hfToken"`
 }
 
 func flattenSettings(s *config.Settings) flatSettings {
@@ -55,6 +58,7 @@ func flattenSettings(s *config.Settings) flatSettings {
 		YtdlpFormat:    "mp4",
 		Port:           1700,
 		AutoPair:       false,
+		HFToken:        config.Resolve[string](s.Extension.HFToken),
 	}
 }
 
@@ -101,6 +105,7 @@ func applyFlatSettings(s *config.Settings, f flatSettings) {
 		setStr(&s.Network.UserAgent, f.UserAgent)
 	}
 	setStr(&s.Network.ProxyURL, f.ProxyURL)
+	setStr(&s.Extension.HFToken, f.HFToken)
 }
 
 func intToStr(n int) string {

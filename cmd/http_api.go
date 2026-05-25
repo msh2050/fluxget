@@ -195,6 +195,9 @@ func registerHTTPRoutes(mux *http.ServeMux, port int, defaultOutputDir string, s
 				return
 			}
 			globalSettings = s
+			// Apply auto-start side-effect (systemd service + XDG autostart entry).
+			// Errors are non-fatal — settings are already saved.
+			_ = utils.SetAutoStart(flat.AutoStart)
 			writeJSONResponse(w, http.StatusOK, map[string]string{"status": "saved"})
 		default:
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -433,6 +436,17 @@ func handleStream(w http.ResponseWriter, r *http.Request, defaultOutputDir strin
 
 	// For platform pages (YouTube, Vimeo, etc.) fall back to yt-dlp
 	if ytdlp.NeedsYtDlp(req.URL) || req.YtFormat != "" {
+		// Inject HuggingFace token for private/gated model downloads.
+		if strings.Contains(strings.ToLower(req.URL), "huggingface.co") {
+			if s := getSettings(); s != nil {
+				if tok := config.Resolve[string](s.Extension.HFToken); tok != "" {
+					if req.Headers == nil {
+						req.Headers = make(map[string]string)
+					}
+					req.Headers["Authorization"] = "Bearer " + tok
+				}
+			}
+		}
 		id, err := ytdlp.Start(context.Background(), service, ytdlp.Request{
 			URL:     req.URL,
 			Title:   req.Title,

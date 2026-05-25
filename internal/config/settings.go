@@ -74,6 +74,7 @@ type ExtensionSettings struct {
 	FirefoxExtensionURL *Setting `json:"firefox_extension_url"`
 	AuthToken           *Setting `json:"auth_token"`
 	InstructionsURL     *Setting `json:"instructions_url"`
+	HFToken             *Setting `json:"hf_token"`
 }
 
 // UnmarshalJSON updates only the Value field of the initialized pointer.
@@ -871,6 +872,14 @@ func DefaultSettings() *Settings {
 				Type:         "link",
 				DefaultValue: "https://github.com/SurgeDM/Surge#browser-extension",
 				Value:        "https://github.com/SurgeDM/Surge#browser-extension",
+			},
+			HFToken: &Setting{
+				Key:          "hf_token",
+				Label:        "HuggingFace Token",
+				Description:  "Your HuggingFace access token (hf_...). Required to download private or gated models.",
+				Type:         "password",
+				DefaultValue: "",
+				Value:        "",
 			},
 		},
 	}
