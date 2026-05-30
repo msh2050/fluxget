@@ -34,10 +34,15 @@ func backendProxy() func(http.Handler) http.Handler {
 	// open-file/open-folder guard rejects requests that have this header even
 	// when the underlying connection is loopback. Strip it so the backend sees
 	// a pure loopback request and allows the action.
+	//
+	// NOTE: a plain Header.Del here does NOT work — ReverseProxy.ServeHTTP runs
+	// after Director and re-populates X-Forwarded-For with the client IP. The
+	// documented way to suppress it entirely is to set the header to nil (see
+	// Go issue 38079); the proxy then omits it instead of overwriting.
 	orig := proxy.Director
 	proxy.Director = func(req *http.Request) {
 		orig(req)
-		req.Header.Del("X-Forwarded-For")
+		req.Header["X-Forwarded-For"] = nil
 		req.Header.Del("X-Real-IP")
 	}
 	return func(next http.Handler) http.Handler {

@@ -805,13 +805,100 @@ func downloadSegment(ctx context.Context, client *http.Client, u string, headers
 	if resp.StatusCode >= 400 {
 		return 0, fmt.Errorf("HTTP %d: %s", resp.StatusCode, u)
 	}
-	f, err := os.Create(dest)
+	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return 0, err
 	}
-	defer func() { _ = f.Close() }()
-	n, err := io.Copy(f, resp.Body)
-	return n, err
+	// Some HLS CDNs (e.g. turbosplayer.com) obfuscate each segment by gluing a
+	// tiny fake PNG/JPEG/GIF header (+ padding) in front of the real MPEG-TS/fMP4
+	// payload. Strip it transparently — same as IDM — so ffmpeg sees clean media.
+	if stripped, ok := stripFakeImagePrefix(data); ok {
+		data = stripped
+	}
+	if err := os.WriteFile(dest, data, 0o644); err != nil {
+		return 0, err
+	}
+	return int64(len(data)), nil
+}
+
+// stripFakeImagePrefix detects the fake image-header obfuscation used by some HLS
+// CDNs, where each .ts/.m4s segment is prefixed with a tiny still image (often a
+// 1x1 PNG) plus padding bytes, with the real MPEG-TS or fMP4 payload appended
+// after. It returns the cleaned payload and true if a prefix was stripped,
+// otherwise (nil, false).
+func stripFakeImagePrefix(data []byte) ([]byte, bool) {
+	if !looksLikeFakeImageHeader(data) {
+		return nil, false
+	}
+	if start := findMediaStart(data); start > 0 {
+		debugLog.Printf("stripFakeImagePrefix: stripped %d-byte image/padding prefix (magic %x)", start, data[:4])
+		return data[start:], true
+	}
+	return nil, false
+}
+
+// looksLikeFakeImageHeader reports whether data begins with a still-image magic
+// number (PNG/JPEG/GIF/BMP/WEBP) — none of which are valid video container starts.
+func looksLikeFakeImageHeader(data []byte) bool {
+	if len(data) < 4 {
+		return false
+	}
+	switch {
+	case data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4E && data[3] == 0x47: // PNG
+		return true
+	case data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF: // JPEG
+		return true
+	case data[0] == 'G' && data[1] == 'I' && data[2] == 'F' && data[3] == '8': // GIF
+		return true
+	case data[0] == 'B' && data[1] == 'M': // BMP
+		return true
+	}
+	if len(data) >= 12 && string(data[0:4]) == "RIFF" && string(data[8:12]) == "WEBP" { // WEBP
+		return true
+	}
+	return false
+}
+
+// findMediaStart scans the head of a segment for the first real media payload
+// offset: an MPEG-TS sync byte (0x47) that repeats every 188 bytes, or an fMP4/MP4
+// box header. Returns the byte offset, or -1 if none is found within the scan
+// window. Used to skip a fake image prefix glued in front of the real stream.
+func findMediaStart(data []byte) int {
+	const scan = 1 << 16 // fake prefixes are tiny; only inspect the first 64 KB
+	limit := len(data)
+	if limit > scan {
+		limit = scan
+	}
+
+	// MPEG-TS: 0x47 sync byte with 188-byte periodicity (verify 3 packets).
+	for i := 0; i < limit; i++ {
+		if data[i] != 0x47 {
+			continue
+		}
+		ok := true
+		for k := 1; k <= 3; k++ {
+			p := i + 188*k
+			if p >= len(data) || data[p] != 0x47 {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return i
+		}
+	}
+
+	// fMP4 / MP4: 4-byte big-endian box size followed by a known box type.
+	for i := 0; i+8 <= limit; i++ {
+		switch string(data[i+4 : i+8]) {
+		case "ftyp", "styp", "moof", "moov", "sidx", "emsg", "mdat", "free":
+			size := uint32(data[i])<<24 | uint32(data[i+1])<<16 | uint32(data[i+2])<<8 | uint32(data[i+3])
+			if size >= 8 && int64(size) <= int64(len(data)-i) {
+				return i
+			}
+		}
+	}
+	return -1
 }
 
 // isYouTubeCDNFragment detects YouTube adaptive fragmented media segments that
@@ -1154,13 +1241,15 @@ func validateVideoSegment(path string) error {
 			return nil
 		}
 	}
-	// PNG magic: 89 50 4E 47
+	// PNG magic: 89 50 4E 47. By the time a segment reaches here the fake-image
+	// prefix should already have been stripped (see stripFakeImagePrefix); a PNG
+	// still present means no real media payload was found behind it.
 	if hdr[0] == 0x89 && hdr[1] == 0x50 && hdr[2] == 0x4E && hdr[3] == 0x47 {
-		return fmt.Errorf("stream: CDN returned a PNG image instead of video — the stream URL requires authentication (missing cookies or signed token)")
+		return fmt.Errorf("stream: segment is a PNG image with no recoverable video payload — the stream URL may require authentication (missing cookies or signed token)")
 	}
 	// JPEG magic: FF D8
 	if hdr[0] == 0xFF && hdr[1] == 0xD8 {
-		return fmt.Errorf("stream: CDN returned a JPEG image instead of video — the stream URL requires authentication")
+		return fmt.Errorf("stream: segment is a JPEG image with no recoverable video payload — the stream URL may require authentication")
 	}
 	// HTML error page
 	if strings.HasPrefix(string(hdr[:n]), "<!") || strings.HasPrefix(string(hdr[:n]), "<ht") {
