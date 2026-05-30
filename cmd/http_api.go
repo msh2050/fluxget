@@ -35,8 +35,10 @@ func registerHTTPRoutes(mux *http.ServeMux, port int, defaultOutputDir string, s
 
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSONResponse(w, http.StatusOK, map[string]interface{}{
-			"status": "ok",
-			"port":   port,
+			"status":  "ok",
+			"port":    port,
+			"version": Version,
+			"commit":  Commit,
 		})
 	})
 
@@ -195,6 +197,7 @@ func registerHTTPRoutes(mux *http.ServeMux, port int, defaultOutputDir string, s
 				return
 			}
 			globalSettings = s
+			applyEngineSettings(s)
 			// Apply auto-start side-effect (systemd service + XDG autostart entry).
 			// Errors are non-fatal — settings are already saved.
 			_ = utils.SetAutoStart(flat.AutoStart)

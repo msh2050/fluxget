@@ -35,3 +35,11 @@ result-*
 # local dev artifacts
 design_handoff_fluxget_gui/
 .claude/
+
+# fluxget build artifacts (produced by scripts/build-release.sh)
+/fluxget
+/fluxget-gui
+gui/fluxget
+gui/gui
+gui/frontend/wailsjs/
+release-assets/

@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/msh2050/fluxget/internal/engine/events"
@@ -113,11 +114,32 @@ func cleanupOldDebugDirs() {
 }
 
 const (
-	segWorkers    = 4                    // conservative — Google Drive and similar CDNs rate-limit hard
-	maxRetries    = 12                   // more retries for flaky/rate-limited CDNs
+	maxRetries    = 12 // more retries for flaky/rate-limited CDNs
 	retryDelay    = 500 * time.Millisecond
 	maxRetryDelay = 60 * time.Second
 )
+
+// segWorkers is the number of parallel HLS/DASH segment connections. It is
+// runtime-tunable from the GUI "HLS/DASH Connections" setting (wired via
+// SetSegmentWorkers) so users can trade speed against CDN rate-limiting
+// without rebuilding. Default 6 — a balance that most CDNs tolerate.
+var segWorkers atomic.Int64
+
+func init() { segWorkers.Store(6) }
+
+// SetSegmentWorkers sets the parallel segment connection count, clamped to
+// [1, 32]. Called from cmd whenever settings are loaded or changed.
+func SetSegmentWorkers(n int) {
+	if n < 1 {
+		n = 1
+	}
+	if n > 32 {
+		n = 32
+	}
+	segWorkers.Store(int64(n))
+}
+
+func segWorkerCount() int { return int(segWorkers.Load()) }
 
 // errRateLimit is returned when a CDN responds with HTTP 429.
 // It carries the suggested wait duration so the worker can back off.
@@ -642,9 +664,10 @@ func downloadSegments(ctx context.Context, pub Publisher, id string, urls []stri
 	// TLS does work, but belt-and-suspenders: scrub them so we always start fresh.
 	segHeaders := stripCloudflareCookies(headers)
 
-	errs := make(chan error, segWorkers)
+	workers := segWorkerCount()
+	errs := make(chan error, workers)
 	var wg sync.WaitGroup
-	for w := 0; w < segWorkers; w++ {
+	for w := 0; w < workers; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -694,7 +717,7 @@ func downloadSegments(ctx context.Context, pub Publisher, id string, urls []stri
 							Total:             db * total / max64(d, 1),
 							Speed:             float64(db) / max1(time.Since(start).Seconds()),
 							Elapsed:           time.Since(start),
-							ActiveConnections: segWorkers,
+							ActiveConnections: workers,
 						})
 						backoff = retryDelay // reset on success
 						lastErr = nil

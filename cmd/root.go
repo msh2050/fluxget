@@ -31,7 +31,7 @@ import (
 
 // Version information - set via ldflags during build
 var (
-	Version   = "dev"
+	Version   = "2.1.1"
 	Commit    = "unknown"
 	BuildTime = "unknown"
 )
@@ -440,6 +440,7 @@ var rootCmd = &cobra.Command{
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
 		GlobalProgressCh = make(chan any, 100)
 		globalSettings = getSettings()
+		applyEngineSettings(globalSettings)
 		GlobalPool = download.NewWorkerPool(GlobalProgressCh, config.Resolve[int](globalSettings.Network.MaxConcurrentDownloads))
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {

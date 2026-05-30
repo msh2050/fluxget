@@ -44,6 +44,7 @@ type GeneralSettings struct {
 
 type NetworkSettings struct {
 	MaxConnectionsPerDownload *Setting `json:"max_connections_per_host"`
+	StreamSegmentWorkers      *Setting `json:"hls_segment_workers"`
 	MaxConcurrentDownloads    *Setting `json:"max_concurrent_downloads"`
 	MaxConcurrentProbes       *Setting `json:"max_concurrent_probes"`
 	UserAgent                 *Setting `json:"user_agent"`
@@ -241,6 +242,7 @@ func (s *Settings) initializeCategoriesList() {
 			Name: "Network",
 			Settings: []*Setting{
 				s.Network.MaxConnectionsPerDownload,
+				s.Network.StreamSegmentWorkers,
 				s.Network.MaxConcurrentDownloads,
 				s.Network.MaxConcurrentProbes,
 				s.Network.UserAgent,
@@ -529,6 +531,28 @@ func DefaultSettings() *Settings {
 					}
 					if v < 1 || v > 64 {
 						return fmt.Errorf("must be between 1 and 64")
+					}
+					return nil
+				},
+			},
+			StreamSegmentWorkers: &Setting{
+				Key:          "hls_segment_workers",
+				Label:        "HLS/DASH Connections",
+				Description:  "Parallel segment connections for HLS/DASH streams (1-32). Higher is faster but some CDNs rate-limit; lower if you hit 429 errors.",
+				Type:         "int",
+				DefaultValue: 6,
+				Value:        6,
+				ValidateFunc: func(val any) error {
+					v, ok := val.(int)
+					if !ok {
+						if f, ok := val.(float64); ok {
+							v = int(f)
+						} else {
+							return fmt.Errorf("invalid type")
+						}
+					}
+					if v < 1 || v > 32 {
+						return fmt.Errorf("must be between 1 and 32")
 					}
 					return nil
 				},

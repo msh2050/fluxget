@@ -1,6 +1,18 @@
 package cmd
 
-import "github.com/msh2050/fluxget/internal/config"
+import (
+	"github.com/msh2050/fluxget/internal/config"
+	"github.com/msh2050/fluxget/internal/stream"
+)
+
+// applyEngineSettings pushes runtime-tunable settings into the engine packages.
+// Call after settings are loaded or changed so the live engine reflects them.
+func applyEngineSettings(s *config.Settings) {
+	if s == nil {
+		return
+	}
+	stream.SetSegmentWorkers(config.Resolve[int](s.Network.StreamSegmentWorkers))
+}
 
 // flatSettings is the simplified settings shape exposed to the GUI.
 // Only the fields the frontend actually reads/writes are included.
@@ -22,6 +34,7 @@ type flatSettings struct {
 	// HLS/DASH engine
 	Quality      string `json:"quality"`
 	MuxContainer string `json:"muxContainer"`
+	HLSConns     int    `json:"hlsConns"`
 
 	// yt-dlp engine
 	YtdlpPath     string `json:"ytdlpPath"`
@@ -53,6 +66,7 @@ func flattenSettings(s *config.Settings) flatSettings {
 		ProxyURL:       config.Resolve[string](s.Network.ProxyURL),
 		Quality:        "best",
 		MuxContainer:   "mkv",
+		HLSConns:       config.Resolve[int](s.Network.StreamSegmentWorkers),
 		YtdlpPath:      "/usr/local/bin/yt-dlp",
 		YtdlpQuality:   "720",
 		YtdlpFormat:    "mp4",
@@ -96,6 +110,9 @@ func applyFlatSettings(s *config.Settings, f flatSettings) {
 	setBool(&s.General.ClipboardMonitor, f.Clipboard)
 	if f.MaxConns > 0 {
 		setInt(&s.Network.MaxConnectionsPerDownload, f.MaxConns)
+	}
+	if f.HLSConns > 0 {
+		setInt(&s.Network.StreamSegmentWorkers, f.HLSConns)
 	}
 	if f.MaxConcurrent > 0 {
 		setInt(&s.Network.MaxConcurrentDownloads, f.MaxConcurrent)

@@ -401,7 +401,7 @@ body{
      APP SHELL
 ══════════════════════════════════════════════════════════ -->
 <div class="fg-titlebar">
-  <div class="title mono">FluxGet · v2.1.0</div>
+  <div class="title mono" id="app-version">FluxGet · v2.1.1</div>
   <div class="right" id="titlebar-right">
     <span id="conn-status" class="disconnected">● offline</span>
     <span>:1700</span>
@@ -468,6 +468,7 @@ const state = {
     proxyUrl: '',
     quality: 'best',
     muxContainer: 'mkv',
+    hlsConns: 6,
     ytdlpPath: '/usr/local/bin/yt-dlp',
     ytdlpQuality: '720',
     ytdlpFormat: 'mp4',
@@ -575,11 +576,17 @@ function downloadRowHtml(d) {
   let meta = '';
   if (d.status === 'downloading') {
     meta += `<span class="speed">↓ ${fmtSpeed(d.speed)}</span>`;
+    // Size: "downloaded / total" when total is known, else just "downloaded"
+    // (some streams have no known length — mirrors IDM's unknown-size behaviour).
+    const sizeTxt = d.total_size
+      ? `${fmtBytes(d.downloaded || 0)} / ${fmtBytes(d.total_size)}`
+      : `${fmtBytes(d.downloaded || 0)}`;
+    meta += `<span class="mdot"></span><span>${sizeTxt}</span>`;
     meta += `<span class="mdot"></span><span>ETA ${fmtETA(d.eta)}</span>`;
     meta += `<span class="mdot"></span>`;
     meta += goroHtml(d.connections || 0, state.settings.maxConns);
   } else if (d.status === 'paused') {
-    meta += `<span>Paused at ${pct.toFixed(0)}%</span>`;
+    meta += `<span>Paused at ${pct.toFixed(0)}% · ${fmtBytes(d.downloaded || 0)}${d.total_size ? ' / ' + fmtBytes(d.total_size) : ''}</span>`;
   } else if (d.status === 'queued') {
     meta += `<span>Waiting in queue</span>`;
   } else if (d.status === 'done') {
@@ -1025,6 +1032,10 @@ function renderSettings() {
   <div class="fg-set-section">
     <h3>HLS / DASH engine</h3>
     <div class="fg-set-row">
+      <div><div class="label">HLS/DASH connections</div><div class="desc">Parallel segment connections for streams (1-32). Higher = faster, but some CDNs rate-limit (429) — lower this if downloads stall or fail.</div></div>
+      <input class="fg-input" id="s-hlsconns" type="number" min="1" max="32" value="${s.hlsConns}" style="width:90px">
+    </div>
+    <div class="fg-set-row">
       <div><div class="label">Quality preference</div><div class="desc">Preferred variant when multiple renditions are available in a manifest.</div></div>
       <select class="fg-select" id="s-quality">
         <option${s.quality==='best'?' selected':''} value="best">Best available</option>
@@ -1125,6 +1136,19 @@ function scheduleRender() {
 /* ═══════════════════════════════════════════════════════════
    TITLEBAR
 ═══════════════════════════════════════════════════════════ */
+async function loadVersion() {
+  try {
+    const r = await fetch('/health');
+    const h = await r.json();
+    const el = document.getElementById('app-version');
+    if (el && h.version) {
+      // Show short commit so every fresh build is visibly distinct.
+      const commit = h.commit && h.commit !== 'unknown' ? ` (${h.commit.slice(0,7)})` : '';
+      el.textContent = `FluxGet · v${h.version}${commit}`;
+    }
+  } catch(e) {}
+}
+
 function renderTitlebar() {
   const el = document.getElementById('conn-status');
   if (el) {
@@ -1379,6 +1403,7 @@ async function saveSettings() {
   s.proxyUrl      = document.getElementById('s-proxy')?.value     ?? s.proxyUrl;
   s.quality       = document.getElementById('s-quality')?.value   || s.quality;
   s.muxContainer  = document.getElementById('s-mux')?.value       || s.muxContainer;
+  s.hlsConns      = parseInt(document.getElementById('s-hlsconns')?.value) || s.hlsConns;
   s.ytdlpPath     = document.getElementById('s-ytdlp')?.value     || s.ytdlpPath;
   s.ytdlpQuality  = document.getElementById('s-ytquality')?.value || s.ytdlpQuality;
   s.ytdlpFormat   = document.getElementById('s-ytformat')?.value  || s.ytdlpFormat;
@@ -1462,6 +1487,7 @@ navigate(state.view);
 renderTitlebar();
 
 // Load current state
+loadVersion();
 loadList();
 loadHistory();
 loadSettings();

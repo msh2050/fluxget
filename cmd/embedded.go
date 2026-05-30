@@ -17,6 +17,7 @@ func StartEmbedded(port int, outputDir string) error {
 	// Mirror what cobra's PersistentPreRun does for CLI mode.
 	GlobalProgressCh = make(chan any, 100)
 	globalSettings = getSettings()
+	applyEngineSettings(globalSettings)
 	GlobalPool = download.NewWorkerPool(GlobalProgressCh, config.Resolve[int](globalSettings.Network.MaxConcurrentDownloads))
 
 	_, listener, err := bindServerListener(port)
