@@ -379,13 +379,52 @@ func runHLS(ctx context.Context, pub Publisher, id, title, destDir string, req R
 	}
 
 	outFile := outputPath(destDir, sanitizeFilename(title), ".mp4")
-	debugLog.Printf("[%s] muxing %d segs → %s", id[:8], len(segFiles), outFile)
-	if err := muxConcat(ctx, pub, id, title, segFiles, outFile, start); err != nil {
-		if fi, statErr := os.Stat(outFile); statErr != nil || fi.Size() == 0 {
-			_ = os.Remove(outFile)
+
+	// fMP4 (fragmented MP4 / CMAF) HLS streams declare an initialization segment
+	// via #EXT-X-MAP. Its moov/trex boxes carry the per-track defaults that every
+	// moof+mdat media fragment references — without it ffmpeg reports "could not
+	// find corresponding trex" / "no tfhd was found" and aborts. fMP4 fragments
+	// also can't be joined with ffmpeg's concat demuxer, so we byte-concatenate
+	// [init, segs...] and remux with -c copy, exactly like the DASH/formats path.
+	initURL := ""
+	for _, s := range segments {
+		if s.InitURL != "" {
+			initURL = s.InitURL
+			break
 		}
-		keepOnce("mux-error")
-		return err
+	}
+	if initURL != "" || isFMP4Segment(segFiles[0]) {
+		allFiles := segFiles
+		if initURL != "" {
+			initFiles, ierr := downloadSegments(ctx, pub, id, []string{initURL}, req.Headers, filepath.Join(tmp, "init"), start)
+			if ierr != nil || len(initFiles) == 0 {
+				keepOnce("init-error")
+				return fmt.Errorf("stream: fetch HLS init segment: %w", ierr)
+			}
+			allFiles = append(initFiles, segFiles...)
+		}
+		combined := filepath.Join(tmp, "combined.mp4")
+		if err := catFiles(allFiles, combined); err != nil {
+			keepOnce("concat-error")
+			return fmt.Errorf("stream: concat fMP4 segments: %w", err)
+		}
+		debugLog.Printf("[%s] fMP4: byte-concat %d files (init=%t) → remux %s", id[:8], len(allFiles), initURL != "", outFile)
+		if err := mux(ctx, pub, id, title, []string{combined}, outFile, start); err != nil {
+			if fi, statErr := os.Stat(outFile); statErr != nil || fi.Size() == 0 {
+				_ = os.Remove(outFile)
+			}
+			keepOnce("mux-error")
+			return err
+		}
+	} else {
+		debugLog.Printf("[%s] muxing %d segs (concat demuxer) → %s", id[:8], len(segFiles), outFile)
+		if err := muxConcat(ctx, pub, id, title, segFiles, outFile, start); err != nil {
+			if fi, statErr := os.Stat(outFile); statErr != nil || fi.Size() == 0 {
+				_ = os.Remove(outFile)
+			}
+			keepOnce("mux-error")
+			return err
+		}
 	}
 	if fi, e := os.Stat(outFile); e == nil {
 		debugLog.Printf("[%s] output OK: %s (%s)", id[:8], outFile, formatBytes(fi.Size()))
@@ -1238,6 +1277,28 @@ func formatBytes(b int64) string {
 // validateVideoSegment reads the first bytes of a downloaded segment and returns
 // an error if the content is clearly not video (e.g. a PNG/JPEG tracking pixel
 // returned by a CDN when the request lacks authentication).
+// isFMP4Segment reports whether a downloaded segment begins with an MP4 box
+// (fragmented MP4 / CMAF) rather than an MPEG-TS sync byte. fMP4 segments must
+// be byte-concatenated with their init segment and remuxed, not joined with
+// ffmpeg's concat demuxer.
+func isFMP4Segment(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = f.Close() }()
+	hdr := make([]byte, 8)
+	n, _ := f.Read(hdr)
+	if n < 8 || hdr[0] == 0x47 { // MPEG-TS sync byte
+		return false
+	}
+	switch string(hdr[4:8]) {
+	case "ftyp", "styp", "moof", "moov", "sidx", "mdat", "emsg":
+		return true
+	}
+	return false
+}
+
 func validateVideoSegment(path string) error {
 	f, err := os.Open(path)
 	if err != nil {

@@ -32,6 +32,7 @@ type HLSSegment struct {
 	Duration float64
 	Key      *HLSKey // nil = unencrypted
 	SeqNum   int     // segment sequence number (for IV derivation)
+	InitURL  string  // #EXT-X-MAP initialization segment (fMP4); "" for MPEG-TS
 }
 
 // ParseHLSMaster parses an HLS master playlist and returns all variants.
@@ -80,10 +81,11 @@ func ParseHLSMaster(body, baseURL string) ([]HLSVariant, error) {
 // It handles #EXT-X-KEY for AES-128 encryption and tracks sequence numbers.
 func ParseHLSMedia(body, baseURL string) ([]HLSSegment, error) {
 	var (
-		segments   []HLSSegment
-		pendingDur float64
-		currentKey *HLSKey
-		seqNum     int
+		segments    []HLSSegment
+		pendingDur  float64
+		currentKey  *HLSKey
+		currentInit string // #EXT-X-MAP init segment (fMP4); applies to following segments
+		seqNum      int
 	)
 	scanner := bufio.NewScanner(strings.NewReader(body))
 	for scanner.Scan() {
@@ -91,6 +93,14 @@ func ParseHLSMedia(body, baseURL string) ([]HLSSegment, error) {
 
 		if strings.HasPrefix(line, "#EXT-X-MEDIA-SEQUENCE:") {
 			seqNum, _ = strconv.Atoi(strings.TrimPrefix(line, "#EXT-X-MEDIA-SEQUENCE:"))
+			continue
+		}
+
+		if strings.HasPrefix(line, "#EXT-X-MAP:") {
+			attrs := parseHLSAttrs(line[len("#EXT-X-MAP:"):])
+			if uri := attrs["URI"]; uri != "" {
+				currentInit, _ = resolveURL(baseURL, uri)
+			}
 			continue
 		}
 
@@ -126,7 +136,7 @@ func ParseHLSMedia(body, baseURL string) ([]HLSSegment, error) {
 			if err != nil {
 				return nil, fmt.Errorf("hls: bad segment URL %q: %w", line, err)
 			}
-			seg := HLSSegment{URL: u, Duration: pendingDur, SeqNum: seqNum}
+			seg := HLSSegment{URL: u, Duration: pendingDur, SeqNum: seqNum, InitURL: currentInit}
 			if currentKey != nil {
 				keyCopy := *currentKey
 				if keyCopy.IV == nil {
