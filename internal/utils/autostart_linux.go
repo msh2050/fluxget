@@ -20,22 +20,21 @@ StartupNotify=true
 StartupWMClass=fluxget-gui
 `
 
-// SetAutoStart enables or disables FluxGet on login.
-// When enabled it:
-//   - starts and enables the systemd user service (headless engine on port 1700)
-//   - writes ~/.config/autostart/fluxget-gui.desktop so the GUI opens on login
+// SetAutoStart enables or disables the FluxGet GUI on login by managing the
+// XDG autostart entry (~/.config/autostart/fluxget-gui.desktop). The GUI embeds
+// the engine, so launching it is all that is needed.
 //
-// When disabled both are reversed.
+// We deliberately do NOT enable the systemd `fluxget` user service: it would run
+// a second headless engine that competes for port 1700 with the GUI's embedded
+// engine and keeps downloading in the background after the GUI is closed. We
+// always disable that service here to undo any prior state that enabled it.
 func SetAutoStart(enable bool) error {
-	// 1. Systemd user service (headless engine)
-	action := "disable"
-	if enable {
-		action = "enable"
-	}
-	// --now starts/stops the service immediately in addition to enable/disable
-	_ = exec.Command("systemctl", "--user", action, "--now", "fluxget").Run()
+	// Always make sure the redundant headless daemon is stopped + disabled.
+	// (Users who genuinely want a headless server can still enable it manually
+	// with `systemctl --user enable --now fluxget`.)
+	_ = exec.Command("systemctl", "--user", "disable", "--now", "fluxget").Run()
 
-	// 2. XDG autostart entry for the GUI
+	// XDG autostart entry for the GUI
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return err

@@ -12,6 +12,7 @@ import (
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
 	"github.com/wailsapp/wails/v2/pkg/options/linux"
+	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 //go:embed all:frontend/dist
@@ -72,6 +73,16 @@ func main() {
 		},
 		BackgroundColour:   &options.RGBA{R: 11, G: 11, B: 12, A: 255},
 		HideWindowOnClose: true,
+		// Prevent a second tray icon / engine: if FluxGet is already running
+		// (e.g. GNOME session-restore plus the XDG autostart entry both fire on
+		// login), focus the existing window instead of starting a new instance.
+		SingleInstanceLock: &options.SingleInstanceLock{
+			UniqueId: "io.fluxget.app",
+			OnSecondInstanceLaunch: func(_ options.SecondInstanceData) {
+				wailsruntime.WindowShow(app.ctx)
+				wailsruntime.WindowUnminimise(app.ctx)
+			},
+		},
 		OnStartup:         app.startup,
 		OnShutdown:        app.shutdown,
 		Bind:             []interface{}{app},
