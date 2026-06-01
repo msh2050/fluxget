@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/msh2050/fluxget/internal/config"
 	"github.com/msh2050/fluxget/internal/core"
@@ -229,11 +230,28 @@ func eventsHandler(service core.DownloadService) http.HandlerFunc {
 		}
 		flusher.Flush()
 
+		// Send an initial comment immediately so clients fire their `open` event
+		// even when there are no download events yet. WebKitGTK's EventSource (the
+		// Wails GUI webview) only considers the stream open once it receives body
+		// bytes — without this the GUI shows "offline" until the first download.
+		_, _ = fmt.Fprint(w, ": connected\n\n")
+		flusher.Flush()
+
+		// Heartbeat keeps idle connections open through proxies and lets the
+		// client tell "connected but idle" apart from "disconnected".
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+
 		done := r.Context().Done()
 		for {
 			select {
 			case <-done:
 				return
+			case <-ticker.C:
+				if _, err := fmt.Fprint(w, ": ping\n\n"); err != nil {
+					return
+				}
+				flusher.Flush()
 			case msg, ok := <-stream:
 				if !ok {
 					return
