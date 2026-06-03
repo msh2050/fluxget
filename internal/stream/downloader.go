@@ -653,13 +653,29 @@ func runSubtitlesOnly(ctx context.Context, pub Publisher, id, title, destDir str
 		return fmt.Errorf("stream: fetch subtitle source: %w", err)
 	}
 
+	trimmed := strings.TrimSpace(body)
 	var subs []HLSSubtitle
-	if strings.Contains(body, "#EXT-X-MEDIA") || strings.Contains(body, "#EXT-X-STREAM-INF") {
+	switch {
+	case strings.Contains(body, "#EXT-X-STREAM-INF") || strings.Contains(body, "#EXT-X-MEDIA"):
+		// Master playlist — subtitle renditions are declared here.
 		subs = ParseHLSSubtitles(body, req.URL)
-	}
-	if len(subs) == 0 {
-		// The URL itself is a single subtitle track (direct .vtt or a subtitle
-		// media playlist of .vtt segments).
+		if len(subs) == 0 {
+			return fmt.Errorf("stream: this stream has no subtitle tracks")
+		}
+	case strings.HasPrefix(trimmed, "WEBVTT"):
+		// Direct WebVTT file.
+		subs = []HLSSubtitle{{URI: req.URL}}
+	case strings.HasPrefix(trimmed, "#EXTM3U"):
+		// A media playlist. Only a valid subtitle source if its segments are
+		// WebVTT — otherwise it's a video variant and must NOT be fetched as text.
+		segs, _ := ParseHLSMedia(body, req.URL)
+		if len(segs) > 0 && isVTTURL(segs[0].URL) {
+			subs = []HLSSubtitle{{URI: req.URL}}
+		} else {
+			return fmt.Errorf("stream: %q is a video playlist with no subtitles — the page's master playlist is required", req.URL)
+		}
+	default:
+		// Assume a direct subtitle file (e.g. .srt without a WEBVTT header).
 		subs = []HLSSubtitle{{URI: req.URL}}
 	}
 	debugLog.Printf("[%s] subtitles-only: %d track(s) from %s", id[:8], len(subs), req.URL)
@@ -1579,6 +1595,16 @@ func isFMP4Segment(path string) bool {
 		return true
 	}
 	return false
+}
+
+// isVTTURL reports whether a URL points at a subtitle file (.vtt/.srt/.webvtt),
+// ignoring any query string or fragment.
+func isVTTURL(u string) bool {
+	u = strings.ToLower(u)
+	if i := strings.IndexAny(u, "?#"); i >= 0 {
+		u = u[:i]
+	}
+	return strings.HasSuffix(u, ".vtt") || strings.HasSuffix(u, ".srt") || strings.HasSuffix(u, ".webvtt")
 }
 
 func validateVideoSegment(path string) error {

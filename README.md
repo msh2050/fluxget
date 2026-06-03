@@ -160,14 +160,14 @@ _Surge powers FluxGet's download engine — if it's useful to you, consider supp
 |---|---|---|
 | `fluxget-linux-amd64` | Linux | CLI / TUI / headless server |
 | `fluxget-gui-linux-amd64` | Linux | Desktop app (requires `libwebkit2gtk-4.1`) |
-| `fluxget_2.1.6_amd64.deb` | Debian / Ubuntu | Installs both binaries + desktop entry |
+| `fluxget_2.1.7_amd64.deb` | Debian / Ubuntu | Installs both binaries + desktop entry |
 | `fluxget-windows-amd64.exe` | Windows | CLI / headless server |
 | `fluxget-extension.zip` | Chrome / Edge | Load unpacked in `chrome://extensions` |
 
 ```bash
 # Linux .deb install — easiest
 sudo apt install ffmpeg
-sudo dpkg -i fluxget_2.1.6_amd64.deb
+sudo dpkg -i fluxget_2.1.7_amd64.deb
 fluxget-gui          # desktop app
 fluxget server start # OR headless on port 1700
 ```

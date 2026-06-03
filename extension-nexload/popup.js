@@ -50,29 +50,35 @@ function guessTitle(url) {
 
 // Parse HLS master playlist and return variants sorted best-first.
 // Returns [] if it's a media playlist (no #EXT-X-STREAM-INF).
-async function fetchHLSVariants(url) {
+// Returns the parsed variants and whether the master declares subtitle tracks.
+async function fetchHLSInfo(url) {
   try {
     const res = await fetch(url);
     const body = await res.text();
-    if (!body.includes("#EXT-X-STREAM-INF")) return [];
-    const lines = body.split("\n");
-    const variants = [];
-    let pending = null;
-    for (const line of lines) {
-      const l = line.trim();
-      if (l.startsWith("#EXT-X-STREAM-INF:")) {
-        const bw  = (l.match(/BANDWIDTH=(\d+)/)  || [])[1];
-        const res = (l.match(/RESOLUTION=\d+x(\d+)/) || [])[1];
-        pending = { bandwidth: bw ? parseInt(bw) : 0, height: res ? parseInt(res) : 0 };
-      } else if (pending && l && !l.startsWith("#")) {
-        try { pending.url = new URL(l, url).href; } catch { pending.url = l; }
-        variants.push(pending);
-        pending = null;
-      }
+    const hasSubs = /#EXT-X-MEDIA[^\n]*TYPE=SUBTITLES/i.test(body);
+    if (!body.includes("#EXT-X-STREAM-INF")) return { variants: [], hasSubs };
+    return { variants: parseHLSVariantLines(body, url), hasSubs };
+  } catch { return { variants: [], hasSubs: false }; }
+}
+
+function parseHLSVariantLines(body, url) {
+  const lines = body.split("\n");
+  const variants = [];
+  let pending = null;
+  for (const line of lines) {
+    const l = line.trim();
+    if (l.startsWith("#EXT-X-STREAM-INF:")) {
+      const bw  = (l.match(/BANDWIDTH=(\d+)/)  || [])[1];
+      const res = (l.match(/RESOLUTION=\d+x(\d+)/) || [])[1];
+      pending = { bandwidth: bw ? parseInt(bw) : 0, height: res ? parseInt(res) : 0 };
+    } else if (pending && l && !l.startsWith("#")) {
+      try { pending.url = new URL(l, url).href; } catch { pending.url = l; }
+      variants.push(pending);
+      pending = null;
     }
-    variants.sort((a, b) => b.bandwidth - a.bandwidth);
-    return variants;
-  } catch { return []; }
+  }
+  variants.sort((a, b) => b.bandwidth - a.bandwidth);
+  return variants;
 }
 
 // ── Render ────────────────────────────────────────────────────────────────────
@@ -146,9 +152,11 @@ function renderList() {
     bestOpt.textContent = "Best";
     sel.appendChild(bestOpt);
 
+    let subBtn = null; // assigned below; revealed by the manifest probe if subs exist
+
     if (isHLS) {
-      // Async: fetch real variants from manifest
-      fetchHLSVariants(item.url).then(variants => {
+      // Async: fetch real variants + subtitle presence from the manifest
+      fetchHLSInfo(item.url).then(({ variants, hasSubs }) => {
         if (variants.length > 1) {
           sel.innerHTML = "";
           variants.forEach((v, i) => {
@@ -159,7 +167,8 @@ function renderList() {
             sel.appendChild(o);
           });
         }
-        // If only 1 variant or media playlist — keep "Best" (no choice needed)
+        // Reveal the subtitles button only when the master declares subtitles.
+        if (hasSubs && subBtn) subBtn.style.display = "";
       });
     } else if (!isDASH) {
       // Direct file — no quality choice
@@ -192,12 +201,14 @@ function renderList() {
     });
     row.appendChild(dlBtn);
 
-    // Subtitles button — HLS only (subtitles are declared in the master playlist)
+    // Subtitles button — created hidden; revealed by fetchHLSInfo() above only
+    // when the HLS master actually declares subtitle tracks.
     if (isHLS) {
-      const subBtn = document.createElement("button");
+      subBtn = document.createElement("button");
       subBtn.className = "dl-btn";
       subBtn.innerHTML = "💬 Subs";
       subBtn.title = "Download subtitle tracks only (.srt)";
+      subBtn.style.display = "none";
       subBtn.addEventListener("click", () => {
         const title = item.title || currentTabTitle || guessTitle(item.url);
         const headers = {};

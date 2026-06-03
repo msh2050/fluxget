@@ -156,7 +156,7 @@
   }
 
   // ── Quality panel (IDM-style) ─────────────────────────────────────────────────
-  function makeQualityPanel(video, anchorBtn, opts) {
+  function makeQualityPanel(video, anchorBtn, opts, subtitleSource) {
     const panel = document.createElement("div");
     panel.className = "fg-quality-panel";
 
@@ -214,39 +214,43 @@
       panel.appendChild(row);
     }
 
-    // Subtitles-only row — downloads all caption tracks as .srt (no video)
-    const subSep = document.createElement("div");
-    subSep.className = "fg-q-sep";
-    panel.appendChild(subSep);
+    // Subtitles-only row — shown ONLY when the master playlist declares subtitle
+    // tracks. Downloads all caption tracks as .srt (no video).
+    if (subtitleSource) {
+      const subSep = document.createElement("div");
+      subSep.className = "fg-q-sep";
+      panel.appendChild(subSep);
 
-    const subRow = document.createElement("button");
-    subRow.className = "fg-q-row";
-    const subIcon = document.createElement("span");
-    subIcon.className = "fg-q-icon";
-    subIcon.textContent = "💬";
-    const subLbl = document.createElement("span");
-    subLbl.className = "fg-q-label";
-    subLbl.textContent = "Subtitles only";
-    const subBadge = document.createElement("span");
-    subBadge.className = "fg-quality-badge";
-    subBadge.textContent = "SRT";
-    subRow.appendChild(subIcon);
-    subRow.appendChild(subLbl);
-    subRow.appendChild(subBadge);
-    subRow.addEventListener("click", (e) => {
-      e.stopPropagation();
-      chrome.runtime.sendMessage({
-        action: "download_subtitles",
-        title: pageTitle || document.title || "",
-        pageUrl: window.location.href,
+      const subRow = document.createElement("button");
+      subRow.className = "fg-q-row";
+      const subIcon = document.createElement("span");
+      subIcon.className = "fg-q-icon";
+      subIcon.textContent = "💬";
+      const subLbl = document.createElement("span");
+      subLbl.className = "fg-q-label";
+      subLbl.textContent = "Subtitles only";
+      const subBadge = document.createElement("span");
+      subBadge.className = "fg-quality-badge";
+      subBadge.textContent = "SRT";
+      subRow.appendChild(subIcon);
+      subRow.appendChild(subLbl);
+      subRow.appendChild(subBadge);
+      subRow.addEventListener("click", (e) => {
+        e.stopPropagation();
+        chrome.runtime.sendMessage({
+          action: "download_subtitles",
+          url: subtitleSource, // the master playlist (where subtitles live)
+          title: pageTitle || document.title || "",
+          pageUrl: window.location.href,
+        });
+        panel.remove();
+        anchorBtn.innerHTML = "";
+        anchorBtn.appendChild(makeIcon());
+        anchorBtn.appendChild(document.createTextNode(" Subs ✓"));
+        setTimeout(() => resetBtn(anchorBtn), 2500);
       });
-      panel.remove();
-      anchorBtn.innerHTML = "";
-      anchorBtn.appendChild(makeIcon());
-      anchorBtn.appendChild(document.createTextNode(" Subs ✓"));
-      setTimeout(() => resetBtn(anchorBtn), 2500);
-    });
-    panel.appendChild(subRow);
+      panel.appendChild(subRow);
+    }
 
     // Close on outside click
     setTimeout(() => {
@@ -295,6 +299,7 @@
       if (existing) { existing.remove(); return; }
 
       let pickerQualities = qualities;
+      let subtitleSource = ""; // master playlist URL, set only when it declares subtitles
 
       // No YouTube data — check if we have a captured HLS manifest for this tab
       if (pickerQualities.length === 0) {
@@ -335,13 +340,18 @@
                 audioUrl: "",
                 ytFormat: "",
               }));
+              // Subtitle renditions are declared in the master — only then do we
+              // offer "Subtitles only", and we use this master URL for it.
+              if (/#EXT-X-MEDIA[^\n]*TYPE=SUBTITLES/i.test(body)) {
+                subtitleSource = hlsItem.url;
+              }
             }
           } catch {}
         }
       }
 
       if (pickerQualities.length === 0) pickerQualities = FALLBACK_QUALITIES;
-      const panel = makeQualityPanel(video, btn, pickerQualities);
+      const panel = makeQualityPanel(video, btn, pickerQualities, subtitleSource);
       positionPanel(panel, btn);
     });
 
