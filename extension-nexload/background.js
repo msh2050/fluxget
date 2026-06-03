@@ -304,7 +304,7 @@ async function sniffHLSSegmentCookies(manifestUrl) {
 //  2. Fallback: chrome.cookies.getAll({url}) for both manifest and segment domains
 // The user must play the video for a few seconds so the browser makes real
 // requests to the CDN and we can capture the authenticated Cookie headers.
-async function sendStream(url, title, headers, formats) {
+async function sendStream(url, title, headers, formats, extra) {
   const allHeaders = { ...(headers || {}) };
   const cookieParts = [];
 
@@ -327,7 +327,24 @@ async function sendStream(url, title, headers, formats) {
   }
 
   if (cookieParts.length > 0) allHeaders.Cookie = cookieParts.join("; ");
-  return apiPost("/stream", { url, title: title || "", headers: allHeaders, formats: formats || [] });
+  return apiPost("/stream", { url, title: title || "", headers: allHeaders, formats: formats || [], ...(extra || {}) });
+}
+
+// Subtitles only → /stream with subtitles:true. The backend reads the HLS
+// master's #EXT-X-MEDIA subtitle renditions (or a direct .vtt) and writes .srt.
+async function sendSubtitles(url, title, headers) {
+  return sendStream(url, title, headers || {}, [], { subtitles: true });
+}
+
+// Resolve the best URL to pull subtitles from: the HLS master is where subtitle
+// renditions are declared, so prefer it over DASH and direct video.
+function subtitleSourceURL(tabId, fallback) {
+  const pd = tabId != null ? pageVideoData.get(tabId) : null;
+  if (pd?.hls) return pd.hls;
+  const captured = getBestCaptured(tabId);
+  if (captured && isManifestURL(captured)) return captured;
+  if (pd?.dash) return pd.dash;
+  return captured || fallback || "";
 }
 
 // ── Notification helper ───────────────────────────────────────────────────────
@@ -506,6 +523,7 @@ chrome.runtime.onInstalled.addListener(() => {
     chrome.contextMenus.create({ id: "fg_link",       title: "⬇ Download link with FluxGet",               contexts: ["link"] });
     chrome.contextMenus.create({ id: "fg_video",      title: "⬇ Download video with FluxGet",              contexts: ["video", "audio"] });
     chrome.contextMenus.create({ id: "fg_page_video", title: "⬇ Download video on this page (FluxGet)",    contexts: ["page"] });
+    chrome.contextMenus.create({ id: "fg_subtitles",  title: "⬇ Download subtitles only (SRT)",            contexts: ["video", "audio", "page"] });
     chrome.contextMenus.create({ id: "fg_selection",  title: "⬇ Download selected URL with FluxGet",       contexts: ["selection"] });
     chrome.contextMenus.create({ id: "fg_open_ui",    title: "🖥 Open FluxGet dashboard",                  contexts: ["action"] });
   });
@@ -528,6 +546,12 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
     case "fg_video": {
       const url = getBestCaptured(tabId) || info.srcUrl || info.pageUrl || tab?.url;
       sendStream(url, tab?.title || "");
+      break;
+    }
+    case "fg_subtitles": {
+      const url = subtitleSourceURL(tabId, info.srcUrl || tab?.url || "");
+      if (!url) { notify("FluxGet", "No subtitle source detected yet. Play the video, then try again."); break; }
+      sendSubtitles(url, tab?.title || "", tab?.url ? { Referer: tab.url } : {});
       break;
     }
     case "fg_page_video": {
@@ -654,6 +678,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         ytFormat: msg.ytFormat,
       });
     }
+    return;
+  }
+
+  // Content.js / context menu: download only subtitle tracks as .srt
+  if (msg.action === "download_subtitles") {
+    const title = msg.title || sender.tab?.title || "";
+    const url   = msg.url || subtitleSourceURL(tabId, sender.tab?.url || "");
+    if (!url) {
+      notify("FluxGet", "No subtitle source detected yet. Play the video for a few seconds, then try again.");
+      return;
+    }
+    const referer = (capturedVideos.get(tabId) || []).find(v => v.url === url)?.referer || sender.tab?.url || "";
+    sendSubtitles(url, title, referer ? { Referer: referer } : {});
     return;
   }
 

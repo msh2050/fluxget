@@ -192,6 +192,27 @@ function renderList() {
     });
     row.appendChild(dlBtn);
 
+    // Subtitles button — HLS only (subtitles are declared in the master playlist)
+    if (isHLS) {
+      const subBtn = document.createElement("button");
+      subBtn.className = "dl-btn";
+      subBtn.innerHTML = "💬 Subs";
+      subBtn.title = "Download subtitle tracks only (.srt)";
+      subBtn.addEventListener("click", () => {
+        const title = item.title || currentTabTitle || guessTitle(item.url);
+        const headers = {};
+        if (item.referer) headers["Referer"] = item.referer;
+        fetch(`${BASE_URL}/stream`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url: item.url, title, headers, subtitles: true }),
+        }).catch(() => {});
+        subBtn.innerHTML = "✓ Subs";
+        setTimeout(() => { subBtn.innerHTML = "💬 Subs"; }, 1500);
+      });
+      row.appendChild(subBtn);
+    }
+
     // More (⋮)
     const more = document.createElement("button");
     more.className = "more-btn";

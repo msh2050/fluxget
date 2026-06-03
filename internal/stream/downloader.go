@@ -186,6 +186,10 @@ type Request struct {
 	DestDir string
 	Headers map[string]string
 	Formats []Format // optional: YouTube adaptive formats from the extension
+
+	// SubtitlesOnly downloads just the subtitle tracks (as .srt) and skips the
+	// video — used by the extension's "Download subtitles only" action.
+	SubtitlesOnly bool
 }
 
 // Start detects the URL type, picks the right download strategy, and runs it
@@ -239,6 +243,10 @@ func run(ctx context.Context, pub Publisher, id, title, destDir string, req Requ
 	})
 
 	u := strings.ToLower(req.URL)
+
+	if req.SubtitlesOnly {
+		return runSubtitlesOnly(ctx, pub, id, title, destDir, req, start)
+	}
 
 	switch {
 	case len(req.Formats) > 0:
@@ -634,6 +642,76 @@ func iso639_2(code string) string {
 		return v
 	}
 	return code
+}
+
+// runSubtitlesOnly downloads only the subtitle tracks for a stream and writes
+// them as .srt files (no video). The URL may be an HLS master playlist
+// (subtitles read from #EXT-X-MEDIA) or a direct subtitle playlist / .vtt.
+func runSubtitlesOnly(ctx context.Context, pub Publisher, id, title, destDir string, req Request, start time.Time) error {
+	body, err := fetchText(ctx, req.URL, req.Headers)
+	if err != nil {
+		return fmt.Errorf("stream: fetch subtitle source: %w", err)
+	}
+
+	var subs []HLSSubtitle
+	if strings.Contains(body, "#EXT-X-MEDIA") || strings.Contains(body, "#EXT-X-STREAM-INF") {
+		subs = ParseHLSSubtitles(body, req.URL)
+	}
+	if len(subs) == 0 {
+		// The URL itself is a single subtitle track (direct .vtt or a subtitle
+		// media playlist of .vtt segments).
+		subs = []HLSSubtitle{{URI: req.URL}}
+	}
+	debugLog.Printf("[%s] subtitles-only: %d track(s) from %s", id[:8], len(subs), req.URL)
+
+	tmp, err := os.MkdirTemp("", "fluxget-subs-*")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.RemoveAll(tmp) }()
+
+	ffmpeg, ffErr := findFFmpeg()
+	nameBase := sanitizeFilename(title)
+	saved := 0
+	var lastFile string
+	for i, s := range subs {
+		vtt, derr := downloadSubtitleTrack(ctx, s, req.Headers, tmp, i)
+		if derr != nil {
+			debugLog.Printf("[%s] subtitle %q failed: %v", id[:8], s.Language, derr)
+			continue
+		}
+		lang := s.Language
+		if lang == "" && len(subs) > 1 {
+			lang = fmt.Sprintf("s%d", i)
+		}
+		suffix := ""
+		if lang != "" {
+			suffix = "." + sanitizeFilename(lang)
+		}
+		outFile := filepath.Join(destDir, nameBase+suffix+".srt")
+		if ffErr == nil {
+			if out, cerr := exec.CommandContext(ctx, ffmpeg, "-y", "-i", vtt, outFile).CombinedOutput(); cerr != nil {
+				debugLog.Printf("[%s] vtt→srt failed (%s): %v\n%s", id[:8], lang, cerr, out)
+				outFile = filepath.Join(destDir, nameBase+suffix+".vtt")
+				if copyFile(vtt, outFile, 0o644) != nil {
+					continue
+				}
+			}
+		} else {
+			outFile = filepath.Join(destDir, nameBase+suffix+".vtt")
+			if copyFile(vtt, outFile, 0o644) != nil {
+				continue
+			}
+		}
+		saved++
+		lastFile = outFile
+		debugLog.Printf("[%s] subtitle saved → %s", id[:8], outFile)
+	}
+
+	if saved == 0 {
+		return fmt.Errorf("stream: no subtitle tracks found for this stream")
+	}
+	return publishComplete(pub, id, title, lastFile, start)
 }
 
 // ── DASH ──────────────────────────────────────────────────────────────────────

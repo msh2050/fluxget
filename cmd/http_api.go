@@ -406,12 +406,13 @@ func handleStream(w http.ResponseWriter, r *http.Request, defaultOutputDir strin
 	}
 
 	var req struct {
-		URL      string            `json:"url"`
-		Title    string            `json:"title"`
-		Path     string            `json:"path"`
-		Headers  map[string]string `json:"headers"`
-		Formats  []stream.Format   `json:"formats"`
-		YtFormat string            `json:"ytFormat"` // yt-dlp format selector, e.g. "bestvideo[height<=1080]+bestaudio/best"
+		URL       string            `json:"url"`
+		Title     string            `json:"title"`
+		Path      string            `json:"path"`
+		Headers   map[string]string `json:"headers"`
+		Formats   []stream.Format   `json:"formats"`
+		YtFormat  string            `json:"ytFormat"`  // yt-dlp format selector, e.g. "bestvideo[height<=1080]+bestaudio/best"
+		Subtitles bool              `json:"subtitles"` // download only subtitle tracks (as .srt), skip the video
 	}
 	if err := decodeJSONBody(r, &req); err != nil {
 		http.Error(w, "Invalid JSON: "+err.Error(), http.StatusBadRequest)
@@ -429,6 +430,26 @@ func handleStream(w http.ResponseWriter, r *http.Request, defaultOutputDir strin
 	destDir := req.Path
 	if destDir == "" {
 		destDir = defaultOutputDir
+	}
+
+	// Subtitles-only: download just the subtitle tracks (.srt) via the native
+	// engine, regardless of whether the URL looks like a manifest.
+	if req.Subtitles {
+		id, err := stream.Start(context.Background(), service, stream.Request{
+			URL:           req.URL,
+			Title:         req.Title,
+			DestDir:       destDir,
+			Headers:       req.Headers,
+			SubtitlesOnly: true,
+		})
+		if err != nil {
+			publishSystemLog("subtitles error: " + err.Error())
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		publishSystemLog(fmt.Sprintf("subtitles started: %s", req.URL))
+		writeJSONResponse(w, http.StatusOK, map[string]string{"status": "queued", "id": id})
+		return
 	}
 
 	u := strings.ToLower(req.URL)

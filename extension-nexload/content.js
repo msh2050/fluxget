@@ -214,6 +214,40 @@
       panel.appendChild(row);
     }
 
+    // Subtitles-only row — downloads all caption tracks as .srt (no video)
+    const subSep = document.createElement("div");
+    subSep.className = "fg-q-sep";
+    panel.appendChild(subSep);
+
+    const subRow = document.createElement("button");
+    subRow.className = "fg-q-row";
+    const subIcon = document.createElement("span");
+    subIcon.className = "fg-q-icon";
+    subIcon.textContent = "💬";
+    const subLbl = document.createElement("span");
+    subLbl.className = "fg-q-label";
+    subLbl.textContent = "Subtitles only";
+    const subBadge = document.createElement("span");
+    subBadge.className = "fg-quality-badge";
+    subBadge.textContent = "SRT";
+    subRow.appendChild(subIcon);
+    subRow.appendChild(subLbl);
+    subRow.appendChild(subBadge);
+    subRow.addEventListener("click", (e) => {
+      e.stopPropagation();
+      chrome.runtime.sendMessage({
+        action: "download_subtitles",
+        title: pageTitle || document.title || "",
+        pageUrl: window.location.href,
+      });
+      panel.remove();
+      anchorBtn.innerHTML = "";
+      anchorBtn.appendChild(makeIcon());
+      anchorBtn.appendChild(document.createTextNode(" Subs ✓"));
+      setTimeout(() => resetBtn(anchorBtn), 2500);
+    });
+    panel.appendChild(subRow);
+
     // Close on outside click
     setTimeout(() => {
       document.addEventListener("click", function close(e) {

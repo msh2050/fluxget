@@ -60,7 +60,8 @@ The project is working end-to-end. Here is a summary of what's fully functional:
 
 ### Browser Extension (MV3, Chrome/Edge)
 - Floating **FluxGet** button injects on every `<video>` element in the page
-- Clicking it opens a quality picker: **1080p HD / 720p HD / 480p / 360p / Audio only**
+- Clicking it opens a quality picker: **1080p HD / 720p HD / 480p / 360p / Audio only / Subtitles only**
+- **Subtitles-only download** from the picker, the popup ("💬 Subs" on HLS streams), and the right-click menu
 - Extension toolbar popup lists all streams detected on the current tab
 - Shows format badge (HLS / DASH / MP4 / WebM), quality dropdown, Download button, Copy URL
 - **Download All** batch download from popup
@@ -71,11 +72,25 @@ The project is working end-to-end. Here is a summary of what's fully functional:
 
 ### Download Engine
 - Native HLS parser: master + media playlists, best-variant selection, AES-128-CBC decryption
+- **Fragmented-MP4 / CMAF (av1, h265, …)**: parses `#EXT-X-MAP`, prepends the init segment, and remuxes — handles streams the concat demuxer can't
+- **Subtitle download**: reads `#EXT-X-MEDIA:TYPE=SUBTITLES` renditions, downloads every language, **embeds them into the video (`.mkv`)** and writes **`.srt` sidecars** — or grabs **subtitles only** (no video)
 - Native DASH parser: MPD XML, `$Number$` / `$Time$` / `$Bandwidth$` template expansion
 - YouTube adaptive: picks best video + audio pair, muxes with ffmpeg `-c copy`
 - yt-dlp fallback for Vimeo, Twitch, TikTok, and 30+ known platforms
 - Multi-connection parallel chunk engine (up to 32 workers) from Surge, fully intact
+- Tunable HLS/DASH segment concurrency from the GUI (1–32) to dodge CDN rate-limits
 - Full download history persisted in SQLite
+
+---
+
+## What's new (2.1.x)
+
+- **Subtitles** — HLS subtitle renditions (`#EXT-X-MEDIA:TYPE=SUBTITLES`) are now downloaded for every language, **embedded into the video as soft tracks (`.mkv`)** and saved as **`.srt` sidecars**. A new **"Download subtitles only"** action (floating picker, popup, right-click menu) grabs just the captions. Toggle in **Settings → HLS/DASH engine → Download subtitles**.
+- **Fragmented-MP4 / CMAF** — av1/h265 streams that use a separate `#EXT-X-MAP` init segment now download correctly (previously failed with `could not find corresponding trex`).
+- **Fake-image segment prefix** — segments that some CDNs disguise with a leading PNG/JPEG header are transparently stripped.
+- **GUI fixes** — the dashboard no longer gets stuck "offline" when idle (SSE heartbeat); the auto-start no longer spawns a rival background daemon that downloaded with no UI; single-instance lock prevents duplicate tray icons; open-file / open-folder work from the GUI again.
+- **Richer tray** — shows active downloads with progress and per-item **pause / resume / cancel**.
+- **Tunable HLS/DASH connections** (1–32) and a **build version + commit** shown in the titlebar.
 
 ---
 
@@ -100,7 +115,11 @@ If you just want a fast terminal downloader, use [Surge](https://github.com/Surg
 |---|---|
 | **Native HLS downloader** | Parses `.m3u8` master + media playlists, picks best variant, downloads segments in parallel |
 | **Native DASH downloader** | Parses MPD XML, handles `$Number$` / `$Time$` / `$Bandwidth$` template expansion |
+| **fMP4 / CMAF support** | Parses `#EXT-X-MAP`, prepends the init segment, and remuxes — fixes av1/h265 "could not find trex" failures |
 | **AES-128-CBC decryption** | Reads `#EXT-X-KEY` tags, fetches key, derives IV from sequence number when not explicit |
+| **Subtitle download** | Reads `#EXT-X-MEDIA:TYPE=SUBTITLES`, fetches every language, embeds them into the `.mkv` **and** writes `.srt` sidecars |
+| **Subtitles-only download** | Grab just the caption tracks as `.srt` — from the floating picker, popup, or right-click menu |
+| **Tunable stream concurrency** | GUI setting for HLS/DASH segment connections (1–32) to trade speed against CDN rate-limiting |
 | **YouTube adaptive streams** | Reads `ytInitialPlayerResponse` directly from the page — no API key, no yt-dlp for YouTube |
 | **yt-dlp fallback** | For Vimeo, Twitch, TikTok, and 30+ known platforms where no manifest URL is captured |
 | **ffmpeg mux** | Lossless `-c copy` container remux — HLS segments → MP4, video+audio → MKV |
@@ -141,14 +160,14 @@ _Surge powers FluxGet's download engine — if it's useful to you, consider supp
 |---|---|---|
 | `fluxget-linux-amd64` | Linux | CLI / TUI / headless server |
 | `fluxget-gui-linux-amd64` | Linux | Desktop app (requires `libwebkit2gtk-4.1`) |
-| `fluxget_1.0.0_amd64.deb` | Debian / Ubuntu | Installs both binaries + desktop entry |
+| `fluxget_2.1.6_amd64.deb` | Debian / Ubuntu | Installs both binaries + desktop entry |
 | `fluxget-windows-amd64.exe` | Windows | CLI / headless server |
 | `fluxget-extension.zip` | Chrome / Edge | Load unpacked in `chrome://extensions` |
 
 ```bash
 # Linux .deb install — easiest
 sudo apt install ffmpeg
-sudo dpkg -i fluxget_1.0.0_amd64.deb
+sudo dpkg -i fluxget_2.1.6_amd64.deb
 fluxget-gui          # desktop app
 fluxget server start # OR headless on port 1700
 ```
@@ -332,11 +351,14 @@ The backend runs on port **1700** by default.
   "headers": {
     "Referer": "https://example.com/watch"
   },
-  "formats": []
+  "formats": [],
+  "subtitles": false
 }
 ```
 
 `formats[]` is the YouTube adaptive format array from `ytInitialPlayerResponse`. When present, the backend picks the best video+audio pair and muxes them with ffmpeg.
+
+`subtitles: true` downloads **only** the subtitle tracks (every language in the HLS master, or a direct `.vtt`) as `.srt` files — the video is skipped.
 
 ---
 
