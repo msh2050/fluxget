@@ -401,7 +401,7 @@ body{
      APP SHELL
 ══════════════════════════════════════════════════════════ -->
 <div class="fg-titlebar">
-  <div class="title mono" id="app-version">FluxGet · v2.1.4</div>
+  <div class="title mono" id="app-version">FluxGet · v2.1.5</div>
   <div class="right" id="titlebar-right">
     <span id="conn-status" class="disconnected">● offline</span>
     <span>:1700</span>
@@ -469,6 +469,7 @@ const state = {
     quality: 'best',
     muxContainer: 'mkv',
     hlsConns: 6,
+    subtitles: true,
     ytdlpPath: '/usr/local/bin/yt-dlp',
     ytdlpQuality: '720',
     ytdlpFormat: 'mp4',
@@ -1034,6 +1035,10 @@ function renderSettings() {
     <div class="fg-set-row">
       <div><div class="label">HLS/DASH connections</div><div class="desc">Parallel segment connections for streams (1-32). Higher = faster, but some CDNs rate-limit (429) — lower this if downloads stall or fail.</div></div>
       <input class="fg-input" id="s-hlsconns" type="number" min="1" max="32" value="${s.hlsConns}" style="width:90px">
+    </div>
+    <div class="fg-set-row">
+      <div><div class="label">Download subtitles</div><div class="desc">Fetch all subtitle tracks: embed them into the video (.mkv) and save .srt sidecar files next to it.</div></div>
+      ${tog('subtitles', s.subtitles)}
     </div>
     <div class="fg-set-row">
       <div><div class="label">Quality preference</div><div class="desc">Preferred variant when multiple renditions are available in a manifest.</div></div>

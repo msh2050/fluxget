@@ -8,7 +8,7 @@
   "frontend:dev:serverUrl": "auto",
   "info": {
     "productName": "FluxGet",
-    "productVersion": "2.1.4",
+    "productVersion": "2.1.5",
     "productIdentifier": "io.fluxget.app",
     "copyright": "FluxGet",
     "comments": "IDM-inspired download manager"

@@ -20,6 +20,16 @@ type HLSVariant struct {
 	Height    int
 }
 
+// HLSSubtitle is one subtitle rendition declared in an HLS master playlist via
+// #EXT-X-MEDIA:TYPE=SUBTITLES. URI points to a subtitle media playlist (or a
+// direct .vtt).
+type HLSSubtitle struct {
+	URI      string // subtitle media playlist or .vtt URL
+	Language string // BCP-47 / ISO-639 code, e.g. "ar", "en"
+	Name     string // human label, e.g. "العربية"
+	Default  bool   // DEFAULT=YES
+}
+
 // HLSKey holds AES-128 encryption info from #EXT-X-KEY.
 type HLSKey struct {
 	URI string // URL to fetch the 16-byte AES-128 key
@@ -75,6 +85,38 @@ func ParseHLSMaster(body, baseURL string) ([]HLSVariant, error) {
 		}
 	}
 	return variants, nil
+}
+
+// ParseHLSSubtitles extracts subtitle renditions from an HLS master playlist
+// (#EXT-X-MEDIA:TYPE=SUBTITLES). Returns nil for media playlists.
+func ParseHLSSubtitles(body, baseURL string) []HLSSubtitle {
+	var subs []HLSSubtitle
+	scanner := bufio.NewScanner(strings.NewReader(body))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.HasPrefix(line, "#EXT-X-MEDIA:") {
+			continue
+		}
+		attrs := parseHLSAttrs(line[len("#EXT-X-MEDIA:"):])
+		if !strings.EqualFold(attrs["TYPE"], "SUBTITLES") {
+			continue
+		}
+		uri := attrs["URI"]
+		if uri == "" {
+			continue // subtitle group with no URI (rare) — nothing to fetch
+		}
+		resolved, err := resolveURL(baseURL, uri)
+		if err != nil {
+			continue
+		}
+		subs = append(subs, HLSSubtitle{
+			URI:      resolved,
+			Language: attrs["LANGUAGE"],
+			Name:     attrs["NAME"],
+			Default:  strings.EqualFold(attrs["DEFAULT"], "YES"),
+		})
+	}
+	return subs
 }
 
 // ParseHLSMedia parses an HLS media playlist and returns all segments in order.

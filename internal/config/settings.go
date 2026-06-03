@@ -34,6 +34,7 @@ type GeneralSettings struct {
 	AllowRemoteOpenActions       *Setting `json:"allow_remote_open_actions"`
 	AutoResume                   *Setting `json:"auto_resume"`
 	AutoStart                    *Setting `json:"auto_start"`
+	DownloadSubtitles            *Setting `json:"download_subtitles"`
 	SkipUpdateCheck              *Setting `json:"skip_update_check"`
 	ClipboardMonitor             *Setting `json:"clipboard_monitor"`
 	Theme                        *Setting `json:"theme"`
@@ -230,6 +231,7 @@ func (s *Settings) initializeCategoriesList() {
 				s.General.AllowRemoteOpenActions,
 				s.General.AutoResume,
 				s.General.AutoStart,
+				s.General.DownloadSubtitles,
 				s.General.SkipUpdateCheck,
 				s.General.ClipboardMonitor,
 				s.General.Theme,
@@ -431,6 +433,14 @@ func DefaultSettings() *Settings {
 				Type:         "bool",
 				DefaultValue: false,
 				Value:        false,
+			},
+			DownloadSubtitles: &Setting{
+				Key:          "download_subtitles",
+				Label:        "Download Subtitles",
+				Description:  "Download all subtitle tracks for HLS streams: embed them into the video (.mkv) and write .srt sidecar files.",
+				Type:         "bool",
+				DefaultValue: true,
+				Value:        true,
 			},
 			SkipUpdateCheck: &Setting{
 				Key:          "skip_update_check",

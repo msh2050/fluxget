@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -140,6 +141,19 @@ func SetSegmentWorkers(n int) {
 }
 
 func segWorkerCount() int { return int(segWorkers.Load()) }
+
+// wantSubtitles controls whether HLS subtitle renditions (#EXT-X-MEDIA:
+// TYPE=SUBTITLES) are downloaded, embedded into the output, and written as
+// .srt sidecars. Tunable from the GUI "Download subtitles" setting; default on.
+var wantSubtitles atomic.Bool
+
+func init() { wantSubtitles.Store(true) }
+
+// SetDownloadSubtitles toggles subtitle downloading. Called from cmd when
+// settings load or change.
+func SetDownloadSubtitles(on bool) { wantSubtitles.Store(on) }
+
+func subtitlesEnabled() bool { return wantSubtitles.Load() }
 
 // errRateLimit is returned when a CDN responds with HTTP 429.
 // It carries the suggested wait duration so the worker can back off.
@@ -314,7 +328,16 @@ func runHLS(ctx context.Context, pub Publisher, id, title, destDir string, req R
 	}
 
 	mediaURL := req.URL
+	// Subtitle renditions are declared only in the master playlist, so capture
+	// them from `body` before it's replaced by the selected media playlist.
+	var subtitles []HLSSubtitle
 	if len(variants) > 0 {
+		if subtitlesEnabled() {
+			subtitles = ParseHLSSubtitles(body, req.URL)
+			if len(subtitles) > 0 {
+				debugLog.Printf("[%s] HLS subtitles: %d track(s)", id[:8], len(subtitles))
+			}
+		}
 		best := HLSBestVariant(variants)
 		mediaURL = best.URL
 		debugLog.Printf("[%s] HLS best variant: %dx%d %d kbps → %s", id[:8], best.Width, best.Height, best.Bandwidth/1000, mediaURL)
@@ -378,8 +401,6 @@ func runHLS(ctx context.Context, pub Publisher, id, title, destDir string, req R
 		}
 	}
 
-	outFile := outputPath(destDir, sanitizeFilename(title), ".mp4")
-
 	// fMP4 (fragmented MP4 / CMAF) HLS streams declare an initialization segment
 	// via #EXT-X-MAP. Its moov/trex boxes carry the per-track defaults that every
 	// moof+mdat media fragment references — without it ffmpeg reports "could not
@@ -393,6 +414,18 @@ func runHLS(ctx context.Context, pub Publisher, id, title, destDir string, req R
 			break
 		}
 	}
+
+	// When the stream carries subtitle renditions, take the subtitle-aware path:
+	// it embeds all tracks into an .mkv and writes .srt sidecars.
+	if len(subtitles) > 0 {
+		if err := assembleHLSWithSubtitles(ctx, pub, id, title, destDir, tmp, segFiles, initURL, isFMP4Segment(segFiles[0]), subtitles, req.Headers, start); err != nil {
+			keepOnce("mux-error")
+			return err
+		}
+		return nil
+	}
+
+	outFile := outputPath(destDir, sanitizeFilename(title), ".mp4")
 	if initURL != "" || isFMP4Segment(segFiles[0]) {
 		allFiles := segFiles
 		if initURL != "" {
@@ -430,6 +463,177 @@ func runHLS(ctx context.Context, pub Publisher, id, title, destDir string, req R
 		debugLog.Printf("[%s] output OK: %s (%s)", id[:8], outFile, formatBytes(fi.Size()))
 	}
 	return nil
+}
+
+// ── HLS subtitles ─────────────────────────────────────────────────────────────
+
+// assembleHLSWithSubtitles builds the final video with every subtitle rendition
+// embedded as a soft track (output .mkv) and also writes one .srt sidecar per
+// language next to it. Subtitle download/convert failures are non-fatal — the
+// video is always produced.
+func assembleHLSWithSubtitles(ctx context.Context, pub Publisher, id, title, destDir, tmp string,
+	segFiles []string, initURL string, isFMP4 bool, subtitles []HLSSubtitle, headers map[string]string, start time.Time) error {
+
+	// 1. Build the single source video file (byte-concat; no publish yet).
+	var initFiles []string
+	if initURL != "" {
+		var ierr error
+		initFiles, ierr = downloadSegments(ctx, pub, id, []string{initURL}, headers, filepath.Join(tmp, "init"), start)
+		if ierr != nil || len(initFiles) == 0 {
+			return fmt.Errorf("stream: fetch HLS init segment: %w", ierr)
+		}
+		isFMP4 = true
+	}
+	videoSrc := filepath.Join(tmp, "video_src.ts")
+	if isFMP4 {
+		videoSrc = filepath.Join(tmp, "video_src.mp4")
+	}
+	if err := catFiles(append(append([]string{}, initFiles...), segFiles...), videoSrc); err != nil {
+		return fmt.Errorf("stream: concat segments: %w", err)
+	}
+
+	// 2. Download subtitle tracks (best-effort).
+	type subTrack struct{ path, lang, name string }
+	var tracks []subTrack
+	for i, s := range subtitles {
+		vtt, err := downloadSubtitleTrack(ctx, s, headers, tmp, i)
+		if err != nil {
+			debugLog.Printf("[%s] subtitle %q (%s) failed: %v", id[:8], s.Name, s.Language, err)
+			continue
+		}
+		lang := s.Language
+		if lang == "" {
+			lang = fmt.Sprintf("s%d", i)
+		}
+		tracks = append(tracks, subTrack{path: vtt, lang: lang, name: s.Name})
+	}
+
+	ffmpeg, ffErr := findFFmpeg()
+
+	// 3. Pick the container: .mkv when we can embed subtitles, else .mp4.
+	ext := ".mp4"
+	if ffErr == nil && len(tracks) > 0 {
+		ext = ".mkv"
+	}
+	outFile := outputPath(destDir, sanitizeFilename(title), ext)
+	base := strings.TrimSuffix(outFile, ext)
+
+	// 4. Write one sidecar per track (.srt via ffmpeg, else raw .vtt).
+	for _, t := range tracks {
+		suffix := ""
+		if t.lang != "" {
+			suffix = "." + sanitizeFilename(t.lang)
+		}
+		if ffErr == nil {
+			side := base + suffix + ".srt"
+			cmd := exec.CommandContext(ctx, ffmpeg, "-y", "-i", t.path, side)
+			if out, err := cmd.CombinedOutput(); err != nil {
+				debugLog.Printf("[%s] srt sidecar (%s) failed: %v\n%s", id[:8], t.lang, err, out)
+				_ = copyFile(t.path, base+suffix+".vtt", 0o644)
+			} else {
+				debugLog.Printf("[%s] subtitle sidecar → %s", id[:8], side)
+			}
+		} else {
+			_ = copyFile(t.path, base+suffix+".vtt", 0o644)
+		}
+	}
+
+	// 5. Produce the final video, embedding subtitle tracks when ffmpeg is present.
+	if ffErr != nil {
+		if err := os.Rename(videoSrc, outFile); err != nil {
+			return err
+		}
+		debugLog.Printf("[%s] no ffmpeg — saved video + %d sidecar(s) → %s", id[:8], len(tracks), outFile)
+		return publishComplete(pub, id, title, outFile, start)
+	}
+
+	args := []string{"-y", "-i", videoSrc}
+	for _, t := range tracks {
+		args = append(args, "-i", t.path)
+	}
+	args = append(args, "-map", "0")
+	for i := range tracks {
+		args = append(args, "-map", strconv.Itoa(i+1))
+	}
+	args = append(args, "-c", "copy")
+	if len(tracks) > 0 {
+		args = append(args, "-c:s", "srt")
+		for i, t := range tracks {
+			args = append(args, fmt.Sprintf("-metadata:s:s:%d", i), "language="+iso639_2(t.lang))
+			if t.name != "" {
+				args = append(args, fmt.Sprintf("-metadata:s:s:%d", i), "title="+t.name)
+			}
+		}
+	}
+	args = append(args, outFile)
+
+	debugLog.Printf("[%s] embedding %d subtitle track(s) → %s", id[:8], len(tracks), outFile)
+	if out, err := exec.CommandContext(ctx, ffmpeg, args...).CombinedOutput(); err != nil {
+		debugLog.Printf("[%s] ffmpeg subtitle mux error: %v\n%s", id[:8], err, out)
+		if fi, statErr := os.Stat(outFile); statErr != nil || fi.Size() == 0 {
+			_ = os.Remove(outFile)
+		}
+		return fmt.Errorf("stream: ffmpeg subtitle mux: %w", err)
+	}
+	if fi, e := os.Stat(outFile); e == nil {
+		debugLog.Printf("[%s] output OK: %s (%s)", id[:8], outFile, formatBytes(fi.Size()))
+	}
+	return publishComplete(pub, id, title, outFile, start)
+}
+
+// downloadSubtitleTrack fetches a subtitle rendition (an HLS media playlist of
+// .vtt segments, or a direct .vtt) and writes a single concatenated WebVTT file.
+func downloadSubtitleTrack(ctx context.Context, sub HLSSubtitle, headers map[string]string, tmp string, idx int) (string, error) {
+	body, err := fetchText(ctx, sub.URI, headers)
+	if err != nil {
+		return "", err
+	}
+
+	vtt := body
+	if strings.HasPrefix(strings.TrimSpace(body), "#EXTM3U") {
+		segs, perr := ParseHLSMedia(body, sub.URI)
+		if perr != nil || len(segs) == 0 {
+			return "", fmt.Errorf("empty subtitle playlist: %w", perr)
+		}
+		var sb strings.Builder
+		for _, s := range segs {
+			segBody, ferr := fetchText(ctx, s.URL, headers)
+			if ferr != nil {
+				return "", ferr
+			}
+			sb.WriteString(segBody)
+			sb.WriteString("\n")
+		}
+		vtt = sb.String()
+	}
+
+	dest := filepath.Join(tmp, fmt.Sprintf("sub%d.vtt", idx))
+	if err := os.WriteFile(dest, []byte(vtt), 0o644); err != nil {
+		return "", err
+	}
+	return dest, nil
+}
+
+// iso639_2 maps a BCP-47/ISO-639-1 subtitle language code to the ISO-639-2
+// 3-letter code Matroska expects (e.g. "ar" → "ara"). Region subtags are
+// dropped ("pt-BR" → "pt"); unknown codes pass through unchanged.
+func iso639_2(code string) string {
+	code = strings.ToLower(strings.TrimSpace(code))
+	if i := strings.IndexAny(code, "-_"); i > 0 {
+		code = code[:i]
+	}
+	m := map[string]string{
+		"ar": "ara", "en": "eng", "fa": "per", "tr": "tur", "ru": "rus",
+		"fr": "fre", "de": "ger", "es": "spa", "it": "ita", "ja": "jpn",
+		"ko": "kor", "zh": "chi", "pt": "por", "nl": "dut", "hi": "hin",
+		"id": "ind", "th": "tha", "vi": "vie", "pl": "pol", "uk": "ukr",
+		"sv": "swe", "no": "nor", "da": "dan", "fi": "fin", "cs": "cze",
+		"el": "gre", "he": "heb", "ro": "rum", "hu": "hun",
+	}
+	if v, ok := m[code]; ok {
+		return v
+	}
+	return code
 }
 
 // ── DASH ──────────────────────────────────────────────────────────────────────

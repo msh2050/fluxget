@@ -12,6 +12,7 @@ func applyEngineSettings(s *config.Settings) {
 		return
 	}
 	stream.SetSegmentWorkers(config.Resolve[int](s.Network.StreamSegmentWorkers))
+	stream.SetDownloadSubtitles(config.Resolve[bool](s.General.DownloadSubtitles))
 }
 
 // flatSettings is the simplified settings shape exposed to the GUI.
@@ -35,6 +36,7 @@ type flatSettings struct {
 	Quality      string `json:"quality"`
 	MuxContainer string `json:"muxContainer"`
 	HLSConns     int    `json:"hlsConns"`
+	Subtitles    bool   `json:"subtitles"`
 
 	// yt-dlp engine
 	YtdlpPath     string `json:"ytdlpPath"`
@@ -67,6 +69,7 @@ func flattenSettings(s *config.Settings) flatSettings {
 		Quality:        "best",
 		MuxContainer:   "mkv",
 		HLSConns:       config.Resolve[int](s.Network.StreamSegmentWorkers),
+		Subtitles:      config.Resolve[bool](s.General.DownloadSubtitles),
 		YtdlpPath:      "/usr/local/bin/yt-dlp",
 		YtdlpQuality:   "720",
 		YtdlpFormat:    "mp4",
@@ -114,6 +117,7 @@ func applyFlatSettings(s *config.Settings, f flatSettings) {
 	if f.HLSConns > 0 {
 		setInt(&s.Network.StreamSegmentWorkers, f.HLSConns)
 	}
+	setBool(&s.General.DownloadSubtitles, f.Subtitles)
 	if f.MaxConcurrent > 0 {
 		setInt(&s.Network.MaxConcurrentDownloads, f.MaxConcurrent)
 	}
