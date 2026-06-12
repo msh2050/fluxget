@@ -22,7 +22,7 @@ require (
 	github.com/stretchr/testify v1.11.1
 	github.com/vfaronov/httpheader v0.1.0
 	github.com/wailsapp/wails/v2 v2.12.0
-	modernc.org/sqlite v1.50.1
+	modernc.org/sqlite v1.52.0
 )
 
 require (
