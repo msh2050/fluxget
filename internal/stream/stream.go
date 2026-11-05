@@ -496,16 +496,6 @@ func stripKnownExt(s string) string {
 
 func titleBase(title string) string { return sanitizeFilename(stripKnownExt(title)) }
 
-func extFromURL(u string) string {
-	path := strings.SplitN(strings.SplitN(u, "?", 2)[0], "#", 2)[0]
-	ext := strings.ToLower(filepath.Ext(path))
-	switch ext {
-	case ".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv", ".m4v", ".m4a", ".mp3", ".aac", ".ogg", ".opus", ".flac", ".wav", ".ts", ".3gp":
-		return ext
-	}
-	return ""
-}
-
 func filenameFromURL(u string) string {
 	parts := strings.Split(strings.SplitN(u, "?", 2)[0], "/")
 	// Skip the scheme ("https:") and host; take the last non-empty path element.

@@ -30,25 +30,19 @@ var apiPaths = []string{
 
 func backendProxy() func(http.Handler) http.Handler {
 	target, _ := url.Parse("http://localhost:1700")
-	proxy := httputil.NewSingleHostReverseProxy(target)
-	// httputil.ReverseProxy adds X-Forwarded-For by default. The backend's
-	// open-file/open-folder guard rejects requests that have this header even
-	// when the underlying connection is loopback. Strip it so the backend sees
-	// a pure loopback request and allows the action.
-	//
-	// NOTE: a plain Header.Del here does NOT work — ReverseProxy.ServeHTTP runs
-	// after Director and re-populates X-Forwarded-For with the client IP. The
-	// documented way to suppress it entirely is to set the header to nil (see
-	// Go issue 38079); the proxy then omits it instead of overwriting.
-	orig := proxy.Director
-	proxy.Director = func(req *http.Request) {
-		orig(req)
-		req.Header["X-Forwarded-For"] = nil
-		req.Header.Del("X-Real-IP")
-		// The webview's own origin is trusted; present the proxied call as a
-		// plain local client so the backend's cross-origin guard allows it.
-		req.Header.Del("Origin")
-		req.Header.Del("Sec-Fetch-Site")
+	// Rewrite (not the deprecated Director): unlike Director it never adds
+	// X-Forwarded-For and strips inbound X-Forwarded-* headers. The backend's
+	// open-file/open-folder guard rejects requests carrying those even over
+	// loopback, so the proxied call must look like a plain local client.
+	proxy := &httputil.ReverseProxy{
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			pr.SetURL(target)
+			pr.Out.Header.Del("X-Real-IP")
+			// The webview's own origin is trusted; drop it so the backend's
+			// cross-origin guard treats this as a local client.
+			pr.Out.Header.Del("Origin")
+			pr.Out.Header.Del("Sec-Fetch-Site")
+		},
 	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -173,9 +173,10 @@ func trayLabel(d trayStatus) string {
 	}
 	var b strings.Builder
 	b.WriteString(name)
-	if d.Status == "paused" {
+	switch d.Status {
+	case "paused":
 		b.WriteString("  (paused)")
-	} else if d.Status == "queued" {
+	case "queued":
 		b.WriteString("  (queued)")
 	}
 	if d.TotalSize > 0 {
@@ -195,7 +196,7 @@ func trayList() []trayStatus {
 	if err != nil {
 		return nil
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	var out []trayStatus
 	_ = json.NewDecoder(resp.Body).Decode(&out)
 	return out
