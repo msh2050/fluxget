@@ -45,6 +45,10 @@ func backendProxy() func(http.Handler) http.Handler {
 		orig(req)
 		req.Header["X-Forwarded-For"] = nil
 		req.Header.Del("X-Real-IP")
+		// The webview's own origin is trusted; present the proxied call as a
+		// plain local client so the backend's cross-origin guard allows it.
+		req.Header.Del("Origin")
+		req.Header.Del("Sec-Fetch-Site")
 	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -71,7 +75,7 @@ func main() {
 			Assets:     assets,
 			Middleware: backendProxy(),
 		},
-		BackgroundColour:   &options.RGBA{R: 11, G: 11, B: 12, A: 255},
+		BackgroundColour:  &options.RGBA{R: 11, G: 11, B: 12, A: 255},
 		HideWindowOnClose: true,
 		// Prevent a second tray icon / engine: if FluxGet is already running
 		// (e.g. GNOME session-restore plus the XDG autostart entry both fire on
@@ -83,9 +87,9 @@ func main() {
 				wailsruntime.WindowUnminimise(app.ctx)
 			},
 		},
-		OnStartup:         app.startup,
-		OnShutdown:        app.shutdown,
-		Bind:             []interface{}{app},
+		OnStartup:  app.startup,
+		OnShutdown: app.shutdown,
+		Bind:       []interface{}{app},
 		Linux: &linux.Options{
 			ProgramName:         "fluxget-gui",
 			Icon:                windowIcon,

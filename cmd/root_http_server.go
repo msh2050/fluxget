@@ -5,16 +5,17 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/msh2050/fluxget/internal/config"
 	"github.com/msh2050/fluxget/internal/service"
 	"github.com/msh2050/fluxget/internal/utils"
-	"github.com/google/uuid"
 )
 
 func resolveTokenPath() string {
@@ -163,8 +164,16 @@ func authMiddleware(token string, next http.Handler) http.Handler {
 			return
 		}
 
-		// Loopback connections (browser extension on same machine) bypass token auth
+		// Loopback connections (browser extension on same machine) bypass token
+		// auth — but only for non-browser clients, the FluxGet extension, the
+		// dashboard itself and the desktop GUI. Without this, any web page the
+		// user visits could POST to 127.0.0.1 and download files to arbitrary
+		// folders (drive-by request forgery).
 		if isLoopback(r) {
+			if !loopbackOriginAllowed(r) {
+				http.Error(w, "Forbidden: cross-origin request from "+r.Header.Get("Origin"), http.StatusForbidden)
+				return
+			}
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -231,4 +240,38 @@ func writeTokenToFile(path string, token string) error {
 		return err
 	}
 	return os.Chmod(path, 0o600)
+}
+
+// loopbackOriginAllowed decides whether a loopback request may skip token auth
+// based on the browser-supplied Origin / Sec-Fetch-Site headers.
+func loopbackOriginAllowed(r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		// Non-browser clients (CLI, curl, GUI proxy) send no Origin. Browsers
+		// omit it on simple GETs; reject those only when they are flagged as
+		// cross-site navigations/subresources.
+		return !strings.EqualFold(r.Header.Get("Sec-Fetch-Site"), "cross-site")
+	}
+	u, err := url.Parse(origin)
+	if err != nil || origin == "null" {
+		return false
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "chrome-extension", "moz-extension", "safari-web-extension", "extension", "wails":
+		return true
+	case "http", "https":
+	default:
+		return false
+	}
+	host := u.Hostname()
+	if strings.EqualFold(u.Host, r.Host) {
+		return true // same-origin: the /ui dashboard
+	}
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true // desktop GUI (wails.localhost) and local dev servers
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return true
+	}
+	return false
 }

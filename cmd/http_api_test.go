@@ -636,7 +636,14 @@ func TestEventsEndpoint_RequiresAuthAndStreamsSSE(t *testing.T) {
 
 	mux := http.NewServeMux()
 	registerHTTPRoutes(mux, 0, "", service)
-	handler := corsMiddleware(authMiddleware("test-token", mux))
+	// FluxGet lets loopback clients (the browser extension) skip the token, so
+	// present the test client as a remote host to exercise token enforcement.
+	remote := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r2 := r.Clone(r.Context())
+		r2.RemoteAddr = "203.0.113.1:12345"
+		authMiddleware("test-token", mux).ServeHTTP(w, r2)
+	})
+	handler := corsMiddleware(remote)
 	server := testutil.NewHTTPServerT(t, handler)
 	defer server.Close()
 
