@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/SurgeDM/Surge/internal/clioutput"
-	"github.com/SurgeDM/Surge/internal/store"
-	"github.com/SurgeDM/Surge/internal/types"
+	"github.com/msh2050/fluxget/internal/clioutput"
+	"github.com/msh2050/fluxget/internal/store"
+	"github.com/msh2050/fluxget/internal/types"
 )
 
 func TestFetchClearsReceiptWhenFinalArtifactCheckFails(t *testing.T) {

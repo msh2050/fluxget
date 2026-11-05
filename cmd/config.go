@@ -11,8 +11,8 @@ import (
 
 	"charm.land/lipgloss/v2"
 	"charm.land/lipgloss/v2/table"
-	"github.com/SurgeDM/Surge/internal/config"
-	"github.com/SurgeDM/Surge/internal/tui/colors"
+	"github.com/msh2050/fluxget/internal/config"
+	"github.com/msh2050/fluxget/internal/tui/colors"
 	"github.com/charmbracelet/x/term"
 	"github.com/spf13/cobra"
 )

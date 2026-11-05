@@ -13,7 +13,7 @@ import (
 	"testing"
 
 	"charm.land/bubbles/v2/viewport"
-	"github.com/SurgeDM/Surge/internal/config"
+	"github.com/msh2050/fluxget/internal/config"
 )
 
 // newModelWithWarnings builds a minimal RootModel with pre-populated
@@ -163,7 +163,7 @@ func TestConfigWarning_SystemLogMsg_UsesInfoStyle(t *testing.T) {
 		list:        NewDownloadList(80, 20),
 	}
 
-	from := "github.com/SurgeDM/Surge/internal/types"
+	from := "github.com/msh2050/fluxget/internal/types"
 	_ = from // suppress unused import - events imported via update_types.go
 
 	// Use the types.DownloadEvent path directly

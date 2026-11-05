@@ -8,7 +8,7 @@ import (
 
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
-	"github.com/SurgeDM/Surge/internal/config"
+	"github.com/msh2050/fluxget/internal/config"
 )
 
 func TestUpdateDashboard_ReportBugEntersTargetModal(t *testing.T) {

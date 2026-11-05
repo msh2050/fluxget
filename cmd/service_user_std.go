@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/SurgeDM/Surge/internal/config"
-	"github.com/SurgeDM/Surge/internal/userservice"
+	"github.com/msh2050/fluxget/internal/config"
+	"github.com/msh2050/fluxget/internal/userservice"
 	"github.com/spf13/cobra"
 )
 

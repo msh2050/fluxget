@@ -11,7 +11,7 @@ import (
 	"time"
 
 	semver "github.com/Masterminds/semver/v3"
-	"github.com/SurgeDM/Surge/internal/utils"
+	"github.com/msh2050/fluxget/internal/utils"
 )
 
 const (

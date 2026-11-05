@@ -7,8 +7,8 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
-	"github.com/SurgeDM/Surge/internal/selfupdate"
-	"github.com/SurgeDM/Surge/internal/version"
+	"github.com/msh2050/fluxget/internal/selfupdate"
+	"github.com/msh2050/fluxget/internal/version"
 )
 
 // checkForUpdateCmd performs an async update check

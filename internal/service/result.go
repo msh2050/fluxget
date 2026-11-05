@@ -6,8 +6,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/SurgeDM/Surge/internal/store"
-	"github.com/SurgeDM/Surge/internal/types"
+	"github.com/msh2050/fluxget/internal/store"
+	"github.com/msh2050/fluxget/internal/types"
 )
 
 // ResultService supplies completion after the lifecycle worker has finalized the

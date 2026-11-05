@@ -4,8 +4,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/SurgeDM/Surge/internal/progress"
-	"github.com/SurgeDM/Surge/internal/types"
+	"github.com/msh2050/fluxget/internal/progress"
+	"github.com/msh2050/fluxget/internal/types"
 )
 
 // buildCompletedBitmap encodes a 2-bit-per-chunk bitmap marking the first

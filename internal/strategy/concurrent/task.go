@@ -6,7 +6,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/SurgeDM/Surge/internal/types"
+	"github.com/msh2050/fluxget/internal/types"
 )
 
 // ActiveTask tracks a task currently being processed by a worker

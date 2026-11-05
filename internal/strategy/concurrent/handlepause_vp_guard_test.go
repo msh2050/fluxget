@@ -6,8 +6,8 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/SurgeDM/Surge/internal/progress"
-	"github.com/SurgeDM/Surge/internal/types"
+	"github.com/msh2050/fluxget/internal/progress"
+	"github.com/msh2050/fluxget/internal/types"
 )
 
 func TestHandlePause_RemainingZeroButVPLessThanFileSize_SavesStateNotFinalize(t *testing.T) {

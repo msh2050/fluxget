@@ -15,7 +15,7 @@ import (
 	"runtime"
 	"testing"
 
-	"github.com/SurgeDM/Surge/internal/version"
+	"github.com/msh2050/fluxget/internal/version"
 )
 
 func TestSelectReleaseAsset(t *testing.T) {

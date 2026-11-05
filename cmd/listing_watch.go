@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/SurgeDM/Surge/internal/clioutput"
+	"github.com/msh2050/fluxget/internal/clioutput"
 	"github.com/charmbracelet/x/term"
 )
 

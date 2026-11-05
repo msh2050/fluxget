@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/SurgeDM/Surge/internal/testutil"
+	"github.com/msh2050/fluxget/internal/testutil"
 	"github.com/spf13/cobra"
 )
 

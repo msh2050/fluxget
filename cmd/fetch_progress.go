@@ -10,8 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/SurgeDM/Surge/internal/transferui"
-	"github.com/SurgeDM/Surge/internal/types"
+	"github.com/msh2050/fluxget/internal/transferui"
+	"github.com/msh2050/fluxget/internal/types"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/charmbracelet/x/term"
 	"github.com/spf13/cobra"

@@ -3,7 +3,7 @@ package concurrent
 import (
 	"time"
 
-	"github.com/SurgeDM/Surge/internal/utils"
+	"github.com/msh2050/fluxget/internal/utils"
 )
 
 // checkWorkerHealth detects slow workers and cancels them

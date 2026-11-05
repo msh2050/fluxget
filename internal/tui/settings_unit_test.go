@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/SurgeDM/Surge/internal/config"
+	"github.com/msh2050/fluxget/internal/config"
 )
 
 func TestSettingsMetadataValidation(t *testing.T) {

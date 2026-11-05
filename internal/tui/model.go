@@ -1,9 +1,9 @@
 package tui
 
 import (
-	"github.com/SurgeDM/Surge/internal/orchestrator"
-	engineprogress "github.com/SurgeDM/Surge/internal/progress"
-	"github.com/SurgeDM/Surge/internal/transferui"
+	"github.com/msh2050/fluxget/internal/orchestrator"
+	engineprogress "github.com/msh2050/fluxget/internal/progress"
+	"github.com/msh2050/fluxget/internal/transferui"
 
 	"context"
 	"errors"
@@ -24,13 +24,13 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 
-	"github.com/SurgeDM/Surge/internal/config"
-	"github.com/SurgeDM/Surge/internal/power"
-	downloadservice "github.com/SurgeDM/Surge/internal/service"
-	"github.com/SurgeDM/Surge/internal/tui/colors"
-	"github.com/SurgeDM/Surge/internal/tui/components"
-	"github.com/SurgeDM/Surge/internal/types"
-	"github.com/SurgeDM/Surge/internal/version"
+	"github.com/msh2050/fluxget/internal/config"
+	"github.com/msh2050/fluxget/internal/power"
+	downloadservice "github.com/msh2050/fluxget/internal/service"
+	"github.com/msh2050/fluxget/internal/tui/colors"
+	"github.com/msh2050/fluxget/internal/tui/components"
+	"github.com/msh2050/fluxget/internal/types"
+	"github.com/msh2050/fluxget/internal/version"
 )
 
 // InitializeTUI prepares global TUI state like styles and component caches.

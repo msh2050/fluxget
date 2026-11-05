@@ -4,10 +4,10 @@ import (
 	"context"
 	"testing"
 
-	"github.com/SurgeDM/Surge/internal/config"
-	"github.com/SurgeDM/Surge/internal/service"
-	"github.com/SurgeDM/Surge/internal/tui"
-	"github.com/SurgeDM/Surge/internal/types"
+	"github.com/msh2050/fluxget/internal/config"
+	"github.com/msh2050/fluxget/internal/service"
+	"github.com/msh2050/fluxget/internal/tui"
+	"github.com/msh2050/fluxget/internal/types"
 )
 
 type fakeRemoteDownloadService struct {

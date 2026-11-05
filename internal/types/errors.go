@@ -4,7 +4,7 @@ import (
 	"errors"
 	"net/http"
 
-	"github.com/SurgeDM/Surge/internal/utils"
+	"github.com/msh2050/fluxget/internal/utils"
 )
 
 // Common errors

@@ -7,7 +7,7 @@ import (
 
 	"charm.land/bubbles/v2/key"
 	tea "charm.land/bubbletea/v2"
-	"github.com/SurgeDM/Surge/internal/types"
+	"github.com/msh2050/fluxget/internal/types"
 )
 
 func TestMissingFileStatusAndRecovery(t *testing.T) {

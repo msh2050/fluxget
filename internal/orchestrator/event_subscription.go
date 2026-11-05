@@ -3,7 +3,7 @@ package orchestrator
 import (
 	"sync"
 
-	"github.com/SurgeDM/Surge/internal/types"
+	"github.com/msh2050/fluxget/internal/types"
 )
 
 // Each observer owns its writer goroutine. None of these channels are closed by

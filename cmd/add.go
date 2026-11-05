@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/SurgeDM/Surge/internal/clioutput"
-	"github.com/SurgeDM/Surge/internal/utils"
+	"github.com/msh2050/fluxget/internal/clioutput"
+	"github.com/msh2050/fluxget/internal/utils"
 	"github.com/spf13/cobra"
 )
 

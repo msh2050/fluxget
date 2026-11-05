@@ -6,10 +6,10 @@ import (
 	"time"
 
 	"charm.land/bubbles/v2/progress"
-	"github.com/SurgeDM/Surge/internal/config"
-	engineprogress "github.com/SurgeDM/Surge/internal/progress"
-	"github.com/SurgeDM/Surge/internal/tui/colors"
-	"github.com/SurgeDM/Surge/internal/types"
+	"github.com/msh2050/fluxget/internal/config"
+	engineprogress "github.com/msh2050/fluxget/internal/progress"
+	"github.com/msh2050/fluxget/internal/tui/colors"
+	"github.com/msh2050/fluxget/internal/types"
 )
 
 // benchModel builds a realistic RootModel with n active downloads for benchmarking.

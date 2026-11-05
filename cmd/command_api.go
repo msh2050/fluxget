@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/SurgeDM/Surge/internal/types"
+	"github.com/msh2050/fluxget/internal/types"
 )
 
 // commandAPIRequest binds observation and mutation requests to command lifetime.

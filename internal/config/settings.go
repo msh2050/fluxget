@@ -18,8 +18,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/SurgeDM/Surge/internal/types"
-	"github.com/SurgeDM/Surge/internal/utils"
+	"github.com/msh2050/fluxget/internal/types"
+	"github.com/msh2050/fluxget/internal/utils"
 	"github.com/pelletier/go-toml/v2"
 )
 
@@ -1073,8 +1073,8 @@ func DefaultSettings() *Settings {
 				Label:        "Setup instructions",
 				Description:  "View detailed instructions on how to set up the Surge browser extension.",
 				Type:         TypeLink,
-				DefaultValue: "https://github.com/SurgeDM/Surge#browser-extension",
-				Value:        "https://github.com/SurgeDM/Surge#browser-extension",
+				DefaultValue: "https://github.com/msh2050/fluxget#browser-extension",
+				Value:        "https://github.com/msh2050/fluxget#browser-extension",
 			},
 		},
 	}

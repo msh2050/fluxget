@@ -1,8 +1,8 @@
 package tui
 
 import (
-	"github.com/SurgeDM/Surge/internal/tui/colors"
-	"github.com/SurgeDM/Surge/internal/tui/components"
+	"github.com/msh2050/fluxget/internal/tui/colors"
+	"github.com/msh2050/fluxget/internal/tui/components"
 )
 
 // renderLogBox returns the full Activity Log box with borders and title.

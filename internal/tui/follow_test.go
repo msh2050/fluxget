@@ -1,12 +1,12 @@
 package tui
 
 import (
-	engineprogress "github.com/SurgeDM/Surge/internal/progress"
+	engineprogress "github.com/msh2050/fluxget/internal/progress"
 
 	"testing"
 
 	"charm.land/bubbles/v2/viewport"
-	"github.com/SurgeDM/Surge/internal/types"
+	"github.com/msh2050/fluxget/internal/types"
 )
 
 func TestAutoFollow_BrandNewDownload(t *testing.T) {

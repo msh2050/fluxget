@@ -3,7 +3,7 @@ package main
 import (
 	"os"
 
-	"github.com/SurgeDM/Surge/cmd"
+	"github.com/msh2050/fluxget/cmd"
 )
 
 func main() {

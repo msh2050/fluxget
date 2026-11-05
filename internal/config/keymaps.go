@@ -12,7 +12,7 @@ import (
 	"strings"
 
 	"charm.land/bubbles/v2/key"
-	"github.com/SurgeDM/Surge/internal/utils"
+	"github.com/msh2050/fluxget/internal/utils"
 )
 
 // KeyMap defines the keybindings for the entire application

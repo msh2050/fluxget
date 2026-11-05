@@ -1,6 +1,6 @@
 package tui
 
-import "github.com/SurgeDM/Surge/internal/tui/components"
+import "github.com/msh2050/fluxget/internal/tui/components"
 
 // GetHeaderHeight returns the appropriate header height based on terminal height
 func GetHeaderHeight(termHeight int) int {

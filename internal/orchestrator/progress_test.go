@@ -6,10 +6,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/SurgeDM/Surge/internal/config"
-	"github.com/SurgeDM/Surge/internal/progress"
-	"github.com/SurgeDM/Surge/internal/scheduler"
-	"github.com/SurgeDM/Surge/internal/types"
+	"github.com/msh2050/fluxget/internal/config"
+	"github.com/msh2050/fluxget/internal/progress"
+	"github.com/msh2050/fluxget/internal/scheduler"
+	"github.com/msh2050/fluxget/internal/types"
 )
 
 func TestProgressAggregator_Loop(t *testing.T) {

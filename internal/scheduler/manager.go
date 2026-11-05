@@ -10,13 +10,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/SurgeDM/Surge/internal/probe"
-	"github.com/SurgeDM/Surge/internal/progress"
-	"github.com/SurgeDM/Surge/internal/store"
-	"github.com/SurgeDM/Surge/internal/strategy/concurrent"
-	"github.com/SurgeDM/Surge/internal/strategy/single"
-	"github.com/SurgeDM/Surge/internal/types"
-	"github.com/SurgeDM/Surge/internal/utils"
+	"github.com/msh2050/fluxget/internal/probe"
+	"github.com/msh2050/fluxget/internal/progress"
+	"github.com/msh2050/fluxget/internal/store"
+	"github.com/msh2050/fluxget/internal/strategy/concurrent"
+	"github.com/msh2050/fluxget/internal/strategy/single"
+	"github.com/msh2050/fluxget/internal/types"
+	"github.com/msh2050/fluxget/internal/utils"
 )
 
 const terminalSendTimeout = 3 * time.Second

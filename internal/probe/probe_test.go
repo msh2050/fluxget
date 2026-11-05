@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/SurgeDM/Surge/internal/probe"
-	"github.com/SurgeDM/Surge/internal/testutil"
-	"github.com/SurgeDM/Surge/internal/types"
+	"github.com/msh2050/fluxget/internal/probe"
+	"github.com/msh2050/fluxget/internal/testutil"
+	"github.com/msh2050/fluxget/internal/types"
 )
 
 func TestProbeServer_UsesConfiguredProxy(t *testing.T) {

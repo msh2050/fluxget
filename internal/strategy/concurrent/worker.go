@@ -10,9 +10,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/SurgeDM/Surge/internal/transport"
-	"github.com/SurgeDM/Surge/internal/types"
-	"github.com/SurgeDM/Surge/internal/utils"
+	"github.com/msh2050/fluxget/internal/transport"
+	"github.com/msh2050/fluxget/internal/types"
+	"github.com/msh2050/fluxget/internal/utils"
 )
 
 // writeAtFn is injectable so tests can simulate ENOSPC without a full disk.

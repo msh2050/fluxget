@@ -1,8 +1,8 @@
 package tui
 
 import (
-	"github.com/SurgeDM/Surge/internal/types"
-	"github.com/SurgeDM/Surge/internal/version"
+	"github.com/msh2050/fluxget/internal/types"
+	"github.com/msh2050/fluxget/internal/version"
 )
 
 // UpdateCheckResultMsg is sent when the update check is complete

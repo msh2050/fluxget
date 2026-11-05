@@ -1,8 +1,8 @@
 package tui
 
 import (
-	engineprogress "github.com/SurgeDM/Surge/internal/progress"
-	downloadservice "github.com/SurgeDM/Surge/internal/service"
+	engineprogress "github.com/msh2050/fluxget/internal/progress"
+	downloadservice "github.com/msh2050/fluxget/internal/service"
 
 	"fmt"
 	"strings"
@@ -10,9 +10,9 @@ import (
 
 	"charm.land/bubbles/v2/spinner"
 	tea "charm.land/bubbletea/v2"
-	"github.com/SurgeDM/Surge/internal/tui/components"
-	"github.com/SurgeDM/Surge/internal/types"
-	"github.com/SurgeDM/Surge/internal/utils"
+	"github.com/msh2050/fluxget/internal/tui/components"
+	"github.com/msh2050/fluxget/internal/types"
+	"github.com/msh2050/fluxget/internal/utils"
 )
 
 func stateProgress(state interface{}) *engineprogress.DownloadProgress {

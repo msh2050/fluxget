@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/SurgeDM/Surge/internal/types"
+	"github.com/msh2050/fluxget/internal/types"
 )
 
 func TestBitmapTracker_InitAndSnapshot(t *testing.T) {

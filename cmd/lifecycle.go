@@ -7,7 +7,7 @@ import (
 	"net/url"
 	"sort"
 
-	"github.com/SurgeDM/Surge/internal/clioutput"
+	"github.com/msh2050/fluxget/internal/clioutput"
 	"github.com/spf13/cobra"
 )
 

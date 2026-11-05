@@ -7,8 +7,8 @@ import (
 	"io"
 	"strings"
 
-	"github.com/SurgeDM/Surge/internal/bugreport"
-	"github.com/SurgeDM/Surge/internal/utils"
+	"github.com/msh2050/fluxget/internal/bugreport"
+	"github.com/msh2050/fluxget/internal/utils"
 	"github.com/spf13/cobra"
 )
 

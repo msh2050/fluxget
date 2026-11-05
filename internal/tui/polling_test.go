@@ -1,16 +1,16 @@
 package tui
 
 import (
-	"github.com/SurgeDM/Surge/internal/orchestrator"
-	engineprogress "github.com/SurgeDM/Surge/internal/progress"
+	"github.com/msh2050/fluxget/internal/orchestrator"
+	engineprogress "github.com/msh2050/fluxget/internal/progress"
 
 	"testing"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
-	"github.com/SurgeDM/Surge/internal/service"
-	"github.com/SurgeDM/Surge/internal/testutil"
-	"github.com/SurgeDM/Surge/internal/types"
+	"github.com/msh2050/fluxget/internal/service"
+	"github.com/msh2050/fluxget/internal/testutil"
+	"github.com/msh2050/fluxget/internal/types"
 )
 
 // TestStateSync verifies that the TUI uses the shared state object

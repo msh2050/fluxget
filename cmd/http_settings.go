@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/SurgeDM/Surge/internal/config"
+	"github.com/msh2050/fluxget/internal/config"
 )
 
 // A patch keeps omitted settings intact. Decode it before acquiring the

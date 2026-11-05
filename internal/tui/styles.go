@@ -3,7 +3,7 @@ package tui
 import (
 	"sync"
 
-	"github.com/SurgeDM/Surge/internal/tui/colors"
+	"github.com/msh2050/fluxget/internal/tui/colors"
 
 	"charm.land/lipgloss/v2"
 )

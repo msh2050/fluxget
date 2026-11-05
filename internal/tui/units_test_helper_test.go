@@ -1,8 +1,8 @@
 package tui
 
 import (
-	"github.com/SurgeDM/Surge/internal/types"
-	"github.com/SurgeDM/Surge/internal/utils"
+	"github.com/msh2050/fluxget/internal/types"
+	"github.com/msh2050/fluxget/internal/utils"
 )
 
 // Unit constants re-exported for use in test files within this package.

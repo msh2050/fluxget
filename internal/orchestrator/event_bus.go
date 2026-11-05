@@ -4,7 +4,7 @@ import (
 	"context"
 	"sync"
 
-	"github.com/SurgeDM/Surge/internal/types"
+	"github.com/msh2050/fluxget/internal/types"
 )
 
 const eventQueueCapacity = 100

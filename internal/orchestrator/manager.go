@@ -16,14 +16,14 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/SurgeDM/Surge/internal/config"
-	probing "github.com/SurgeDM/Surge/internal/probe"
-	"github.com/SurgeDM/Surge/internal/progress"
-	"github.com/SurgeDM/Surge/internal/store"
-	"github.com/SurgeDM/Surge/internal/types"
+	"github.com/msh2050/fluxget/internal/config"
+	probing "github.com/msh2050/fluxget/internal/probe"
+	"github.com/msh2050/fluxget/internal/progress"
+	"github.com/msh2050/fluxget/internal/store"
+	"github.com/msh2050/fluxget/internal/types"
 
-	"github.com/SurgeDM/Surge/internal/scheduler"
-	"github.com/SurgeDM/Surge/internal/utils"
+	"github.com/msh2050/fluxget/internal/scheduler"
+	"github.com/msh2050/fluxget/internal/utils"
 )
 
 // IsNameActiveFunc lets routing treat in-flight downloads as filename conflicts within a directory.

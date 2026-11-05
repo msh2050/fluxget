@@ -17,7 +17,7 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/SurgeDM/Surge/internal/version"
+	"github.com/msh2050/fluxget/internal/version"
 )
 
 const checksumsAssetName = "checksums.txt"

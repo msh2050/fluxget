@@ -7,7 +7,7 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/SurgeDM/Surge/internal/clioutput"
+	"github.com/msh2050/fluxget/internal/clioutput"
 )
 
 type commandSignals struct {

@@ -3,7 +3,7 @@ package tui
 import (
 	"testing"
 
-	"github.com/SurgeDM/Surge/internal/config"
+	"github.com/msh2050/fluxget/internal/config"
 )
 
 func TestHandleClipboardPaste_StandardURL(t *testing.T) {

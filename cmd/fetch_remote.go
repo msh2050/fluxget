@@ -7,8 +7,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/SurgeDM/Surge/internal/clioutput"
-	"github.com/SurgeDM/Surge/internal/types"
+	"github.com/msh2050/fluxget/internal/clioutput"
+	"github.com/msh2050/fluxget/internal/types"
 	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 )

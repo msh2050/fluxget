@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/SurgeDM/Surge/internal/userservice"
+	"github.com/msh2050/fluxget/internal/userservice"
 )
 
 type fakeUserServiceManager struct {

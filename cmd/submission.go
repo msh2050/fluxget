@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/SurgeDM/Surge/internal/clioutput"
+	"github.com/msh2050/fluxget/internal/clioutput"
 )
 
 // submissionItem correlates a receipt with its one-based position in the input.

@@ -7,7 +7,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/SurgeDM/Surge/internal/transport"
+	"github.com/msh2050/fluxget/internal/transport"
 	"go.uber.org/goleak"
 )
 

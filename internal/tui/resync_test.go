@@ -7,8 +7,8 @@ import (
 	"testing/synctest"
 	"time"
 
-	downloadservice "github.com/SurgeDM/Surge/internal/service"
-	"github.com/SurgeDM/Surge/internal/types"
+	downloadservice "github.com/msh2050/fluxget/internal/service"
+	"github.com/msh2050/fluxget/internal/types"
 )
 
 func TestSnapshotPreservesDownloadMetadataOnStartupAndResync(t *testing.T) {

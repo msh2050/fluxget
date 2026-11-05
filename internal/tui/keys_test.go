@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"charm.land/bubbles/v2/key"
-	"github.com/SurgeDM/Surge/internal/config"
+	"github.com/msh2050/fluxget/internal/config"
 )
 
 type helperKeyMap interface {

@@ -9,10 +9,10 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/SurgeDM/Surge/internal/config"
-	probing "github.com/SurgeDM/Surge/internal/probe"
-	"github.com/SurgeDM/Surge/internal/types"
-	"github.com/SurgeDM/Surge/internal/utils"
+	"github.com/msh2050/fluxget/internal/config"
+	probing "github.com/msh2050/fluxget/internal/probe"
+	"github.com/msh2050/fluxget/internal/types"
+	"github.com/msh2050/fluxget/internal/utils"
 )
 
 // InferFilenameFromURL is the final naming fallback when neither the user nor

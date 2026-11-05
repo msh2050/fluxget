@@ -7,7 +7,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/SurgeDM/Surge/internal/transport"
+	"github.com/msh2050/fluxget/internal/transport"
 	"go.uber.org/goleak"
 )
 
@@ -18,7 +18,7 @@ func TestMain(m *testing.M) {
 	if code == 0 {
 		if err := goleak.Find(
 			goleak.IgnoreTopFunction("sync.runtime_notifyListWait"),
-			goleak.IgnoreTopFunction("github.com/SurgeDM/Surge/internal/scheduler.safeSendProgress"),
+			goleak.IgnoreTopFunction("github.com/msh2050/fluxget/internal/scheduler.safeSendProgress"),
 			goleak.IgnoreTopFunction("net/http.(*persistConn).writeLoop"),
 			goleak.IgnoreTopFunction("net/http.(*persistConn).readLoop"),
 		); err != nil {

@@ -3,9 +3,9 @@ package orchestrator
 import (
 	"strings"
 
-	"github.com/SurgeDM/Surge/internal/progress"
-	"github.com/SurgeDM/Surge/internal/store"
-	"github.com/SurgeDM/Surge/internal/types"
+	"github.com/msh2050/fluxget/internal/progress"
+	"github.com/msh2050/fluxget/internal/store"
+	"github.com/msh2050/fluxget/internal/types"
 )
 
 // DuplicateResult represents the outcome of a duplicate check

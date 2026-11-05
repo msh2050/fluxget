@@ -41,7 +41,7 @@ func releaseHandler(t *testing.T, body string, status int) http.HandlerFunc {
 
 func TestUpdaterCheckUpdateAvailable(t *testing.T) {
 	srv := httptest.NewServer(releaseHandler(t,
-		`{"tag_name":"v1.4.2","html_url":"https://github.com/SurgeDM/Surge/releases/tag/v1.4.2"}`, http.StatusOK))
+		`{"tag_name":"v1.4.2","html_url":"https://github.com/msh2050/fluxget/releases/tag/v1.4.2"}`, http.StatusOK))
 	defer srv.Close()
 
 	u := &Updater{Client: newTestClient(), APIURL: srv.URL}
@@ -61,14 +61,14 @@ func TestUpdaterCheckUpdateAvailable(t *testing.T) {
 	if info.LatestVersion != "v1.4.2" {
 		t.Errorf("LatestVersion = %q, want %q", info.LatestVersion, "v1.4.2")
 	}
-	if info.ReleaseURL != "https://github.com/SurgeDM/Surge/releases/tag/v1.4.2" {
+	if info.ReleaseURL != "https://github.com/msh2050/fluxget/releases/tag/v1.4.2" {
 		t.Errorf("ReleaseURL = %q, want release page URL", info.ReleaseURL)
 	}
 }
 
 func TestUpdaterCheckUpToDate(t *testing.T) {
 	srv := httptest.NewServer(releaseHandler(t,
-		`{"tag_name":"v1.4.2","html_url":"https://github.com/SurgeDM/Surge/releases/tag/v1.4.2"}`, http.StatusOK))
+		`{"tag_name":"v1.4.2","html_url":"https://github.com/msh2050/fluxget/releases/tag/v1.4.2"}`, http.StatusOK))
 	defer srv.Close()
 
 	u := &Updater{Client: newTestClient(), APIURL: srv.URL}
@@ -86,7 +86,7 @@ func TestUpdaterCheckUpToDate(t *testing.T) {
 
 func TestUpdaterCheckCurrentAhead(t *testing.T) {
 	srv := httptest.NewServer(releaseHandler(t,
-		`{"tag_name":"v1.4.2","html_url":"https://github.com/SurgeDM/Surge/releases/tag/v1.4.2"}`, http.StatusOK))
+		`{"tag_name":"v1.4.2","html_url":"https://github.com/msh2050/fluxget/releases/tag/v1.4.2"}`, http.StatusOK))
 	defer srv.Close()
 
 	u := &Updater{Client: newTestClient(), APIURL: srv.URL}
@@ -216,7 +216,7 @@ func TestUpdaterCheckTimeout(t *testing.T) {
 
 func TestUpdaterCheckNilClientUsesTimeout(t *testing.T) {
 	srv := httptest.NewServer(releaseHandler(t,
-		`{"tag_name":"v1.4.2","html_url":"https://github.com/SurgeDM/Surge/releases/tag/v1.4.2"}`, http.StatusOK))
+		`{"tag_name":"v1.4.2","html_url":"https://github.com/msh2050/fluxget/releases/tag/v1.4.2"}`, http.StatusOK))
 	defer srv.Close()
 
 	u := &Updater{APIURL: srv.URL, Timeout: 5 * time.Second}

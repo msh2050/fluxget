@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/SurgeDM/Surge/internal/types"
-	"github.com/SurgeDM/Surge/internal/utils"
+	"github.com/msh2050/fluxget/internal/types"
+	"github.com/msh2050/fluxget/internal/utils"
 	"github.com/stretchr/testify/assert"
 )
 

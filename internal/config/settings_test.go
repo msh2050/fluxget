@@ -12,7 +12,7 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/SurgeDM/Surge/internal/utils"
+	"github.com/msh2050/fluxget/internal/utils"
 )
 
 func TestSettingsLabelsUseSentenceCase(t *testing.T) {

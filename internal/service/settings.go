@@ -2,7 +2,7 @@ package service
 
 import (
 	"errors"
-	"github.com/SurgeDM/Surge/internal/config"
+	"github.com/msh2050/fluxget/internal/config"
 )
 
 var ErrInvalidSettings = errors.New("invalid settings")

@@ -7,7 +7,7 @@ import (
 	"net/http/httptrace"
 	"testing"
 
-	"github.com/SurgeDM/Surge/internal/types"
+	"github.com/msh2050/fluxget/internal/types"
 )
 
 func TestNetworkPool_ClientSessionCache_SharedAcrossPoolKeys(t *testing.T) {

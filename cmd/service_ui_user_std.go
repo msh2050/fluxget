@@ -3,8 +3,8 @@ package cmd
 import (
 	"context"
 
-	"github.com/SurgeDM/Surge/internal/tui"
-	"github.com/SurgeDM/Surge/internal/userservice"
+	"github.com/msh2050/fluxget/internal/tui"
+	"github.com/msh2050/fluxget/internal/userservice"
 )
 
 func configureServiceUI(m *tui.RootModel) {

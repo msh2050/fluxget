@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/SurgeDM/Surge/internal/utils"
+	"github.com/msh2050/fluxget/internal/utils"
 )
 
 func TestRuntimeConfig_Getters(t *testing.T) {

@@ -8,7 +8,7 @@ import (
 
 	"charm.land/bubbles/v2/progress"
 	"charm.land/lipgloss/v2"
-	"github.com/SurgeDM/Surge/internal/tui/colors"
+	"github.com/msh2050/fluxget/internal/tui/colors"
 )
 
 func TestStatusLabelKeepsItsColorAfterStyledSpinner(t *testing.T) {

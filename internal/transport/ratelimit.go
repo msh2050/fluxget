@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/SurgeDM/Surge/internal/types"
+	"github.com/msh2050/fluxget/internal/types"
 )
 
 var DefaultHostRateLimiter = NewHostRateLimiter()

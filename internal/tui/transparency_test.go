@@ -3,8 +3,8 @@ package tui
 import (
 	"fmt"
 
-	"github.com/SurgeDM/Surge/internal/config"
-	"github.com/SurgeDM/Surge/internal/tui/colors"
+	"github.com/msh2050/fluxget/internal/config"
+	"github.com/msh2050/fluxget/internal/tui/colors"
 	"strings"
 	"testing"
 )
