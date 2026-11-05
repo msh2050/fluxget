@@ -17,8 +17,8 @@ import (
 
 	"github.com/msh2050/fluxget/internal/config"
 	downloadservice "github.com/msh2050/fluxget/internal/service"
-	"github.com/msh2050/fluxget/internal/types"
 	"github.com/msh2050/fluxget/internal/stream"
+	"github.com/msh2050/fluxget/internal/types"
 	"github.com/msh2050/fluxget/internal/utils"
 	"github.com/msh2050/fluxget/internal/webui"
 	"github.com/msh2050/fluxget/internal/ytdlp"
@@ -234,6 +234,10 @@ func registerHTTPRoutes(mux *http.ServeMux, port int, defaultOutputDir string, s
 	})
 
 	mux.HandleFunc("/pause", requireMethod(http.MethodPost, withRequiredID(func(w http.ResponseWriter, _ *http.Request, id string) {
+		if stream.IsActive(id) {
+			http.Error(w, "stream (HLS/DASH/yt-dlp) downloads cannot be paused \u2014 delete to stop it", http.StatusConflict)
+			return
+		}
 		if err := service.Pause(id); err != nil {
 			http.Error(w, err.Error(), lifecycleErrorStatus(err))
 			return
@@ -244,6 +248,10 @@ func registerHTTPRoutes(mux *http.ServeMux, port int, defaultOutputDir string, s
 	// Cancellation retains the same resumable checkpoint and record as pause.
 	// Keep the destructive Delete operation separate for existing API clients.
 	mux.HandleFunc("/cancel", requireMethod(http.MethodPost, withRequiredID(func(w http.ResponseWriter, _ *http.Request, id string) {
+		if cancelStreamDownload(service, id) {
+			writeJSONResponse(w, http.StatusOK, map[string]string{"status": "cancel_requested", "id": id})
+			return
+		}
 		if err := service.Pause(id); err != nil {
 			http.Error(w, err.Error(), lifecycleErrorStatus(err))
 			return
@@ -266,6 +274,10 @@ func registerHTTPRoutes(mux *http.ServeMux, port int, defaultOutputDir string, s
 	mux.HandleFunc("/resume-all", requireMethod(http.MethodPost, handleResumeAll(service)))
 
 	mux.HandleFunc("/delete", requireMethods(withRequiredID(func(w http.ResponseWriter, _ *http.Request, id string) {
+		if cancelStreamDownload(service, id) {
+			writeJSONResponse(w, http.StatusOK, map[string]string{"status": "deleted", "id": id})
+			return
+		}
 		if err := service.Delete(id); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -727,26 +739,31 @@ func eventsHandler(service downloadservice.DownloadService) http.HandlerFunc {
 			return
 		}
 
-		// Send an initial comment immediately so clients fire their `open` event
-		// even when there are no download events yet. WebKitGTK's EventSource (the
-		// Wails GUI webview) only considers the stream open once it receives body
-		// bytes — without this the GUI shows "offline" until the first download.
-		_, _ = fmt.Fprint(w, ": connected\n\n")
+		// Send an initial comment right away so clients fire their `open` event
+		// even with no downloads yet: WebKitGTK's EventSource (the desktop GUI
+		// webview) only considers the stream open once body bytes arrive.
+		if err := prepareSSEWrite(controller); err != nil {
+			return
+		}
+		if _, err := fmt.Fprint(w, ": connected\n\n"); err != nil {
+			return
+		}
 		if err := flushSSEWrite(controller); err != nil {
 			return
 		}
 
-		// Heartbeat keeps idle connections open through proxies and lets the
-		// client tell "connected but idle" apart from "disconnected".
-		ticker := time.NewTicker(15 * time.Second)
-		defer ticker.Stop()
+		// Idle heartbeat: only sent after sseHeartbeat without any event, so
+		// busy streams carry no extra traffic, idle ones survive proxies and the
+		// client can tell "connected but idle" from "disconnected".
+		heartbeat := time.NewTimer(sseHeartbeat)
+		defer heartbeat.Stop()
 
 		done := r.Context().Done()
 		for {
 			select {
 			case <-done:
 				return
-			case <-ticker.C:
+			case <-heartbeat.C:
 				if err := prepareSSEWrite(controller); err != nil {
 					return
 				}
@@ -756,6 +773,7 @@ func eventsHandler(service downloadservice.DownloadService) http.HandlerFunc {
 				if err := flushSSEWrite(controller); err != nil {
 					return
 				}
+				heartbeat.Reset(sseHeartbeat)
 			case msg, ok := <-stream:
 				if !ok {
 					return
@@ -781,10 +799,20 @@ func eventsHandler(service downloadservice.DownloadService) http.HandlerFunc {
 				if err := flushSSEWrite(controller); err != nil {
 					return
 				}
+				if !heartbeat.Stop() {
+					select {
+					case <-heartbeat.C:
+					default:
+					}
+				}
+				heartbeat.Reset(sseHeartbeat)
 			}
 		}
 	}
 }
+
+// sseHeartbeat is the idle interval after which /events sends a comment ping.
+const sseHeartbeat = 15 * time.Second
 
 // Bound writes per SSE batch so a stalled socket cannot retain a subscriber
 // indefinitely. Test/middleware writers may not expose deadline support.
@@ -984,6 +1012,9 @@ func handleStream(w http.ResponseWriter, r *http.Request, defaultOutputDir strin
 		Formats   []stream.Format   `json:"formats"`
 		YtFormat  string            `json:"ytFormat"`  // yt-dlp format selector, e.g. "bestvideo[height<=1080]+bestaudio/best"
 		Subtitles bool              `json:"subtitles"` // download only subtitle tracks (as .srt), skip the video
+		MaxHeight int               `json:"maxHeight"` // cap video quality (0 = best)
+		AudioOnly bool              `json:"audioOnly"` // only the audio track
+		PageURL   string            `json:"pageUrl"`   // page the media came from (yt-dlp fallback)
 	}
 	if err := decodeJSONBody(r, &req); err != nil {
 		http.Error(w, "Invalid JSON: "+err.Error(), http.StatusBadRequest)
@@ -998,9 +1029,17 @@ func handleStream(w http.ResponseWriter, r *http.Request, defaultOutputDir strin
 		return
 	}
 
-	destDir := req.Path
-	if destDir == "" {
-		destDir = defaultOutputDir
+	destDir, err := resolveStreamDestDir(req.Path, defaultOutputDir)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	pageURL := ""
+	if strings.HasPrefix(req.PageURL, "http://") || strings.HasPrefix(req.PageURL, "https://") {
+		pageURL = req.PageURL
+	}
+	if req.YtFormat == "" && (req.MaxHeight > 0 || req.AudioOnly) {
+		req.YtFormat = ytdlpSelector(req.MaxHeight, req.AudioOnly)
 	}
 
 	// Subtitles-only: download just the subtitle tracks (.srt) via the native
@@ -1031,11 +1070,14 @@ func handleStream(w http.ResponseWriter, r *http.Request, defaultOutputDir strin
 	// Use native stream engine for: manifest URLs, or when extension provided direct YouTube format URLs
 	if isManifest || hasFormats {
 		id, err := stream.Start(context.Background(), service, stream.Request{
-			URL:     req.URL,
-			Title:   req.Title,
-			DestDir: destDir,
-			Headers: req.Headers,
-			Formats: req.Formats,
+			URL:       req.URL,
+			Title:     req.Title,
+			DestDir:   destDir,
+			Headers:   req.Headers,
+			Formats:   req.Formats,
+			MaxHeight: req.MaxHeight,
+			AudioOnly: req.AudioOnly,
+			PageURL:   pageURL,
 		})
 		if err != nil {
 			publishSystemLog("stream error: " + err.Error())
@@ -1079,10 +1121,12 @@ func handleStream(w http.ResponseWriter, r *http.Request, defaultOutputDir strin
 
 	// Direct video URL — use native stream engine (single-connection download)
 	id, err := stream.Start(context.Background(), service, stream.Request{
-		URL:     req.URL,
-		Title:   req.Title,
-		DestDir: destDir,
-		Headers: req.Headers,
+		URL:       req.URL,
+		Title:     req.Title,
+		DestDir:   destDir,
+		Headers:   req.Headers,
+		AudioOnly: req.AudioOnly,
+		PageURL:   pageURL,
 	})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -1127,9 +1171,10 @@ func handleYtDlp(w http.ResponseWriter, r *http.Request, defaultOutputDir string
 		return
 	}
 
-	destDir := req.Path
-	if destDir == "" {
-		destDir = defaultOutputDir
+	destDir, err := resolveStreamDestDir(req.Path, defaultOutputDir)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 
 	id, err := ytdlp.Start(context.Background(), service, ytdlp.Request{
@@ -1150,4 +1195,39 @@ func handleYtDlp(w http.ResponseWriter, r *http.Request, defaultOutputDir string
 		"status": "queued",
 		"id":     id,
 	})
+}
+
+// cancelStreamDownload stops a native stream / yt-dlp download (they are not
+// owned by the scheduler pool, so service.Delete/Pause cannot reach them).
+func cancelStreamDownload(service downloadservice.DownloadService, id string) bool {
+	if !stream.Cancel(id) && !ytdlp.Cancel(id) {
+		return false
+	}
+	if service != nil {
+		_ = service.Publish(types.DownloadEvent{Type: types.EventRemoved, DownloadID: id})
+	}
+	return true
+}
+
+// resolveStreamDestDir validates a client-supplied destination directory.
+// Relative paths and ".." traversal are rejected; empty means the default.
+func resolveStreamDestDir(requested, defaultDir string) (string, error) {
+	if strings.TrimSpace(requested) == "" {
+		return defaultDir, nil
+	}
+	if strings.ContainsRune(requested, 0) || strings.Contains(requested, "..") {
+		return "", fmt.Errorf("invalid path")
+	}
+	p := utils.EnsureAbsPath(requested)
+	if !filepath.IsAbs(p) {
+		return "", fmt.Errorf("invalid path")
+	}
+	return filepath.Clean(p), nil
+}
+
+func ytdlpSelector(maxHeight int, audioOnly bool) string {
+	if audioOnly {
+		return "bestaudio/best"
+	}
+	return fmt.Sprintf("bestvideo*[height<=%d]+bestaudio/best[height<=%d]/best", maxHeight, maxHeight)
 }

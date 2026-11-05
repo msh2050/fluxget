@@ -12,12 +12,12 @@ import (
 	"strings"
 	"sync/atomic"
 
+	"github.com/google/uuid"
 	"github.com/msh2050/fluxget/internal/config"
 	"github.com/msh2050/fluxget/internal/orchestrator"
 	"github.com/msh2050/fluxget/internal/service"
 	"github.com/msh2050/fluxget/internal/types"
 	"github.com/msh2050/fluxget/internal/utils"
-	"github.com/google/uuid"
 )
 
 // DownloadRequest represents a download request from the browser extension

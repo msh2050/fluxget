@@ -14,7 +14,9 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/msh2050/fluxget/internal/types"
@@ -189,59 +191,37 @@ func findBin() string {
 	return "yt-dlp"
 }
 
+// ── Cancellation registry ─────────────────────────────────────────────────────
+
+var active sync.Map // download ID → context.CancelFunc
+
+// Cancel stops a running yt-dlp download. Returns false when id is unknown.
+func Cancel(id string) bool {
+	if v, ok := active.LoadAndDelete(id); ok {
+		v.(context.CancelFunc)()
+		return true
+	}
+	return false
+}
+
+// Available reports whether a yt-dlp binary can be found.
+func Available() bool {
+	bin := findBin()
+	if filepath.IsAbs(bin) {
+		return true
+	}
+	_, err := exec.LookPath(bin)
+	return err == nil
+}
+
 // Start runs yt-dlp for req, publishing progress events to pub.
 // It returns the download ID immediately; the download runs in the background.
 func Start(ctx context.Context, pub Publisher, req Request) (string, error) {
-	bin := findBin()
-	if _, err := exec.LookPath(bin); err != nil {
-		if bin == "yt-dlp" {
-			return "", fmt.Errorf("yt-dlp not found in PATH \u2014 install it with: pip install yt-dlp")
-		}
+	if !Available() {
+		return "", fmt.Errorf("yt-dlp not found in PATH \u2014 install it with: pip install -U yt-dlp")
 	}
-
 	id := uuid.New().String()
-	format := req.Format
-	if format == "" {
-		format = "bestvideo+bestaudio/best"
-	}
-
-	destDir := req.DestDir
-	if destDir == "" {
-		home, _ := os.UserHomeDir()
-		destDir = filepath.Join(home, "Downloads")
-	}
-	_ = os.MkdirAll(destDir, 0o755)
-
-	outTmpl := filepath.Join(destDir, "%(title)s.%(ext)s")
-
-	args := []string{
-		"-f", format,
-		"-o", outTmpl,
-		"--newline",
-		"--progress-template",
-		"%(progress.status)s\t%(progress.downloaded_bytes)s\t%(progress.total_bytes)s\t%(progress.speed)s\t%(progress.eta)s",
-		"--no-playlist",
-		"--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-		"--js-runtimes", "node",
-		"--extractor-retries", "3",
-		"--fragment-retries", "10",
-		"--trim-filenames", "180",
-	}
-	// Pass browser cookies for platforms that require login state
-	u := strings.ToLower(req.URL)
-	for _, h := range cookiePlatforms {
-		if strings.Contains(u, h) {
-			args = append(args, "--cookies-from-browser", "edge")
-			break
-		}
-	}
-	for k, v := range req.Headers {
-		args = append(args, "--add-header", fmt.Sprintf("%s:%s", k, v))
-	}
-	args = append(args, req.URL)
-	debugLog.Printf("start url=%s args=%v", req.URL, args)
-
-	// Announce queued
+	destDir := resolveDestDir(req.DestDir)
 	filename := req.Title
 	if filename == "" {
 		filename = filenameFromURL(req.URL)
@@ -252,178 +232,340 @@ func Start(ctx context.Context, pub Publisher, req Request) (string, error) {
 		URL:        req.URL,
 		DestPath:   destDir,
 	})
-
 	go func() {
-		cmd := exec.CommandContext(ctx, bin, args...)
-		stdout, err := cmd.StdoutPipe()
-		if err != nil {
-			_ = pub.Publish(types.DownloadEvent{Type: types.EventError, DownloadID: id, Filename: filename, Err: err})
-			return
-		}
-		var stderrBuf strings.Builder
-		cmd.Stderr = &stderrBuf
-		if err := cmd.Start(); err != nil {
-			_ = pub.Publish(types.DownloadEvent{Type: types.EventError, DownloadID: id, Filename: filename, Err: err})
-			return
-		}
-
 		_ = pub.Publish(types.DownloadEvent{Type: types.EventStarted,
 			DownloadID: id,
 			URL:        req.URL,
 			Filename:   filename,
 			DestPath:   destDir,
 		})
-
-		start := time.Now()
-		var lastDownloaded int64
-		var lastTotal int64
-
-		scanner := bufio.NewScanner(stdout)
-		for scanner.Scan() {
-			line := scanner.Text()
-			parts := strings.Split(line, "\t")
-			if len(parts) < 5 {
-				continue
-			}
-			status := strings.TrimSpace(parts[0])
-			downloaded := parseInt64(parts[1])
-			total := parseInt64(parts[2])
-			speed := parseFloat64(parts[3])
-
-			if downloaded > 0 {
-				lastDownloaded = downloaded
-			}
-			if total > 0 {
-				lastTotal = total
-			}
-
-			if status == "downloading" || status == "finished" {
-				_ = pub.Publish(types.DownloadEvent{Type: types.EventProgress,
-					DownloadID:  id,
-					Downloaded:  lastDownloaded,
-					Total:       lastTotal,
-					Speed:       speed,
-					Elapsed:     time.Since(start),
-					Connections: 1,
-				})
-			}
-		}
-
-		if err := cmd.Wait(); err != nil {
-			stderr := strings.TrimSpace(stderrBuf.String())
-			debugLog.Printf("error url=%s\nstderr:\n%s", req.URL, stderr)
-
-			// If the chosen format selector is too specific for this site's
-			// available formats, retry once with the simplest possible selector.
-			if strings.Contains(stderr, "Requested format is not available") && format != "best" {
-				debugLog.Printf("format not available, retrying with --format best url=%s", req.URL)
-				retryArgs := make([]string, 0, len(args))
-				skipNext := false
-				for i, a := range args {
-					if skipNext {
-						skipNext = false
-						continue
-					}
-					if a == "-f" && i+1 < len(args) {
-						retryArgs = append(retryArgs, "-f", "best")
-						skipNext = true
-						continue
-					}
-					retryArgs = append(retryArgs, a)
-				}
-				retryCmd := exec.CommandContext(ctx, bin, retryArgs...)
-				var retryStderr strings.Builder
-				retryCmd.Stderr = &retryStderr
-				retryOut, _ := retryCmd.StdoutPipe()
-				if retryCmd.Start() == nil {
-					scanner2 := bufio.NewScanner(retryOut)
-					for scanner2.Scan() {
-						line := scanner2.Text()
-						parts := strings.Split(line, "\t")
-						if len(parts) < 5 {
-							continue
-						}
-						status := strings.TrimSpace(parts[0])
-						downloaded := parseInt64(parts[1])
-						total := parseInt64(parts[2])
-						speed := parseFloat64(parts[3])
-						if downloaded > 0 {
-							lastDownloaded = downloaded
-						}
-						if total > 0 {
-							lastTotal = total
-						}
-						if status == "downloading" || status == "finished" {
-							_ = pub.Publish(types.DownloadEvent{Type: types.EventProgress,
-								DownloadID:  id,
-								Downloaded:  lastDownloaded,
-								Total:       lastTotal,
-								Speed:       speed,
-								Elapsed:     time.Since(start),
-								Connections: 1,
-							})
-						}
-					}
-					if retryCmd.Wait() == nil {
-						elapsed := time.Since(start)
-						avgSpeed := 0.0
-						if elapsed.Seconds() > 0 && lastTotal > 0 {
-							avgSpeed = float64(lastTotal) / elapsed.Seconds()
-						}
-						_ = pub.Publish(types.DownloadEvent{Type: types.EventComplete,
-							DownloadID: id,
-							Filename:   filename,
-							Elapsed:    elapsed,
-							Total:      lastTotal,
-							AvgSpeed:   avgSpeed,
-						})
-						return
-					}
-					// retry also failed — fall through and report the original error
-					if s := strings.TrimSpace(retryStderr.String()); s != "" {
-						stderr = s
-					}
-				}
-			}
-
-			errMsg := fmt.Errorf("yt-dlp: %w", err)
-			if stderr != "" {
-				// Surface the last meaningful line of stderr to the UI
-				lines := strings.Split(stderr, "\n")
-				for i := len(lines) - 1; i >= 0; i-- {
-					if l := strings.TrimSpace(lines[i]); l != "" {
-						errMsg = fmt.Errorf("yt-dlp: %s", l)
-						break
-					}
-				}
-			}
+		if err := Run(ctx, pub, id, req); err != nil {
 			_ = pub.Publish(types.DownloadEvent{Type: types.EventError,
 				DownloadID: id,
 				Filename:   filename,
 				DestPath:   destDir,
-				Err:        errMsg,
+				Err:        err,
 			})
-			return
 		}
-		if s := strings.TrimSpace(stderrBuf.String()); s != "" {
-			debugLog.Printf("stderr (non-fatal) url=%s\n%s", req.URL, s)
-		}
+	}()
+	return id, nil
+}
 
-		elapsed := time.Since(start)
-		avgSpeed := 0.0
-		if elapsed.Seconds() > 0 && lastTotal > 0 {
-			avgSpeed = float64(lastTotal) / elapsed.Seconds()
-		}
-		_ = pub.Publish(types.DownloadEvent{Type: types.EventComplete,
-			DownloadID: id,
-			Filename:   filename,
-			Elapsed:    elapsed,
-			Total:      lastTotal,
-			AvgSpeed:   avgSpeed,
-		})
+func resolveDestDir(dir string) string {
+	if dir == "" {
+		home, _ := os.UserHomeDir()
+		dir = filepath.Join(home, "Downloads")
+	}
+	_ = os.MkdirAll(dir, 0o755)
+	return dir
+}
+
+// Run executes yt-dlp synchronously under an existing download ID (the
+// caller has already published Queued/Started). It publishes progress and,
+// on success, the final Started(dest)+Complete pair. The returned error is
+// for the caller to publish — Run never publishes EventError itself.
+func Run(parent context.Context, pub Publisher, id string, req Request) error {
+	bin := findBin()
+	ctx, cancel := context.WithCancel(parent)
+	active.Store(id, cancel)
+	defer func() {
+		active.Delete(id)
+		cancel()
 	}()
 
-	return id, nil
+	destDir := resolveDestDir(req.DestDir)
+	format := req.Format
+	if format == "" {
+		format = "bestvideo*+bestaudio/best"
+	}
+
+	start := time.Now()
+	attempt := func(format string, withCookies bool) (string, int64, string, error) {
+		args := buildArgs(req, destDir, format, withCookies)
+		debugLog.Printf("start url=%s args=%v", req.URL, args)
+		return runOnce(ctx, pub, id, bin, args, start)
+	}
+
+	browser := cookieBrowser(req.URL)
+	finalPath, total, stderr, err := attempt(format, browser != "")
+	if err != nil && ctx.Err() == nil {
+		switch {
+		case browser != "" && looksLikeCookieError(stderr):
+			// Browser cookie DB unreadable (browser not installed, keyring
+			// locked, profile in use…) — retry anonymously.
+			debugLog.Printf("cookie extraction failed (%s), retrying without cookies", browser)
+			finalPath, total, stderr, err = attempt(format, false)
+		case strings.Contains(stderr, "Requested format is not available") && format != "best":
+			debugLog.Printf("format not available, retrying with -f best url=%s", req.URL)
+			finalPath, total, stderr, err = attempt("bv*+ba/b", browser != "")
+		}
+	}
+	if err != nil {
+		if ctx.Err() != nil {
+			return context.Canceled
+		}
+		debugLog.Printf("error url=%s\nstderr:\n%s", req.URL, stderr)
+		return fmt.Errorf("yt-dlp: %s", lastMeaningfulLine(stderr, err))
+	}
+
+	filename := req.Title
+	dest := destDir
+	if finalPath != "" {
+		filename = filepath.Base(finalPath)
+		dest = finalPath
+		if fi, statErr := os.Stat(finalPath); statErr == nil && fi.Size() > 0 {
+			total = fi.Size()
+		}
+	}
+	elapsed := time.Since(start)
+	avgSpeed := 0.0
+	if elapsed.Seconds() > 0 && total > 0 {
+		avgSpeed = float64(total) / elapsed.Seconds()
+	}
+	// Re-announce with the real output path so the history entry (and
+	// open-file / open-folder) point at the produced file, not the folder.
+	_ = pub.Publish(types.DownloadEvent{Type: types.EventStarted,
+		DownloadID: id, URL: req.URL, Filename: filename, DestPath: dest, Total: total})
+	_ = pub.Publish(types.DownloadEvent{Type: types.EventComplete,
+		DownloadID: id,
+		Filename:   filename,
+		Elapsed:    elapsed,
+		Total:      total,
+		AvgSpeed:   avgSpeed,
+	})
+	return nil
+}
+
+const finalPathMarker = "FLUXGET_FILE\t"
+
+func buildArgs(req Request, destDir, format string, withCookies bool) []string {
+	outTmpl := filepath.Join(destDir, "%(title).180B [%(id)s].%(ext)s")
+	if t := strings.TrimSpace(req.Title); t != "" {
+		outTmpl = filepath.Join(destDir, sanitizeTitle(t)+".%(ext)s")
+	}
+	args := []string{
+		"-f", format,
+		"-o", outTmpl,
+		"--newline",
+		"--progress",
+		"--progress-template",
+		"download:%(progress.status)s\t%(progress.downloaded_bytes)s\t%(progress.total_bytes)s\t%(progress.speed)s\t%(progress.eta)s\t%(progress.total_bytes_estimate)s",
+		"--print", "after_move:" + finalPathMarker + "%(filepath)s",
+		"--no-simulate",
+		"--no-playlist",
+		"--concurrent-fragments", "8",
+		"--merge-output-format", "mp4/mkv",
+		"--extractor-retries", "3",
+		"--fragment-retries", "10",
+		"--retries", "10",
+		"--trim-filenames", "180",
+	}
+	if rt := jsRuntime(); rt != "" {
+		args = append(args, "--js-runtimes", rt)
+	}
+	if withCookies {
+		if b := cookieBrowser(req.URL); b != "" {
+			args = append(args, "--cookies-from-browser", b)
+		}
+	}
+	hasUA := false
+	for k := range req.Headers {
+		if strings.EqualFold(k, "User-Agent") {
+			hasUA = true
+		}
+	}
+	if !hasUA {
+		args = append(args, "--user-agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36")
+	}
+	for k, v := range req.Headers {
+		// Cookies are better sourced from the browser profile; a raw Cookie
+		// header is scoped to one host and breaks on cross-domain redirects.
+		if strings.EqualFold(k, "Cookie") && withCookies {
+			continue
+		}
+		args = append(args, "--add-header", fmt.Sprintf("%s:%s", k, v))
+	}
+	return append(args, "--", req.URL)
+}
+
+// runOnce runs a single yt-dlp invocation, streaming progress. It returns the
+// final file path (from --print after_move), the last known total size, the
+// captured stderr and the process error.
+func runOnce(ctx context.Context, pub Publisher, id, bin string, args []string, start time.Time) (string, int64, string, error) {
+	cmd := exec.CommandContext(ctx, bin, args...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return "", 0, "", err
+	}
+	var stderrBuf strings.Builder
+	cmd.Stderr = &stderrBuf
+	if err := cmd.Start(); err != nil {
+		return "", 0, "", err
+	}
+
+	var (
+		finalPath                 string
+		lastDownloaded, lastTotal int64
+		// yt-dlp downloads video and audio as separate files; keep a running
+		// offset so the progress bar doesn't jump back to 0 for the audio.
+		doneBytes, curTotal int64
+		lastPublish         time.Time
+	)
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if p, ok := strings.CutPrefix(line, finalPathMarker); ok {
+			finalPath = strings.TrimSpace(p)
+			continue
+		}
+		parts := strings.Split(line, "\t")
+		if len(parts) < 5 {
+			continue
+		}
+		status := strings.TrimSpace(parts[0])
+		downloaded := parseInt64(parts[1])
+		total := parseInt64(parts[2])
+		if total <= 0 && len(parts) >= 6 {
+			total = int64(parseFloat64(parts[5]))
+		}
+		speed := parseFloat64(parts[3])
+
+		if total > 0 && total != curTotal && downloaded < lastDownloaded-doneBytes {
+			// A new file started (e.g. the audio stream after the video).
+			doneBytes += curTotal
+		}
+		if total > 0 {
+			curTotal = total
+		}
+		lastDownloaded = doneBytes + downloaded
+		if total > 0 {
+			lastTotal = doneBytes + total
+		}
+		if status == "finished" || time.Since(lastPublish) > 250*time.Millisecond {
+			lastPublish = time.Now()
+			_ = pub.Publish(types.DownloadEvent{Type: types.EventProgress,
+				DownloadID:  id,
+				Downloaded:  lastDownloaded,
+				Total:       lastTotal,
+				Speed:       speed,
+				Elapsed:     time.Since(start),
+				Connections: 1,
+			})
+		}
+	}
+	err = cmd.Wait()
+	return finalPath, lastTotal, strings.TrimSpace(stderrBuf.String()), err
+}
+
+func lastMeaningfulLine(stderr string, fallback error) string {
+	lines := strings.Split(stderr, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		l := strings.TrimSpace(lines[i])
+		if l != "" && !strings.HasPrefix(l, "WARNING:") {
+			return l
+		}
+	}
+	return fallback.Error()
+}
+
+func looksLikeCookieError(stderr string) bool {
+	s := strings.ToLower(stderr)
+	return strings.Contains(s, "cookie") && (strings.Contains(s, "could not") ||
+		strings.Contains(s, "failed") || strings.Contains(s, "unable") ||
+		strings.Contains(s, "not find") || strings.Contains(s, "keyring") || strings.Contains(s, "decrypt"))
+}
+
+// cookieBrowser returns the yt-dlp --cookies-from-browser name to use for a
+// login-gated platform URL, or "" when none applies or no browser profile is
+// installed. FLUXGET_COOKIES_BROWSER overrides detection ("none" disables).
+func cookieBrowser(rawURL string) string {
+	u := strings.ToLower(rawURL)
+	needs := false
+	for _, h := range cookiePlatforms {
+		if strings.Contains(u, h) {
+			needs = true
+			break
+		}
+	}
+	if !needs {
+		return ""
+	}
+	if env := strings.TrimSpace(os.Getenv("FLUXGET_COOKIES_BROWSER")); env != "" {
+		if strings.EqualFold(env, "none") {
+			return ""
+		}
+		return env
+	}
+	return detectBrowser()
+}
+
+var (
+	browserOnce     sync.Once
+	detectedBrowser string
+)
+
+// detectBrowser finds the first browser with a profile on disk, in the order
+// users most commonly run the FluxGet extension in.
+func detectBrowser() string {
+	browserOnce.Do(func() {
+		home, _ := os.UserHomeDir()
+		cfg := os.Getenv("XDG_CONFIG_HOME")
+		if cfg == "" {
+			cfg = filepath.Join(home, ".config")
+		}
+		candidates := []struct{ name, path string }{
+			{"chrome", filepath.Join(cfg, "google-chrome")},
+			{"edge", filepath.Join(cfg, "microsoft-edge")},
+			{"brave", filepath.Join(cfg, "BraveSoftware", "Brave-Browser")},
+			{"chromium", filepath.Join(cfg, "chromium")},
+			{"vivaldi", filepath.Join(cfg, "vivaldi")},
+			{"opera", filepath.Join(cfg, "opera")},
+			{"firefox", filepath.Join(home, ".mozilla", "firefox")},
+			{"firefox", filepath.Join(home, "snap", "firefox", "common", ".mozilla", "firefox")},
+			// macOS / Windows profile roots
+			{"chrome", filepath.Join(home, "Library", "Application Support", "Google", "Chrome")},
+			{"edge", filepath.Join(home, "Library", "Application Support", "Microsoft Edge")},
+			{"firefox", filepath.Join(home, "Library", "Application Support", "Firefox")},
+			{"chrome", filepath.Join(os.Getenv("LOCALAPPDATA"), "Google", "Chrome", "User Data")},
+			{"edge", filepath.Join(os.Getenv("LOCALAPPDATA"), "Microsoft", "Edge", "User Data")},
+		}
+		for _, c := range candidates {
+			if fi, err := os.Stat(c.path); err == nil && fi.IsDir() {
+				detectedBrowser = c.name
+				return
+			}
+		}
+	})
+	return detectedBrowser
+}
+
+// jsRuntime returns the --js-runtimes value yt-dlp needs to solve YouTube's
+// signature/n challenges. Deno is yt-dlp's default, so it needs no flag.
+func jsRuntime() string {
+	if _, err := exec.LookPath("deno"); err == nil {
+		return ""
+	}
+	for _, rt := range []string{"node", "bun", "quickjs"} {
+		if _, err := exec.LookPath(rt); err == nil {
+			return rt
+		}
+	}
+	return ""
+}
+
+func sanitizeTitle(s string) string {
+	r := strings.NewReplacer("/", "-", "\\", "-", ":", "-", "*", "-", "?", "", "\"", "'", "<", "", ">", "", "|", "-", "%", "%%")
+	s = strings.TrimSpace(r.Replace(s))
+	// Leave room for " [id].ext"; truncate on a rune boundary by bytes.
+	for len(s) > 180 {
+		_, size := utf8.DecodeLastRuneInString(s)
+		s = s[:len(s)-size]
+	}
+	if s == "" {
+		return "video"
+	}
+	return s
 }
 
 func parseInt64(s string) int64 {

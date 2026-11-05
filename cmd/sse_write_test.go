@@ -111,7 +111,8 @@ func TestSSEIdleIntervalsDoNotExpireWriteDeadline(t *testing.T) {
 		writer := &idleSSEWriter{ResponseRecorder: httptest.NewRecorder()}
 		service := &idleSSEService{stream: stream}
 		eventsHandler(service)(writer, httptest.NewRequest(http.MethodGet, "/events", nil))
-		if writer.flushes != 3 || !writer.deadline.IsZero() {
+		// initial header flush + FluxGet ": connected" comment + 2 events
+		if writer.flushes != 4 || !writer.deadline.IsZero() {
 			t.Fatalf("flushes=%d deadline=%s", writer.flushes, writer.deadline)
 		}
 		for _, id := range []string{"first", "second"} {

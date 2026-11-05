@@ -75,7 +75,9 @@ func newChromeClient(timeout time.Duration) *http.Client {
 			}
 			return conn, nil
 		},
-		MaxIdleConns:          100,
+		MaxIdleConns:          256,
+		MaxIdleConnsPerHost:   64, // one warm socket per parallel segment worker
+		ResponseHeaderTimeout: 30 * time.Second,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   20 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,

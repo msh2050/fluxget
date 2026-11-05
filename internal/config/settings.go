@@ -310,6 +310,7 @@ func (s *Settings) initializeCategoriesList() {
 			s.Extension.FirefoxExtensionURL,
 			s.Extension.AuthToken,
 			s.Extension.InstructionsURL,
+			s.Extension.HFToken,
 		}},
 	}
 }
@@ -321,7 +322,7 @@ var settingsDisplayGroups = map[string][]string{
 	"Appearance": {"theme", "theme_path", "transparent_background", "show_speed_graph", "live_speed_graph"},
 	"Network":    {"proxy_url", "custom_dns", "user_agent", "allow_remote_open_actions"},
 	"Categories": {"category_enabled"},
-	"Extension":  {"extension_prompt", "auth_token", "chrome_extension_url", "firefox_extension_url", "instructions_url"},
+	"Extension":  {"extension_prompt", "auth_token", "chrome_extension_url", "firefox_extension_url", "instructions_url", "hf_token"},
 	"Advanced":   {"max_concurrent_probes", "min_chunk_size", "worker_buffer_size", "max_task_retries", "slow_worker_threshold", "slow_worker_grace_period", "stall_timeout", "speed_ema_alpha", "adaptive_concurrency_interval", "log_retention_count"},
 }
 
