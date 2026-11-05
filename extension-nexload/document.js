@@ -8,81 +8,111 @@
   window.__fluxget_doc__ = true;
 
   const TAG = "__fluxget";
+  const IS_YOUTUBE = /(^|\.)youtube(-nocookie)?\.com$/i.test(location.hostname);
 
   function post(obj) {
-    window.postMessage(Object.assign({ [TAG]: true }, obj), "*");
+    // Same-window only: content.js accepts messages whose source is this window.
+    window.postMessage(Object.assign({ [TAG]: true }, obj), location.origin === "null" ? "*" : location.origin);
   }
 
-  // ── YouTube: ytInitialPlayerResponse ─────────────────────────
-  // YouTube injects this global before DOMContentLoaded.
-  // It contains dashManifestUrl, hlsManifestUrl, and all adaptiveFormats
-  // with direct signed URLs — no API key needed.
-  function probeYouTube() {
-    const ipr = window.ytInitialPlayerResponse;
+  // ── YouTube: player response ─────────────────────────────────
+  // ytInitialPlayerResponse is only present on the first page load. YouTube's
+  // SPA navigation instead fetches /youtubei/v1/player, so we also parse those
+  // responses (see the fetch hook below) — otherwise the formats of the
+  // *previous* video would be downloaded after clicking a related video.
+  let lastVideoId = "";
+  function publishPlayerResponse(ipr) {
     if (!ipr || !ipr.streamingData) return false;
     const sd   = ipr.streamingData;
     const info = ipr.videoDetails || {};
+    if (!info.videoId) return false;
+    // Ignore preview/ad responses for a different video than the page shows.
+    const pageVid = new URLSearchParams(location.search).get("v");
+    if (pageVid && info.videoId !== pageVid && location.pathname === "/watch") return false;
+    lastVideoId = info.videoId;
+    const mapFmt = (f, progressive) => ({
+      itag:        f.itag,
+      mimeType:    f.mimeType  || "",
+      quality:     f.qualityLabel || f.audioQuality || "",
+      bitrate:     f.bitrate   || 0,
+      width:       f.width     || 0,
+      height:      f.height    || 0,
+      fps:         f.fps       || 0,
+      url:         f.url       || "",   // "" when the URL is signatureCipher-protected
+      contentLength: Number(f.contentLength || 0),
+      progressive: !!progressive,      // muxed audio+video (legacy "formats" list)
+      audioTrack:  f.audioTrack ? (f.audioTrack.displayName || "") : "",
+    });
     const formats = [
-      ...(sd.adaptiveFormats || []),
-      ...(sd.formats         || []),
-    ].map(f => ({
-      itag:      f.itag,
-      mimeType:  f.mimeType  || "",
-      quality:   f.qualityLabel || f.audioQuality || "",
-      bitrate:   f.bitrate   || 0,
-      width:     f.width     || 0,
-      height:    f.height    || 0,
-      url:       f.url       || "",          // direct CDN URL
-      duration:  f.approxDurationMs,
-    }));
+      ...(sd.adaptiveFormats || []).map(f => mapFmt(f, false)),
+      ...(sd.formats         || []).map(f => mapFmt(f, true)),
+    ];
     post({
       type:     "yt_player",
-      manifest: sd.dashManifestUrl || sd.hlsManifestUrl || "",
       hls:      sd.hlsManifestUrl  || "",
       dash:     sd.dashManifestUrl || "",
       formats,
       title:    info.title        || document.title,
-      duration: info.lengthSeconds || 0,
+      duration: Number(info.lengthSeconds || 0),
       videoId:  info.videoId      || "",
       author:   info.author       || "",
+      isLive:   !!info.isLiveContent && !!sd.hlsManifestUrl,
     });
     return true;
   }
 
-  // Poll for ytInitialPlayerResponse (may load slightly after script runs)
-  let ytAttempts = 0;
-  const ytTimer = setInterval(() => {
-    if (probeYouTube() || ++ytAttempts >= 30) clearInterval(ytTimer);
-  }, 300);
+  if (IS_YOUTUBE) {
+    let ytAttempts = 0;
+    const ytTimer = setInterval(() => {
+      if (publishPlayerResponse(window.ytInitialPlayerResponse) || ++ytAttempts >= 40) clearInterval(ytTimer);
+    }, 300);
 
-  // Also hook ytInitialPlayerResponse assignment (YouTube SPA navigation)
-  try {
-    let _ytIPR = window.ytInitialPlayerResponse;
-    Object.defineProperty(window, "ytInitialPlayerResponse", {
-      configurable: true,
-      get() { return _ytIPR; },
-      set(v) {
-        _ytIPR = v;
-        if (v && v.streamingData) setTimeout(probeYouTube, 0);
-      },
+    try {
+      let _ytIPR = window.ytInitialPlayerResponse;
+      Object.defineProperty(window, "ytInitialPlayerResponse", {
+        configurable: true,
+        get() { return _ytIPR; },
+        set(v) { _ytIPR = v; setTimeout(() => publishPlayerResponse(v), 0); },
+      });
+    } catch (_) {}
+
+    // SPA navigation fires yt-navigate-finish; the player response for the new
+    // video is in the page's player element shortly after.
+    document.addEventListener("yt-navigate-finish", () => {
+      setTimeout(() => {
+        try {
+          const p = document.querySelector("#movie_player");
+          const r = p && typeof p.getPlayerResponse === "function" ? p.getPlayerResponse() : null;
+          if (r && r.videoDetails && r.videoDetails.videoId !== lastVideoId) publishPlayerResponse(r);
+        } catch (_) {}
+      }, 800);
     });
-  } catch (_) {}
+  }
 
   // ── Generic: intercept fetch() ────────────────────────────────
   // Catches any .m3u8 / .mpd response the page fetches itself.
   const _fetch = window.fetch;
   window.fetch = async function (...args) {
-    const reqUrl = typeof args[0] === "string"
-      ? args[0]
-      : (args[0] instanceof Request ? args[0].url : "");
-    // Skip non-http schemes (magnet:, blob:, data:, etc.) — native fetch rejects them too
-    if (reqUrl && !/^https?:\/\//i.test(reqUrl)) return _fetch.apply(this, args);
+    let reqUrl = "";
+    try {
+      const a0 = args[0];
+      reqUrl = typeof a0 === "string" ? a0 : (a0 instanceof Request ? a0.url : (a0 && a0.href) || String(a0 || ""));
+      reqUrl = new URL(reqUrl, location.href).href;
+    } catch (_) {}
+    // Skip non-http schemes (magnet:, blob:, data:, etc.)
+    if (!/^https?:\/\//i.test(reqUrl)) return _fetch.apply(this, args);
     const res = await _fetch.apply(this, args);
     try {
+      if (IS_YOUTUBE && /\/youtubei\/v1\/player(\?|$)/.test(reqUrl)) {
+        res.clone().json().then(publishPlayerResponse).catch(() => {});
+        return res;
+      }
       const ct = res.headers.get("content-type") || "";
-      if (isManifestUrl(reqUrl) || isManifestCT(ct)) {
+      if (isManifestUrl(reqUrl) || isManifestCT(ct) || maybeManifestUrl(reqUrl)) {
         res.clone().text().then(body => {
-          post({ type: "manifest_intercepted", url: reqUrl, body, contentType: ct });
+          if (looksLikeManifest(body)) {
+            post({ type: "manifest_intercepted", url: res.url || reqUrl, contentType: ct, hasSubs: hasSubtitleTracks(body) });
+          }
         }).catch(() => {});
       }
     } catch (_) {}
@@ -93,16 +123,20 @@
   const _open = XMLHttpRequest.prototype.open;
   const _send = XMLHttpRequest.prototype.send;
   XMLHttpRequest.prototype.open = function (method, url, ...rest) {
-    this.__fg_url = String(url);
+    try { this.__fg_url = new URL(String(url), location.href).href; } catch (_) { this.__fg_url = String(url); }
     return _open.call(this, method, url, ...rest);
   };
   XMLHttpRequest.prototype.send = function (...args) {
     this.addEventListener("load", function () {
       try {
-        const url = this.__fg_url || "";
+        const url = this.responseURL || this.__fg_url || "";
         const ct  = this.getResponseHeader("content-type") || "";
-        if (isManifestUrl(url) || isManifestCT(ct)) {
-          post({ type: "manifest_intercepted", url, body: this.responseText, contentType: ct });
+        if (!(isManifestUrl(url) || isManifestCT(ct) || maybeManifestUrl(url))) return;
+        // responseText throws for arraybuffer/blob/json response types.
+        const textual = this.responseType === "" || this.responseType === "text";
+        const body = textual ? this.responseText : "";
+        if (!textual || looksLikeManifest(body)) {
+          post({ type: "manifest_intercepted", url, contentType: ct, hasSubs: textual && hasSubtitleTracks(body) });
         }
       } catch (_) {}
     });
@@ -110,83 +144,108 @@
   };
 
   // ── MSE / SourceBuffer: detect DASH/HLS in Media Source ───────
-  // When pages use blob: URLs (Netflix, Prime, etc.), they feed encrypted
-  // segments via SourceBuffer. We capture the manifest URL from the
-  // MediaSource.addSourceBuffer() call.
-  const _addSB = MediaSource.prototype.addSourceBuffer;
-  MediaSource.prototype.addSourceBuffer = function (mimeType) {
-    post({ type: "mse_mime", mimeType });
-    return _addSB.call(this, mimeType);
-  };
+  if (typeof MediaSource !== "undefined" && MediaSource.prototype && MediaSource.prototype.addSourceBuffer) {
+    const _addSB = MediaSource.prototype.addSourceBuffer;
+    MediaSource.prototype.addSourceBuffer = function (mimeType) {
+      post({ type: "mse_mime", mimeType: String(mimeType || "") });
+      return _addSB.call(this, mimeType);
+    };
+  }
 
-  // ── JWPlayer interception ─────────────────────────────────────
-  // JWPlayer stores HLS/DASH manifests in its setup config before they
-  // become blob: URLs. We hook setup() to capture them early.
-  function hookJWPlayer() {
-    if (!window.jwplayer) return;
-    const _jw = window.jwplayer;
-    window.jwplayer = function (...args) {
-      const player = _jw.apply(this, args);
-      if (!player || typeof player.setup !== "function") return player;
-      const _setup = player.setup.bind(player);
-      player.setup = function (cfg) {
-        extractJWConfig(cfg);
-        return _setup(cfg);
-      };
+  // ── Player library hooks (JWPlayer / Video.js) ────────────────
+  // Players store HLS/DASH manifests in their setup config before they become
+  // blob: URLs. Hook the globals whenever they get assigned.
+  function extractSources(list) {
+    for (const s of list || []) {
+      const file = s && (s.file || s.src);
+      if (!file) continue;
+      if (isManifestUrl(file) || isManifestCT(s.type || "")) {
+        let abs = file;
+        try { abs = new URL(file, location.href).href; } catch (_) {}
+        post({ type: "manifest_intercepted", url: abs, contentType: s.type || "application/x-mpegURL", label: s.label || "" });
+      }
+    }
+  }
+
+  function wrapJW(jw) {
+    if (!jw || jw.__fg_wrapped) return jw;
+    const wrapped = function (...args) {
+      const player = jw.apply(this, args);
+      if (player && typeof player.setup === "function" && !player.__fg_setup) {
+        const _setup = player.setup.bind(player);
+        player.setup = function (cfg) {
+          try {
+            const items = (cfg && cfg.playlist) || [cfg];
+            for (const it of items) {
+              if (!it) continue;
+              extractSources(it.sources);
+              if (it.file) extractSources([{ file: it.file }]);
+            }
+          } catch (_) {}
+          return _setup(cfg);
+        };
+        player.__fg_setup = true;
+      }
       return player;
     };
-    Object.assign(window.jwplayer, _jw);
+    Object.assign(wrapped, jw);
+    wrapped.__fg_wrapped = true;
+    return wrapped;
   }
 
-  function extractJWConfig(cfg) {
-    if (!cfg) return;
-    const sources = [];
-    const list = cfg.playlist || [cfg];
-    for (const item of list) {
-      for (const src of (item.sources || [])) {
-        if (src.file) sources.push({ file: src.file, type: src.type || "", label: src.label || "" });
-      }
-      if (item.file) sources.push({ file: item.file, type: "", label: "" });
-    }
-    for (const s of sources) {
-      if (isManifestUrl(s.file) || isManifestCT(s.type)) {
-        post({ type: "manifest_intercepted", url: s.file, contentType: s.type || "application/x-mpegURL", label: s.label });
-      }
-    }
-  }
-
-  // ── Video.js / Plyr / Flowplayer interception ─────────────────
-  // Intercept videojs() setup — used by many streaming sites
-  function hookVideoJS() {
-    if (!window.videojs) return;
-    const _vjs = window.videojs;
-    window.videojs = function (id, opts, ...rest) {
-      const player = _vjs(id, opts, ...rest);
-      if (opts && opts.sources) {
-        for (const s of opts.sources) {
-          if (s.src && (isManifestUrl(s.src) || isManifestCT(s.type || ""))) {
-            post({ type: "manifest_intercepted", url: s.src, contentType: s.type || "application/x-mpegURL" });
-          }
+  function wrapVJS(vjs) {
+    if (!vjs || vjs.__fg_wrapped) return vjs;
+    const wrapped = function (id, opts, ...rest) {
+      try { if (opts && opts.sources) extractSources(opts.sources); } catch (_) {}
+      const player = vjs(id, opts, ...rest);
+      try {
+        if (player && typeof player.src === "function" && !player.__fg_src) {
+          const _src = player.src.bind(player);
+          player.src = function (s) {
+            if (s) extractSources(Array.isArray(s) ? s : [typeof s === "string" ? { src: s } : s]);
+            return _src(s);
+          };
+          player.__fg_src = true;
         }
-      }
+      } catch (_) {}
       return player;
     };
-    Object.assign(window.videojs, _vjs);
+    Object.assign(wrapped, vjs);
+    wrapped.__fg_wrapped = true;
+    return wrapped;
   }
 
-  // Try hooking now and after DOMContentLoaded (players may init late)
-  hookJWPlayer();
-  hookVideoJS();
-  document.addEventListener("DOMContentLoaded", () => {
-    hookJWPlayer();
-    hookVideoJS();
-  });
+  function hookGlobal(name, wrap) {
+    try {
+      let current = wrap(window[name]);
+      Object.defineProperty(window, name, {
+        configurable: true,
+        get() { return current; },
+        set(v) { current = wrap(v); },
+      });
+    } catch (_) {}
+  }
+  hookGlobal("jwplayer", wrapJW);
+  hookGlobal("videojs", wrapVJS);
 
   // ── Helpers ───────────────────────────────────────────────────
   function isManifestUrl(url) {
-    return /\.(m3u8|mpd)(\?|#|$)/i.test(url) || /(\/playlist|\/master|\/index|\/manifest)(\.m3u8|\.mpd)?(\?|$)/i.test(url);
+    return /\.(m3u8|mpd)(\?|#|$)/i.test(url);
+  }
+  // Extension-less manifest paths (/playlist, /master, /manifest…) — only
+  // reported once the body confirms it really is a playlist.
+  function maybeManifestUrl(url) {
+    return /\/(playlist|master|manifest|index|chunklist)[^/]*?(\?|#|$)/i.test(url) && !/youtube\.com\/playlist/i.test(url);
   }
   function isManifestCT(ct) {
-    return /mpegurl|dash\+xml|vnd\.apple\.mpegurl/i.test(ct);
+    return /mpegurl|dash\+xml/i.test(ct);
+  }
+  function looksLikeManifest(body) {
+    if (!body) return false;
+    const head = body.slice(0, 2048).trimStart();
+    return head.startsWith("#EXTM3U") || /<MPD[\s>]/.test(head);
+  }
+  function hasSubtitleTracks(body) {
+    return /#EXT-X-MEDIA:[^\n]*TYPE=SUBTITLES/i.test(body || "") || /contentType="text"|mimeType="(text\/vtt|application\/ttml)/i.test(body || "");
   }
 })();

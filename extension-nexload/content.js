@@ -121,14 +121,16 @@
   let   qualities = [];        // picker options from background.js
   let   pageTitle = "";
 
-  // Fallback quality options when YouTube data isn't captured (uses yt-dlp format selectors)
+  // Fallback quality options when no format list was captured: the backend
+  // applies the height cap to whatever it finds (HLS/DASH variant or yt-dlp).
   const FALLBACK_QUALITIES = [
-    { label: "1080p HD", height: 1080, codec: "MP4",  type: "video", videoUrl: "", audioUrl: "", ytFormat: "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]" },
-    { label: "720p HD",  height: 720,  codec: "MP4",  type: "video", videoUrl: "", audioUrl: "", ytFormat: "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]" },
-    { label: "480p",     height: 480,  codec: "MP4",  type: "video", videoUrl: "", audioUrl: "", ytFormat: "bestvideo[height<=480]+bestaudio/best[height<=480]" },
-    { label: "360p",     height: 360,  codec: "MP4",  type: "video", videoUrl: "", audioUrl: "", ytFormat: "bestvideo[height<=360]+bestaudio/best[height<=360]" },
-    { label: "Audio only", height: 0, codec: "AAC",   type: "audio", videoUrl: "", audioUrl: "", ytFormat: "bestaudio/best" },
+    { label: "Best quality", maxHeight: 0,    type: "video", codec: "Auto" },
+    { label: "1080p",        maxHeight: 1080, type: "video", codec: "" },
+    { label: "720p",         maxHeight: 720,  type: "video", codec: "" },
+    { label: "480p",         maxHeight: 480,  type: "video", codec: "" },
+    { label: "Audio only",   maxHeight: 0,    type: "audio", codec: "", audioOnly: true },
   ];
+  let qualitiesVideoId = "";
 
   // On load, request cached quality data (fixes race with document.js)
   chrome.runtime.sendMessage({ action: "get_quality_data" }, (res) => {
@@ -136,9 +138,17 @@
     if (res && res.options && res.options.length > 0) {
       qualities = res.options;
       pageTitle = res.title || "";
+      qualitiesVideoId = res.videoId || "";
       tracked.forEach(({ btn }) => resetBtn(btn));
     }
   });
+
+  function fmtSize(n) {
+    if (!n) return "";
+    if (n >= 1 << 30) return (n / (1 << 30)).toFixed(1) + " GB";
+    if (n >= 1 << 20) return Math.round(n / (1 << 20)) + " MB";
+    return Math.round(n / 1024) + " KB";
+  }
 
   // ── SVG icon ──────────────────────────────────────────────────────────────────
   function makeIcon() {
@@ -183,7 +193,7 @@
 
       const badge = document.createElement("span");
       badge.className = "fg-quality-badge";
-      badge.textContent = opt.codec || (opt.videoUrl || opt.audioUrl ? "Direct" : "yt-dlp");
+      badge.textContent = [opt.codec, fmtSize(opt.size)].filter(Boolean).join(" \u00B7 ") || "Auto";
 
       row.appendChild(icon);
       row.appendChild(lbl);
@@ -191,18 +201,12 @@
 
       row.addEventListener("click", (e) => {
         e.stopPropagation();
-        const title = pageTitle || document.title || "";
-        const pageUrl = window.location.href;
         chrome.runtime.sendMessage({
-          action:   "download_quality",
-          videoUrl: opt.videoUrl || "",
-          audioUrl: opt.audioUrl || "",
-          ytFormat: opt.ytFormat || "",
-          pageUrl,
-          title,
-          formats:  opt.videoUrl && opt.audioUrl
-            ? [{ url: opt.videoUrl, mimeType: "video/" }, { url: opt.audioUrl, mimeType: "audio/" }]
-            : [],
+          action:      "download_quality",
+          maxHeight:   opt.maxHeight || 0,
+          audioOnly:   !!opt.audioOnly || opt.type === "audio",
+          manifestUrl: opt.manifestUrl || "",
+          title:       pageTitle || document.title || "",
         });
         panel.remove();
         anchorBtn.innerHTML = "";
@@ -301,52 +305,34 @@
       let pickerQualities = qualities;
       let subtitleSource = ""; // master playlist URL, set only when it declares subtitles
 
-      // No YouTube data — check if we have a captured HLS manifest for this tab
+      // No YouTube data \u2014 inspect a captured HLS master for this tab. The
+      // fetch runs in the service worker: content-script fetches are bound by
+      // the page's CORS policy and fail on most CDNs.
       if (pickerQualities.length === 0) {
         const captured = await new Promise(resolve =>
           chrome.runtime.sendMessage({ action: "get_captured" }, r => resolve(r || {}))
         );
-        const hlsItem = (captured.captured || []).find(v =>
-          /\.m3u8/i.test(v.url) || /mpegurl/i.test(v.type || "")
-        );
+        const list = captured.captured || [];
+        const hlsItem = [...list].reverse().find(v => v.hasSubs || v.isMaster) ||
+          [...list].reverse().find(v => /\.m3u8/i.test(v.url) || /mpegurl/i.test(v.type || ""));
         if (hlsItem) {
-          // Parse real variants from the manifest
-          try {
-            const res  = await fetch(hlsItem.url);
-            const body = await res.text();
-            if (body.includes("#EXT-X-STREAM-INF")) {
-              const lines = body.split("\n");
-              const variants = [];
-              let pending = null;
-              for (const line of lines) {
-                const l = line.trim();
-                if (l.startsWith("#EXT-X-STREAM-INF:")) {
-                  const bw  = (l.match(/BANDWIDTH=(\d+)/)      || [])[1];
-                  const rh  = (l.match(/RESOLUTION=\d+x(\d+)/) || [])[1];
-                  pending = { bandwidth: bw ? parseInt(bw) : 0, height: rh ? parseInt(rh) : 0 };
-                } else if (pending && l && !l.startsWith("#")) {
-                  try { pending.url = new URL(l, hlsItem.url).href; } catch { pending.url = l; }
-                  variants.push(pending);
-                  pending = null;
-                }
-              }
-              variants.sort((a, b) => b.bandwidth - a.bandwidth);
-              pickerQualities = variants.map((v, i) => ({
-                label:    v.height ? `${v.height}p${i === 0 ? " (Best)" : ""}` : `Stream ${i+1}`,
-                height:   v.height,
-                codec:    "HLS",
-                type:     "video",
-                videoUrl: v.url,
-                audioUrl: "",
-                ytFormat: "",
-              }));
-              // Subtitle renditions are declared in the master — only then do we
-              // offer "Subtitles only", and we use this master URL for it.
-              if (/#EXT-X-MEDIA[^\n]*TYPE=SUBTITLES/i.test(body)) {
-                subtitleSource = hlsItem.url;
-              }
-            }
-          } catch {}
+          const info = await new Promise(resolve =>
+            chrome.runtime.sendMessage({ action: "inspect_hls", url: hlsItem.url }, r => resolve(r || {}))
+          );
+          const variants = info.variants || [];
+          // Quality = height cap on the *master* URL, so the backend keeps the
+          // variant's separate audio group and the subtitle renditions.
+          pickerQualities = variants.map((v, i) => ({
+            label:       v.height ? `${v.height}p${i === 0 ? " (Best)" : ""}` : `Stream ${i + 1}`,
+            maxHeight:   v.height || 0,
+            codec:       v.bandwidth ? `${(v.bandwidth / 1e6).toFixed(1)} Mbps` : "HLS",
+            type:        "video",
+            manifestUrl: hlsItem.url,
+          }));
+          if (variants.length) {
+            pickerQualities.push({ label: "Audio only", type: "audio", audioOnly: true, codec: "HLS", manifestUrl: hlsItem.url });
+          }
+          if (info.hasSubs) subtitleSource = hlsItem.url;
         }
       }
 
@@ -431,7 +417,8 @@
   // ── Relay: document.js (MAIN world) → background.js ──────────────────────────
   // document.js posts messages tagged with __fluxget; we relay them to the SW.
   window.addEventListener("message", (event) => {
-    if (!event.data || !event.data[TAG]) return;
+    // Only our own frame's MAIN-world script (document.js); ignore other frames.
+    if (event.source !== window || !event.data || !event.data[TAG]) return;
     const msg = event.data;
 
     if (msg.type === "yt_player") {
@@ -439,8 +426,9 @@
         action:  "yt_player",
         dash:    msg.dash    || "",
         hls:     msg.hls     || "",
-        formats: msg.formats || [],
+        formats: Array.isArray(msg.formats) ? msg.formats : [],
         title:   msg.title   || "",
+        videoId: msg.videoId || "",
       });
       return;
     }
@@ -448,8 +436,9 @@
     if (msg.type === "manifest_intercepted") {
       chrome.runtime.sendMessage({
         action:      "manifest_intercepted",
-        url:         msg.url         || "",
+        url:         String(msg.url || ""),
         contentType: msg.contentType || "",
+        hasSubs:     !!msg.hasSubs,
       });
       return;
     }
@@ -460,8 +449,9 @@
   // ── Messages from background.js ───────────────────────────────────────────────
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg.action === "video_qualities") {
-      qualities = msg.options || msg.formats || [];
+      qualities = msg.options || [];
       pageTitle = msg.title  || "";
+      qualitiesVideoId = msg.videoId || "";
       tracked.forEach(({ btn }) => resetBtn(btn));
       return;
     }
@@ -492,7 +482,12 @@
   });
 
   // ── Observe DOM ───────────────────────────────────────────────────────────────
-  new MutationObserver(scanForVideos).observe(document.documentElement, { childList: true, subtree: true });
+  // Debounced: heavy SPAs mutate the DOM hundreds of times per second.
+  let scanTimer = 0;
+  new MutationObserver(() => {
+    if (scanTimer) return;
+    scanTimer = setTimeout(() => { scanTimer = 0; scanForVideos(); }, 400);
+  }).observe(document.documentElement, { childList: true, subtree: true });
   scanForVideos();
   window.addEventListener("load", scanForVideos);
 
@@ -502,9 +497,20 @@
     if (location.href !== lastHref) {
       lastHref = location.href;
       qualities = [];       // clear stale quality data on navigation
+      qualitiesVideoId = "";
       dismissed.clear();    // allow overlay to reappear on new page/video
       tracked.forEach(({ btn }) => resetBtn(btn));
       setTimeout(scanForVideos, 1500);
+      // The new video's player data arrives shortly after SPA navigation.
+      setTimeout(() => {
+        chrome.runtime.sendMessage({ action: "get_quality_data" }, (res) => {
+          if (chrome.runtime.lastError || !res || !res.options || !res.options.length) return;
+          qualities = res.options;
+          pageTitle = res.title || "";
+          qualitiesVideoId = res.videoId || "";
+          tracked.forEach(({ btn }) => resetBtn(btn));
+        });
+      }, 2000);
     }
   }, 500);
 
