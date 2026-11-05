@@ -5,7 +5,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/msh2050/fluxget/internal/core"
+	"github.com/msh2050/fluxget/internal/service"
 )
 
 const (
@@ -22,27 +22,33 @@ var (
 type remoteClientConfig struct {
 	AllowInsecureHTTP bool
 	ConnectTimeout    time.Duration
-	HTTPOptions       core.HTTPClientOptions
+	HTTPOptions       service.HTTPClientOptions
 }
 
 func currentRemoteClientConfig() remoteClientConfig {
 	return remoteClientConfig{
 		AllowInsecureHTTP: globalInsecureHTTP,
 		ConnectTimeout:    defaultRemoteConnectTimeout,
-		HTTPOptions: core.HTTPClientOptions{
-			Timeout:            defaultRemoteAPIRequestTimeout,
-			InsecureSkipVerify: globalInsecureTLS,
-			CAFile:             strings.TrimSpace(globalTLSCAFile),
+		HTTPOptions: service.HTTPClientOptions{
+			Timeout:               defaultRemoteAPIRequestTimeout,
+			ResponseHeaderTimeout: defaultRemoteAPIRequestTimeout,
+			InsecureSkipVerify:    globalInsecureTLS,
+			CAFile:                strings.TrimSpace(globalTLSCAFile),
 		},
 	}
 }
 
-func newRemoteDownloadService(baseURL, token string) (*core.RemoteDownloadService, error) {
+func newRemoteDownloadService(baseURL, token string) (*service.RemoteDownloadService, error) {
 	cfg := currentRemoteClientConfig()
-	return core.NewRemoteDownloadService(baseURL, token, cfg.HTTPOptions)
+	return service.NewRemoteDownloadService(baseURL, token, cfg.HTTPOptions)
 }
 
 func newRemoteAPIHTTPClient() (*http.Client, error) {
 	cfg := currentRemoteClientConfig()
-	return core.NewHTTPClient(cfg.HTTPOptions)
+	client, err := service.NewHTTPClient(cfg.HTTPOptions)
+	if err != nil {
+		return nil, err
+	}
+	client.CheckRedirect = service.SameOriginRedirectPolicy
+	return client, nil
 }

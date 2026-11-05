@@ -9,14 +9,14 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/msh2050/fluxget/internal/config"
-	"github.com/msh2050/fluxget/internal/engine/events"
-	"github.com/msh2050/fluxget/internal/processing"
+	"github.com/msh2050/fluxget/internal/orchestrator"
+	"github.com/msh2050/fluxget/internal/types"
 	"github.com/msh2050/fluxget/internal/utils"
 )
 
-func (m *RootModel) processProgressMsg(msg events.ProgressMsg) tea.Cmd {
+func (m *RootModel) processProgressMsg(msg types.DownloadEvent) tea.Cmd {
 	d := m.FindDownloadByID(msg.DownloadID)
-	if d == nil || d.done || d.paused {
+	if d == nil || !d.started || d.done || d.paused {
 		return nil
 	}
 
@@ -25,7 +25,11 @@ func (m *RootModel) processProgressMsg(msg events.ProgressMsg) tea.Cmd {
 	d.Total = msg.Total
 	d.Speed = msg.Speed
 	d.Elapsed = msg.Elapsed
-	d.Connections = msg.ActiveConnections
+	d.Connections = msg.Connections
+	d.rateLimited = msg.RateLimited
+
+	// Update smoothed ETA on every progress tick
+	d.UpdateETA()
 
 	// Keep "Resuming..." visible until we observe actual transfer.
 	if d.resuming && (d.Speed > 0 || d.Downloaded > prevDownloaded) {
@@ -40,7 +44,7 @@ func (m *RootModel) processProgressMsg(msg events.ProgressMsg) tea.Cmd {
 		// We only get bitmap, no progress array (to save bandwidth)
 		// State needs to be updated carefully
 		if d.state != nil {
-			d.state.RestoreBitmap(msg.ChunkBitmap, msg.ActualChunkSize)
+			d.state.RestoreBitmap(msg.ChunkBitmap, msg.ChunkSize)
 		}
 		if d.state != nil && len(msg.ChunkProgress) > 0 {
 			d.state.SetChunkProgress(msg.ChunkProgress)
@@ -55,7 +59,7 @@ func (m *RootModel) processProgressMsg(msg events.ProgressMsg) tea.Cmd {
 
 	// Update speed graph history with EMA smoothing for smooth transitions
 	if time.Since(m.lastSpeedHistoryUpdate) >= GraphUpdateInterval {
-		totalSpeed := m.calcTotalSpeed()
+		totalSpeed := float64(m.cachedTotalSpeed)
 		// EMA smooth against previous graph point for visual continuity
 		var smoothed float64
 		if m.Settings != nil && config.Resolve[bool](m.Settings.General.LiveSpeedGraph) {
@@ -73,14 +77,16 @@ func (m *RootModel) processProgressMsg(msg events.ProgressMsg) tea.Cmd {
 		m.lastSpeedHistoryUpdate = time.Now()
 	}
 
-	m.UpdateListItems()
+	// ponytail: list items hold *DownloadModel pointers — speed/progress are
+	// read live on every View() without a rebuild. UpdateListItems() is only
+	// needed for structural changes (start/pause/complete/error/tab switch).
 	return cmd
 }
 
 // startDownload initiates a new download
-func (m RootModel) startDownload(url string, mirrors []string, headers map[string]string, path string, isDefaultPath bool, filename, id string) (RootModel, tea.Cmd) {
+func (m RootModel) startDownload(url string, mirrors []string, headers map[string]string, path string, isDefaultPath bool, filename, id string, workers int, minChunkSize int64) (RootModel, tea.Cmd) {
 	if m.Service == nil {
-		m.addLogEntry(LogStyleError.Render("\u2716 Service unavailable"))
+		m.addStyledLogEntry(logError, "\u2716 Service unavailable")
 		return m, nil
 	}
 
@@ -89,11 +95,19 @@ func (m RootModel) startDownload(url string, mirrors []string, headers map[strin
 
 	candidateFilename := strings.TrimSpace(filename)
 	requestID := strings.TrimSpace(id)
+	if requestID != "" {
+		for _, download := range m.downloads {
+			if download.ID == requestID {
+				m.addStyledLogEntry(logError, "\u2716 Download ID already exists")
+				return m, nil
+			}
+		}
+	}
 
 	resolvedPath := path
 	resolvedFilename := candidateFilename
 	optimisticFilename := candidateFilename
-	if p, f, err := processing.ResolveDestination(url, candidateFilename, path, isDefaultPath, m.Settings, nil, nil); err == nil {
+	if p, f, err := orchestrator.ResolveDestination(url, candidateFilename, path, isDefaultPath, m.Settings, nil, nil); err == nil {
 		resolvedPath = p
 		resolvedFilename = f
 		if candidateFilename != "" {
@@ -102,11 +116,11 @@ func (m RootModel) startDownload(url string, mirrors []string, headers map[strin
 			optimisticFilename = f
 		}
 	} else {
-		utils.Debug("Optimistic destination resolve failed for %s: %v", url, err)
+		utils.Debug("Optimistic destination resolve failed for host %s: %v", utils.URLHostForLog(url), err)
 	}
 
 	// Call Orchestrator Enqueue
-	req := &processing.DownloadRequest{
+	req := &orchestrator.DownloadRequest{
 		URL:                url,
 		Filename:           candidateFilename,
 		Path:               path,
@@ -114,6 +128,8 @@ func (m RootModel) startDownload(url string, mirrors []string, headers map[strin
 		Headers:            headers,
 		IsExplicitCategory: !isDefaultPath,
 		SkipApproval:       true,
+		Workers:            workers,
+		MinChunkSize:       minChunkSize,
 	}
 
 	optimisticID := requestID
@@ -122,7 +138,7 @@ func (m RootModel) startDownload(url string, mirrors []string, headers map[strin
 	}
 	displayName := optimisticFilename
 	if displayName == "" {
-		displayName = processing.InferFilenameFromURL(url)
+		displayName = orchestrator.InferFilenameFromURL(url)
 	}
 	if displayName == "" {
 		displayName = "Queued"
@@ -136,7 +152,7 @@ func (m RootModel) startDownload(url string, mirrors []string, headers map[strin
 	}
 	m.downloads = append(m.downloads, newDownload)
 	m.SelectedDownloadID = optimisticID
-	if m.pinnedTab == -1 {
+	if m.pinnedTab == -1 && m.activeTab != TabAll {
 		m.activeTab = TabQueued
 	}
 	m.UpdateListItems()
@@ -149,14 +165,15 @@ func (m RootModel) startDownload(url string, mirrors []string, headers map[strin
 		)
 		if requestID != "" {
 			newID, err = m.Service.AddWithID(
-				url,
-				resolvedPath,
-				resolvedFilename,
-				mirrors,
-				headers,
+				req.URL,
+				req.Path,
+				req.Filename,
+				req.Mirrors,
+				req.Headers,
 				requestID,
-				0,
-				false,
+				req.IsExplicitCategory,
+				req.Workers,
+				req.MinChunkSize,
 			)
 		} else {
 			newID, err = m.Service.Add(
@@ -166,14 +183,14 @@ func (m RootModel) startDownload(url string, mirrors []string, headers map[strin
 				mirrors,
 				headers,
 				!isDefaultPath,
-				0,
-				false,
+				workers,
+				minChunkSize,
 			)
 		}
 		if err != nil {
 			m.removeDownloadByID(optimisticID)
 			m.UpdateListItems()
-			m.addLogEntry(LogStyleError.Render("\u2716 Failed to add download: " + err.Error()))
+			m.addStyledLogEntry(logError, "\u2716 Failed to add download: "+err.Error())
 			return m, nil
 		}
 
@@ -215,7 +232,7 @@ func (m RootModel) startDownload(url string, mirrors []string, headers map[strin
 		}
 	}
 
-	utils.Debug("Queued enqueue command (via Orchestrator): %s -> %s", url, optimisticFilename)
+	utils.Debug("Queued enqueue command (via Orchestrator): host %s -> %s", utils.URLHostForLog(url), optimisticFilename)
 	return m, cmd
 }
 

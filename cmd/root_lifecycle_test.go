@@ -13,31 +13,31 @@ import (
 	"time"
 
 	"github.com/msh2050/fluxget/internal/config"
-	"github.com/msh2050/fluxget/internal/core"
-	"github.com/msh2050/fluxget/internal/download"
-	"github.com/msh2050/fluxget/internal/engine/events"
-	"github.com/msh2050/fluxget/internal/engine/state"
-	"github.com/msh2050/fluxget/internal/engine/types"
-	"github.com/msh2050/fluxget/internal/processing"
+	"github.com/msh2050/fluxget/internal/orchestrator"
+	"github.com/msh2050/fluxget/internal/progress"
+	"github.com/msh2050/fluxget/internal/scheduler"
+	"github.com/msh2050/fluxget/internal/service"
+	"github.com/msh2050/fluxget/internal/store"
 	"github.com/msh2050/fluxget/internal/testutil"
+	"github.com/msh2050/fluxget/internal/types"
 )
 
 type countingLifecycleService struct {
 	streamCalls atomic.Int32
-	streamCh    chan interface{}
+	streamCh    chan types.DownloadEvent
 	cleanupMu   sync.Mutex
 	cleaned     bool
 	logs        []string
 }
 
-var _ core.DownloadService = (*countingLifecycleService)(nil)
+var _ service.DownloadService = (*countingLifecycleService)(nil)
 
-func (s *countingLifecycleService) List() ([]types.DownloadStatus, error)   { return nil, nil }
-func (s *countingLifecycleService) History() ([]types.DownloadEntry, error) { return nil, nil }
-func (s *countingLifecycleService) Add(string, string, string, []string, map[string]string, bool, int64, bool) (string, error) {
+func (s *countingLifecycleService) List() ([]types.DownloadStatus, error)    { return nil, nil }
+func (s *countingLifecycleService) History() ([]types.DownloadRecord, error) { return nil, nil }
+func (s *countingLifecycleService) Add(string, string, string, []string, map[string]string, bool, int, int64) (string, error) {
 	return "", nil
 }
-func (s *countingLifecycleService) AddWithID(string, string, string, []string, map[string]string, string, int64, bool) (string, error) {
+func (s *countingLifecycleService) AddWithID(string, string, string, []string, map[string]string, string, bool, int, int64) (string, error) {
 	return "", nil
 }
 func (s *countingLifecycleService) Pause(string) error             { return nil }
@@ -45,20 +45,21 @@ func (s *countingLifecycleService) Resume(string) error            { return nil 
 func (s *countingLifecycleService) ResumeBatch([]string) []error   { return nil }
 func (s *countingLifecycleService) UpdateURL(string, string) error { return nil }
 func (s *countingLifecycleService) Delete(string) error            { return nil }
-func (s *countingLifecycleService) Publish(msg interface{}) error {
-	if log, ok := msg.(events.SystemLogMsg); ok {
-		s.cleanupMu.Lock()
-		s.logs = append(s.logs, log.Message)
-		s.cleanupMu.Unlock()
-	}
+func (s *countingLifecycleService) Purge(string) error             { return nil }
+func (s *countingLifecycleService) Publish(msg types.DownloadEvent) error {
+	s.cleanupMu.Lock()
+	s.logs = append(s.logs, msg.Message)
+	s.cleanupMu.Unlock()
 	return nil
 }
 func (s *countingLifecycleService) GetStatus(string) (*types.DownloadStatus, error) { return nil, nil }
 func (s *countingLifecycleService) Shutdown() error                                 { return nil }
+func (s *countingLifecycleService) SetRateLimit(string, int64) error                { return nil }
+func (s *countingLifecycleService) ClearRateLimit(string) error                     { return nil }
 
-func (s *countingLifecycleService) StreamEvents(context.Context) (<-chan interface{}, func(), error) {
+func (s *countingLifecycleService) StreamEvents(context.Context) (<-chan types.DownloadEvent, func(), error) {
 	s.streamCalls.Add(1)
-	ch := make(chan interface{})
+	ch := make(chan types.DownloadEvent)
 	s.streamCh = ch
 	cleanup := func() {
 		s.cleanupMu.Lock()
@@ -72,16 +73,24 @@ func (s *countingLifecycleService) StreamEvents(context.Context) (<-chan interfa
 	return ch, cleanup, nil
 }
 
+func (s *countingLifecycleService) ClearCompleted() (int64, error) {
+	return 0, nil
+}
+
+func (s *countingLifecycleService) ClearFailed() (int64, error) {
+	return 0, nil
+}
+
 func TestBuildActiveDownloadChecker(t *testing.T) {
-	getAll := func() []types.DownloadConfig {
-		state := types.NewProgressState("dl-2", 0)
+	getAll := func() []types.DownloadRecord {
+		state := progress.New("dl-2", 0)
 		state.SetFilename("from-state.iso")
 		state.SetDestPath("/downloads/from-state.iso")
 
-		return []types.DownloadConfig{
+		return []types.DownloadRecord{
 			{Filename: "queued.zip", OutputPath: "/downloads"},
 			{DestPath: "/downloads/from-path.mp4"},
-			{State: state},
+			{ProgressState: state},
 		}
 	}
 
@@ -105,11 +114,11 @@ func TestBuildActiveDownloadChecker(t *testing.T) {
 }
 
 func TestNewLocalLifecycleManager_WiresNameActivityCheck(t *testing.T) {
-	getAll := func() []types.DownloadConfig {
-		return []types.DownloadConfig{{Filename: "active.bin", OutputPath: "."}}
+	getAll := func() []types.DownloadRecord {
+		return []types.DownloadRecord{{Filename: "active.bin", OutputPath: "."}}
 	}
 
-	mgr := newLocalLifecycleManager(nil, getAll)
+	mgr := newLocalLifecycleManager(nil, nil, nil, getAll)
 	if !mgr.IsNameActive(".", "active.bin") {
 		t.Fatal("expected wired IsNameActive callback to inspect active downloads")
 	}
@@ -119,9 +128,24 @@ func TestEnsureLocalLifecycle_StartsEventWorker(t *testing.T) {
 	setupIsolatedCmdState(t)
 	GlobalLifecycle = nil
 	GlobalLifecycleCleanup = nil
-	GlobalProgressCh = make(chan any, 32)
-	GlobalPool = download.NewWorkerPool(GlobalProgressCh, 1)
-	GlobalService = core.NewLocalDownloadServiceWithInput(GlobalPool, GlobalProgressCh)
+	GlobalProgressCh = make(chan types.DownloadEvent, 32)
+	if GlobalPool != nil {
+		GlobalPool.GracefulShutdown()
+	}
+	tmpPool := scheduler.New(GlobalProgressCh, 1)
+	t.Cleanup(func() {
+		if tmpPool != nil {
+			tmpPool.GracefulShutdown()
+		}
+	})
+	GlobalPool = tmpPool
+	eventBus := orchestrator.NewEventBus()
+	t.Cleanup(func() { eventBus.Shutdown() })
+	getAll := func() []types.DownloadRecord { return GlobalPool.GetAll() }
+	tmpLifecycle := orchestrator.NewLifecycleManager(GlobalPool, eventBus, nil, buildActiveDownloadChecker(getAll))
+	t.Cleanup(func() { tmpLifecycle.Shutdown() })
+	GlobalLifecycle = tmpLifecycle
+	GlobalService = service.NewLocalDownloadService(GlobalLifecycle)
 	t.Cleanup(func() {
 		if GlobalLifecycleCleanup != nil {
 			GlobalLifecycleCleanup()
@@ -156,7 +180,7 @@ func TestEnsureLocalLifecycle_StartsEventWorker(t *testing.T) {
 
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		entries, err := state.ListAllDownloads()
+		entries, err := store.ListAllDownloads()
 		if err == nil {
 			for _, entry := range entries {
 				if strings.HasSuffix(entry.DestPath, fmt.Sprintf("%clocal.bin", filepath.Separator)) {
@@ -167,7 +191,7 @@ func TestEnsureLocalLifecycle_StartsEventWorker(t *testing.T) {
 		time.Sleep(25 * time.Millisecond)
 	}
 
-	entries, err := state.ListAllDownloads()
+	entries, err := store.ListAllDownloads()
 	if err != nil {
 		t.Fatalf("failed to list downloads: %v", err)
 	}
@@ -182,6 +206,9 @@ func TestEnsureGlobalLocalServiceAndLifecycle_ReusesExistingService(t *testing.T
 	GlobalService = service
 	t.Cleanup(func() {
 		GlobalService = nil
+		if GlobalLifecycle != nil {
+			GlobalLifecycle.Shutdown()
+		}
 		GlobalLifecycle = nil
 		if cleanup := takeLifecycleCleanup(); cleanup != nil {
 			cleanup()
@@ -216,9 +243,24 @@ func TestProcessDownloads_RoutesBinFilesToCustomCategory(t *testing.T) {
 	setupIsolatedCmdState(t)
 	GlobalLifecycle = nil
 	GlobalLifecycleCleanup = nil
-	GlobalProgressCh = make(chan any, 32)
-	GlobalPool = download.NewWorkerPool(GlobalProgressCh, 1)
-	GlobalService = core.NewLocalDownloadServiceWithInput(GlobalPool, GlobalProgressCh)
+	eventBus := orchestrator.NewEventBus()
+	t.Cleanup(func() { eventBus.Shutdown() })
+	GlobalProgressCh = eventBus.InputCh
+	if GlobalPool != nil {
+		GlobalPool.GracefulShutdown()
+	}
+	tmpPool := scheduler.New(GlobalProgressCh, 1)
+	t.Cleanup(func() {
+		if tmpPool != nil {
+			tmpPool.GracefulShutdown()
+		}
+	})
+	GlobalPool = tmpPool
+	getAll := func() []types.DownloadRecord { return GlobalPool.GetAll() }
+	tmpLifecycle := orchestrator.NewLifecycleManager(GlobalPool, eventBus, nil, buildActiveDownloadChecker(getAll))
+	t.Cleanup(func() { tmpLifecycle.Shutdown() })
+	GlobalLifecycle = tmpLifecycle
+	GlobalService = service.NewLocalDownloadService(GlobalLifecycle)
 	t.Cleanup(func() {
 		if GlobalLifecycleCleanup != nil {
 			GlobalLifecycleCleanup()
@@ -241,14 +283,15 @@ func TestProcessDownloads_RoutesBinFilesToCustomCategory(t *testing.T) {
 	settings := config.DefaultSettings()
 	settings.General.DefaultDownloadDir.Value = defaultDir
 	settings.Categories.CategoryEnabled.Value = true
-	settings.Categories.Categories = append(settings.Categories.Categories, config.Category{
+	settings.Categories.Categories = append([]config.Category{{
 		Name:    "Binary",
 		Pattern: `(?i)\.bin$`,
 		Path:    customDir,
-	})
+	}}, settings.Categories.Categories...)
 	if err := config.SaveSettings(settings); err != nil {
 		t.Fatalf("SaveSettings failed: %v", err)
 	}
+	GlobalLifecycle.ApplySettings(settings)
 
 	const filename = "artifact.bin"
 	const fileSize = int64(64 * 1024)
@@ -260,7 +303,7 @@ func TestProcessDownloads_RoutesBinFilesToCustomCategory(t *testing.T) {
 	)
 	defer server.Close()
 
-	count := processDownloads([]string{server.URL() + "/" + filename}, defaultDir, 0)
+	count := processDownloads([]string{server.URL() + "/" + filename}, "", 0)
 	if count != 1 {
 		t.Fatalf("expected 1 successful add, got %d", count)
 	}
@@ -276,7 +319,7 @@ func TestProcessDownloads_RoutesBinFilesToCustomCategory(t *testing.T) {
 				t.Fatalf("expected no file in default dir, stat err: %v", err)
 			}
 
-			entries, err := state.ListAllDownloads()
+			entries, err := store.ListAllDownloads()
 			if err != nil {
 				t.Fatalf("failed to list downloads: %v", err)
 			}
@@ -295,7 +338,7 @@ func TestProcessDownloads_RoutesBinFilesToCustomCategory(t *testing.T) {
 	if _, err := os.Stat(unexpectedPath); !os.IsNotExist(err) {
 		t.Fatalf("expected no file in default dir, stat err: %v", err)
 	}
-	entries, err := state.ListAllDownloads()
+	entries, err := store.ListAllDownloads()
 	if err != nil {
 		t.Fatalf("failed to list downloads: %v", err)
 	}
@@ -306,9 +349,24 @@ func TestProcessDownloads_UsesLatestSavedCategorySettings(t *testing.T) {
 	setupIsolatedCmdState(t)
 	GlobalLifecycle = nil
 	GlobalLifecycleCleanup = nil
-	GlobalProgressCh = make(chan any, 32)
-	GlobalPool = download.NewWorkerPool(GlobalProgressCh, 1)
-	GlobalService = core.NewLocalDownloadServiceWithInput(GlobalPool, GlobalProgressCh)
+	eventBus := orchestrator.NewEventBus()
+	t.Cleanup(func() { eventBus.Shutdown() })
+	GlobalProgressCh = eventBus.InputCh
+	if GlobalPool != nil {
+		GlobalPool.GracefulShutdown()
+	}
+	tmpPool := scheduler.New(GlobalProgressCh, 1)
+	t.Cleanup(func() {
+		if tmpPool != nil {
+			tmpPool.GracefulShutdown()
+		}
+	})
+	GlobalPool = tmpPool
+	getAll := func() []types.DownloadRecord { return GlobalPool.GetAll() }
+	tmpLifecycle := orchestrator.NewLifecycleManager(GlobalPool, eventBus, nil, buildActiveDownloadChecker(getAll))
+	t.Cleanup(func() { tmpLifecycle.Shutdown() })
+	GlobalLifecycle = tmpLifecycle
+	GlobalService = service.NewLocalDownloadService(GlobalLifecycle)
 	t.Cleanup(func() {
 		if GlobalLifecycleCleanup != nil {
 			GlobalLifecycleCleanup()
@@ -367,7 +425,7 @@ func TestProcessDownloads_UsesLatestSavedCategorySettings(t *testing.T) {
 	)
 	defer server.Close()
 
-	count := processDownloads([]string{server.URL() + "/" + filename}, defaultDir, 0)
+	count := processDownloads([]string{server.URL() + "/" + filename}, "", 0)
 	if count != 1 {
 		t.Fatalf("expected 1 successful add, got %d", count)
 	}
@@ -400,7 +458,7 @@ func TestEnsureLocalLifecycle_ConcurrentInitializationStartsOneStream(t *testing
 	service := &countingLifecycleService{}
 
 	const callers = 12
-	results := make(chan *processing.LifecycleManager, callers)
+	results := make(chan *orchestrator.LifecycleManager, callers)
 	errs := make(chan error, callers)
 
 	var wg sync.WaitGroup
@@ -424,7 +482,7 @@ func TestEnsureLocalLifecycle_ConcurrentInitializationStartsOneStream(t *testing
 		t.Fatalf("ensureLocalLifecycle returned error: %v", err)
 	}
 
-	var first *processing.LifecycleManager
+	var first *orchestrator.LifecycleManager
 	for mgr := range results {
 		if first == nil {
 			first = mgr
@@ -444,6 +502,9 @@ func TestEnsureLocalLifecycle_ConcurrentInitializationStartsOneStream(t *testing
 	if cleanup := takeLifecycleCleanup(); cleanup != nil {
 		cleanup()
 	}
+	if GlobalLifecycle != nil {
+		GlobalLifecycle.Shutdown()
+	}
 	GlobalLifecycle = nil
 }
 
@@ -451,7 +512,16 @@ func TestProcessDownloads_UsesSharedEnqueueContext(t *testing.T) {
 	setupIsolatedCmdState(t)
 	service := &countingLifecycleService{}
 	GlobalService = service
-	GlobalPool = download.NewWorkerPool(nil, 1)
+	if GlobalPool != nil {
+		GlobalPool.GracefulShutdown()
+	}
+	tmpPool := scheduler.New(nil, 1)
+	t.Cleanup(func() {
+		if tmpPool != nil {
+			tmpPool.GracefulShutdown()
+		}
+	})
+	GlobalPool = tmpPool
 	GlobalLifecycleCleanup = nil
 	t.Cleanup(func() {
 		GlobalService = nil
@@ -468,21 +538,19 @@ func TestProcessDownloads_UsesSharedEnqueueContext(t *testing.T) {
 	}))
 	defer server.Close()
 
-	dispatchCalled := false
-	GlobalLifecycle = processing.NewLifecycleManager(
-		func(string, string, string, []string, map[string]string, bool, int64, bool) (string, error) {
-			dispatchCalled = true
-			return "", nil
-		},
-		nil,
-	)
+	eventBus := orchestrator.NewEventBus()
+	t.Cleanup(func() { eventBus.Shutdown() })
+	getAll := func() []types.DownloadRecord { return GlobalPool.GetAll() }
+	tmpLifecycle := orchestrator.NewLifecycleManager(GlobalPool, eventBus, nil, buildActiveDownloadChecker(getAll))
+	t.Cleanup(func() { tmpLifecycle.Shutdown() })
+	GlobalLifecycle = tmpLifecycle
 
 	cancelGlobalEnqueue()
 	count := processDownloads([]string{server.URL + "/shared-context.bin"}, t.TempDir(), 0)
 	if count != 0 {
 		t.Fatalf("count = %d, want 0 after canceled enqueue context", count)
 	}
-	if dispatchCalled {
+	if len(GlobalPool.GetAll()) > 0 {
 		t.Fatal("expected canceled enqueue context to stop before dispatch")
 	}
 	if len(service.logs) == 0 {

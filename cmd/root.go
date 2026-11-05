@@ -15,13 +15,13 @@ import (
 	"time"
 
 	"github.com/msh2050/fluxget/internal/config"
-	"github.com/msh2050/fluxget/internal/core"
-	"github.com/msh2050/fluxget/internal/download"
-	"github.com/msh2050/fluxget/internal/engine/events"
-	"github.com/msh2050/fluxget/internal/engine/state"
-	"github.com/msh2050/fluxget/internal/engine/types"
-	"github.com/msh2050/fluxget/internal/processing"
+	"github.com/msh2050/fluxget/internal/orchestrator"
+	"github.com/msh2050/fluxget/internal/progress"
+	"github.com/msh2050/fluxget/internal/scheduler"
+	"github.com/msh2050/fluxget/internal/service"
+	"github.com/msh2050/fluxget/internal/store"
 	"github.com/msh2050/fluxget/internal/tui"
+	"github.com/msh2050/fluxget/internal/types"
 	"github.com/msh2050/fluxget/internal/utils"
 
 	tea "charm.land/bubbletea/v2"
@@ -60,10 +60,7 @@ func buildInfoSetting(settings []debug.BuildSetting, key string) string {
 	return ""
 }
 
-// activeDownloads tracks in-flight downloads for headless/server exit logic.
-var activeDownloads int32
-
-// pendingEnqueue tracks the number of pending batch enqueues to avoid premature exit
+// pendingEnqueue tracks startup and HTTP enqueues to avoid premature exit.
 var pendingEnqueue int32
 
 var (
@@ -73,14 +70,15 @@ var (
 
 // Globals for Unified Backend
 var (
-	GlobalPool              *download.WorkerPool
-	GlobalProgressCh        chan any
-	GlobalService           core.DownloadService
+	GlobalPool              *scheduler.Scheduler
+	GlobalProgressCh        chan types.DownloadEvent
+	GlobalService           service.DownloadService
 	GlobalLifecycleCleanup  func()
 	serverProgram           *tea.Program
 	startupIntegrityMessage string
-	globalSettings          *config.Settings
-	GlobalLifecycle         *processing.LifecycleManager
+	globalSettings          *config.Settings // Startup snapshot; live settings belong to GlobalService.
+	globalSettingsMu        sync.RWMutex
+	GlobalLifecycle         *orchestrator.LifecycleManager
 	globalLifecycleMu       sync.Mutex
 	globalEnqueueCtx        context.Context
 	globalEnqueueCancel     context.CancelFunc
@@ -90,7 +88,7 @@ var (
 // buildActiveDownloadChecker bridges the lifecycle manager and the worker pool.
 // LifecycleManager has no direct reference to the pool, so we inject this closure
 // at construction time to let it detect file-name collisions with in-flight downloads.
-func buildActiveDownloadChecker(getAll func() []types.DownloadConfig) processing.IsNameActiveFunc {
+func buildActiveDownloadChecker(getAll func() []types.DownloadRecord) orchestrator.IsNameActiveFunc {
 	if getAll == nil {
 		return nil
 	}
@@ -111,11 +109,11 @@ func buildActiveDownloadChecker(getAll func() []types.DownloadConfig) processing
 					existingName = filepath.Base(cfg.DestPath)
 				}
 			}
-			if cfg.State != nil {
-				if stateName := strings.TrimSpace(cfg.State.GetFilename()); stateName != "" {
+			if ps := progress.CfgProgress(&cfg); ps != nil {
+				if stateName := strings.TrimSpace(ps.GetFilename()); stateName != "" {
 					existingName = stateName
 				}
-				if stateDestPath := strings.TrimSpace(cfg.State.GetDestPath()); stateDestPath != "" {
+				if stateDestPath := strings.TrimSpace(ps.GetDestPath()); stateDestPath != "" {
 					existingDir = filepath.Dir(stateDestPath)
 					if existingName == "" {
 						existingName = filepath.Base(stateDestPath)
@@ -133,31 +131,31 @@ func buildActiveDownloadChecker(getAll func() []types.DownloadConfig) processing
 	}
 }
 
-func newLocalLifecycleManager(service core.DownloadService, getAll func() []types.DownloadConfig) *processing.LifecycleManager {
-	var addFunc processing.AddDownloadFunc
-	var addWithIDFunc processing.AddDownloadWithIDFunc
-	if service != nil {
-		addFunc = service.Add
-		addWithIDFunc = service.AddWithID
-	}
-
-	return processing.NewLifecycleManager(addFunc, addWithIDFunc, buildActiveDownloadChecker(getAll))
+func newLocalLifecycleManager(pool *scheduler.Scheduler, eventBus *orchestrator.EventBus, settings *config.Settings, getAll func() []types.DownloadRecord) *orchestrator.LifecycleManager {
+	return orchestrator.NewLifecycleManager(pool, eventBus, settings, buildActiveDownloadChecker(getAll))
 }
 
-func startLifecycleEventWorker(service core.DownloadService, mgr *processing.LifecycleManager) (func(), error) {
+func startLifecycleEventWorker(service service.DownloadService, mgr *orchestrator.LifecycleManager) (func(), error) {
 	if service == nil || mgr == nil {
 		return nil, nil
 	}
 
-	managerStream, managerCleanup, err := service.StreamEvents(context.Background())
+	streamEvents := service.StreamEvents
+	if source, ok := service.(interface {
+		StreamLifecycleEvents(context.Context) (<-chan types.DownloadEvent, func(), error)
+	}); ok {
+		streamEvents = source.StreamLifecycleEvents
+	}
+	managerStream, managerCleanup, err := streamEvents(context.Background())
 	if err != nil {
 		return nil, err
 	}
-	go mgr.StartEventWorker(managerStream)
-	return managerCleanup, nil
+	done := make(chan struct{})
+	go func() { defer close(done); mgr.StartEventWorker(managerStream) }()
+	return func() { managerCleanup(); <-done }, nil
 }
 
-func currentLifecycle() *processing.LifecycleManager {
+func currentLifecycle() *orchestrator.LifecycleManager {
 	globalLifecycleMu.Lock()
 	defer globalLifecycleMu.Unlock()
 	return GlobalLifecycle
@@ -209,14 +207,20 @@ func takeLifecycleCleanup() func() {
 	return cleanup
 }
 
-func currentPoolConfigs() []types.DownloadConfig {
+func setLifecycleCleanupForTest(fn func()) {
+	globalLifecycleMu.Lock()
+	GlobalLifecycleCleanup = fn
+	globalLifecycleMu.Unlock()
+}
+
+func currentPoolConfigs() []types.DownloadRecord {
 	if GlobalPool == nil {
 		return nil
 	}
 	return GlobalPool.GetAll()
 }
 
-func lifecycleForLocalService(service core.DownloadService) (*processing.LifecycleManager, error) {
+func lifecycleForLocalService(service service.DownloadService) (*orchestrator.LifecycleManager, error) {
 	lifecycle := currentLifecycle()
 	if service == nil || GlobalService == nil || service != GlobalService {
 		return lifecycle, nil
@@ -226,31 +230,22 @@ func lifecycleForLocalService(service core.DownloadService) (*processing.Lifecyc
 
 func ensureGlobalLocalServiceAndLifecycle() error {
 	if GlobalService == nil {
-		localService := core.NewLocalDownloadServiceWithInput(GlobalPool, GlobalProgressCh)
-		GlobalService = localService
+		eventBus := orchestrator.NewEventBus()
+		lifecycle := newLocalLifecycleManager(GlobalPool, eventBus, getGlobalSettings(), currentPoolConfigs)
+		localService := service.NewLocalDownloadService(lifecycle)
 
-		lifecycle, err := ensureLocalLifecycle(localService, currentPoolConfigs)
+		globalLifecycleMu.Lock()
+		GlobalLifecycle = lifecycle
+		GlobalService = localService
+		globalLifecycleMu.Unlock()
+
+		cleanup, err := startLifecycleEventWorker(localService, lifecycle)
 		if err != nil {
 			return err
 		}
-
-		lifecycle.SetEngineHooks(processing.EngineHooks{
-			Pause:               GlobalPool.Pause,
-			ExtractPausedConfig: GlobalPool.ExtractPausedConfig,
-			GetStatus:           GlobalPool.GetStatus,
-			AddConfig:           GlobalPool.Add,
-			Cancel:              GlobalPool.Cancel,
-			UpdateURL:           GlobalPool.UpdateURL,
-			PublishEvent:        localService.Publish,
-		})
-
-		localService.SetLifecycleHooks(core.LifecycleHooks{
-			Pause:       lifecycle.Pause,
-			Resume:      lifecycle.Resume,
-			ResumeBatch: lifecycle.ResumeBatch,
-			Cancel:      lifecycle.Cancel,
-			UpdateURL:   lifecycle.UpdateURL,
-		})
+		globalLifecycleMu.Lock()
+		GlobalLifecycleCleanup = cleanup
+		globalLifecycleMu.Unlock()
 	} else {
 		_, err := ensureLocalLifecycle(GlobalService, currentPoolConfigs)
 		return err
@@ -260,7 +255,8 @@ func ensureGlobalLocalServiceAndLifecycle() error {
 
 func publishSystemLog(message string) {
 	if GlobalService != nil {
-		_ = GlobalService.Publish(events.SystemLogMsg{Message: message})
+		_ = GlobalService.Publish(types.DownloadEvent{
+			Type: types.EventSystem, Message: message})
 		return
 	}
 	fmt.Fprintln(os.Stderr, message)
@@ -271,25 +267,26 @@ func recordPreflightDownloadError(url, outPath string, err error) {
 		return
 	}
 
-	filename := strings.TrimSpace(processing.InferFilenameFromURL(url))
+	filename := strings.TrimSpace(orchestrator.InferFilenameFromURL(url))
 	destPath := ""
 	if filename != "" && strings.TrimSpace(outPath) != "" {
 		destPath = filepath.Join(outPath, filename)
 	}
 
-	entry := types.DownloadEntry{
+	entry := types.DownloadRecord{
 		ID:       uuid.New().String(),
 		URL:      url,
-		URLHash:  state.URLHash(url),
+		URLHash:  store.URLHash(url),
 		DestPath: destPath,
 		Filename: filename,
 		Status:   "error",
 	}
-	if addErr := state.AddToMasterList(entry); addErr != nil {
-		utils.Debug("Failed to persist preflight download error for %s: %v", url, addErr)
+	if addErr := store.AddToMasterList(entry); addErr != nil {
+		utils.Debug("Failed to persist preflight download error for host %s: %v", utils.URLHostForLog(url), addErr)
 	}
 	if GlobalService != nil {
-		_ = GlobalService.Publish(events.DownloadErrorMsg{
+		_ = GlobalService.Publish(types.DownloadEvent{
+			Type:       types.EventError,
 			DownloadID: entry.ID,
 			Filename:   filename,
 			DestPath:   destPath,
@@ -298,12 +295,13 @@ func recordPreflightDownloadError(url, outPath string, err error) {
 	}
 }
 
-func ensureLocalLifecycle(service core.DownloadService, getAll func() []types.DownloadConfig) (*processing.LifecycleManager, error) {
+func ensureLocalLifecycle(service service.DownloadService, getAll func() []types.DownloadRecord) (*orchestrator.LifecycleManager, error) {
 	globalLifecycleMu.Lock()
 	defer globalLifecycleMu.Unlock()
 
 	if GlobalLifecycle == nil {
-		GlobalLifecycle = newLocalLifecycleManager(service, getAll)
+		eventBus := orchestrator.NewEventBus()
+		GlobalLifecycle = newLocalLifecycleManager(GlobalPool, eventBus, getGlobalSettings(), getAll)
 	}
 	if GlobalLifecycleCleanup == nil {
 		cleanup, err := startLifecycleEventWorker(service, GlobalLifecycle)
@@ -321,10 +319,12 @@ func isExplicitOutputPath(outPath, defaultDir string) bool {
 
 type rootRunOptions struct {
 	portFlag     int
+	portSet      bool
 	batchFile    string
 	outputDir    string
 	noResume     bool
 	exitWhenDone bool
+	noServer     bool
 }
 
 func readRootRunOptions(cmd *cobra.Command) rootRunOptions {
@@ -333,13 +333,16 @@ func readRootRunOptions(cmd *cobra.Command) rootRunOptions {
 	outputDir, _ := cmd.Flags().GetString("output")
 	noResume, _ := cmd.Flags().GetBool("no-resume")
 	exitWhenDone, _ := cmd.Flags().GetBool("exit-when-done")
+	noServer, _ := cmd.Flags().GetBool("no-server")
 
 	return rootRunOptions{
 		portFlag:     portFlag,
+		portSet:      cmd.Flags().Changed("port"),
 		batchFile:    batchFile,
 		outputDir:    outputDir,
 		noResume:     noResume,
 		exitWhenDone: exitWhenDone,
+		noServer:     noServer,
 	}
 }
 
@@ -360,7 +363,7 @@ func maybeRunRemoteTUI(cmd *cobra.Command, args []string) (bool, error) {
 }
 
 func acquireRootInstanceLock() (func(), error) {
-	isMaster, err := AcquireLock()
+	lock, isMaster, err := TryAcquireInstanceLock(resolveRuntimeDir())
 	if err != nil {
 		return nil, fmt.Errorf("error acquiring lock: %w", err)
 	}
@@ -370,14 +373,14 @@ func acquireRootInstanceLock() (func(), error) {
 	}
 
 	return func() {
-		if err := ReleaseLock(); err != nil {
+		if err := lock.Release(); err != nil {
 			utils.Debug("Error releasing lock: %v", err)
 		}
 	}, nil
 }
 
 func initializeRootLocalRuntime() error {
-	if err := initializeGlobalState(); err != nil {
+	if err := initializeLocalEngine(); err != nil {
 		return err
 	}
 	resetGlobalEnqueueContext()
@@ -403,6 +406,16 @@ func startRootHTTPServer(opts rootRunOptions) (int, func(), error) {
 	return port, func() {
 		removeActivePort()
 	}, nil
+}
+
+func maybeStartRootHTTPServer(opts rootRunOptions) (int, func(), error) {
+	if opts.noServer {
+		if opts.portSet {
+			return 0, nil, fmt.Errorf("--port cannot be used with --no-server")
+		}
+		return 0, func() {}, nil
+	}
+	return startRootHTTPServer(opts)
 }
 
 func queueInitialRootDownloads(args []string, opts rootRunOptions) {
@@ -437,17 +450,43 @@ var rootCmd = &cobra.Command{
 	Args:          cobra.ArbitraryArgs,
 	SilenceErrors: true, //errors are printed in main.go this prevents double printing
 	SilenceUsage:  true, // prevent usage text from being printed on every error
-	PersistentPreRun: func(cmd *cobra.Command, args []string) {
-		GlobalProgressCh = make(chan any, 100)
-		globalSettings = getSettings()
-		applyEngineSettings(globalSettings)
-		GlobalPool = download.NewWorkerPool(GlobalProgressCh, config.Resolve[int](globalSettings.Network.MaxConcurrentDownloads))
-	},
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if reset, _ := cmd.Flags().GetBool("reset-settings"); reset {
+			err1 := utils.RemoveFile(config.GetSettingsPath())
+			err2 := utils.RemoveFile(config.GetKeyMapConfigPath())
+			if err1 != nil || err2 != nil {
+				fmt.Printf("Error resetting settings: %v, %v\n", err1, err2)
+			} else {
+				fmt.Println("Settings and keybindings have been reset to defaults.")
+			}
+		}
+
 		if ranRemote, err := maybeRunRemoteTUI(cmd, args); err != nil {
 			return err
 		} else if ranRemote {
 			return nil
+		}
+
+		if checkUserServiceRunning() {
+			return fmt.Errorf("the Surge user service is already running; use 'surge connect' or stop the service first")
+		}
+
+		if len(args) > 0 {
+			var validFound bool
+			for _, arg := range args {
+				urlArg, _ := ParseURLArg(arg)
+				if urlArg == "" {
+					continue
+				}
+				if _, err := ValidateAndNormalizeURL(urlArg); err != nil {
+					cmd.PrintErrf("Warning: skipping invalid URL %q: %v\n", urlArg, err)
+					continue
+				}
+				validFound = true
+			}
+			if !validFound {
+				return fmt.Errorf("no valid URLs provided in arguments")
+			}
 		}
 
 		releaseLock, err := acquireRootInstanceLock()
@@ -464,24 +503,24 @@ var rootCmd = &cobra.Command{
 		}
 
 		opts := readRootRunOptions(cmd)
-		port, cleanup, err := startRootHTTPServer(opts)
+		port, cleanup, err := maybeStartRootHTTPServer(opts)
 		if err != nil {
 			return err
 		}
 		defer cleanup()
 
 		queueInitialRootDownloads(args, opts)
-		return startTUI(port, opts.exitWhenDone, opts.noResume)
+		return startTUI(port, opts.exitWhenDone, opts.noResume, releaseLock)
 	},
 }
 
 // startTUI initializes and runs the TUI program
-func startTUI(port int, exitWhenDone bool, noResume bool) error {
+func startTUI(port int, exitWhenDone bool, noResume bool, releaseLock func()) error {
 	tui.InitializeTUI()
 	// Initialize TUI
-	// GlobalService and GlobalProgressCh are already initialized in PersistentPreRun or Run
+	// The local runtime was initialized by the owning command before starting the TUI.
 
-	m := tui.InitialRootModel(port, Version, GlobalService, currentLifecycle(), noResume, Commit)
+	m := tui.InitialRootModel(port, Version, GlobalService, currentLifecycle(), getSettings(), noResume, Commit)
 	m = m.WithEnqueueContext(currentEnqueueContext(), currentEnqueueCancel())
 
 	configureServiceUI(&m)
@@ -511,7 +550,8 @@ func startTUI(port int, exitWhenDone bool, noResume bool) error {
 	}()
 
 	if startupIntegrityMessage != "" && GlobalService != nil {
-		_ = GlobalService.Publish(events.SystemLogMsg{
+		_ = GlobalService.Publish(types.DownloadEvent{
+			Type:    types.EventSystem,
 			Message: startupIntegrityMessage,
 		})
 		startupIntegrityMessage = ""
@@ -546,6 +586,8 @@ func startTUI(port int, exitWhenDone bool, noResume bool) error {
 		case sig := <-sigChan:
 			_ = executeGlobalShutdown(fmt.Sprintf("tui signal: %s", sig))
 			p.Send(tea.Quit())
+		case <-shutDownRequested:
+			p.Send(tea.Quit())
 		case <-stopSignalListener:
 			return
 		}
@@ -561,20 +603,22 @@ func startTUI(port int, exitWhenDone bool, noResume bool) error {
 
 	// Check if restart was requested (e.g. from settings changed)
 	if m, ok := finalModel.(tui.RootModel); ok && m.RestartRequested {
-		return performRestart()
+		return performRestart(releaseLock)
 	}
 
 	return nil
 }
 
-func performRestart() error {
+func performRestart(releaseLock func()) error {
 	executable, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("could not get executable path: %w", err)
 	}
 
 	if runtime.GOOS == "windows" {
-		_ = ReleaseLock()
+		if releaseLock != nil {
+			releaseLock()
+		}
 	}
 
 	return utils.Run(executable, os.Args, os.Environ())
@@ -596,6 +640,8 @@ func init() {
 	rootCmd.Flags().StringP("output", "o", "", "Output directory (defaults to current working directory)")
 	rootCmd.Flags().Bool("no-resume", false, "Do not auto-resume paused downloads on startup")
 	rootCmd.Flags().Bool("exit-when-done", false, "Exit when all downloads complete")
+	rootCmd.Flags().Bool("no-server", false, "Do not start the HTTP API server (CLI subcommands will not work)")
+	rootCmd.Flags().Bool("reset-settings", false, "Reset settings and keybindings to defaults on startup")
 	rootCmd.SetVersionTemplate("Surge v{{.Version}}\n")
 	rootCmd.Version = Version
 }

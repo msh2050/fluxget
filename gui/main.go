@@ -25,7 +25,7 @@ var windowIcon []byte
 var apiPaths = []string{
 	"/events", "/list", "/history", "/pause", "/resume",
 	"/delete", "/download", "/stream", "/health", "/open-file", "/open-folder",
-	"/update-url", "/settings",
+	"/update-url", "/settings", "/gui/settings", "/ytdlp", "/ui",
 }
 
 func backendProxy() func(http.Handler) http.Handler {

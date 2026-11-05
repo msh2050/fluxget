@@ -1,22 +1,21 @@
 package tui
 
 import (
-	"errors"
+	"strings"
 
 	"charm.land/bubbles/v2/key"
-	"charm.land/bubbles/v2/list"
 	tea "charm.land/bubbletea/v2"
 	"github.com/msh2050/fluxget/internal/clipboard"
 	"github.com/msh2050/fluxget/internal/config"
-	"github.com/msh2050/fluxget/internal/engine/types"
+	"github.com/msh2050/fluxget/internal/types"
+	"github.com/msh2050/fluxget/internal/utils"
 )
 
 func (m RootModel) updateDashboard(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-
 	// Handle search input FIRST when active (intercepts ALL keys)
 	if m.searchActive {
 		switch msg.String() {
-		case "esc":
+		case "esc", "Q", "ctrl+c":
 			// Cancel search and clear query
 			m.searchActive = false
 			m.searchInput.Blur()
@@ -39,25 +38,24 @@ func (m RootModel) updateDashboard(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	// Toggle search with F
-	if key.Matches(msg, m.keys.Dashboard.Search) {
-		if m.searchQuery != "" {
-			// Clear existing search
-			m.searchQuery = ""
-			m.searchInput.SetValue("")
-			m.UpdateListItems()
-		} else {
-			// Start new search
-			m.searchActive = true
-			m.searchInput.Focus()
-		}
+	// Focus search.
+	if msg.String() == "/" || key.Matches(msg, m.keys.Dashboard.Search) {
+		m.searchActive = true
+		m.searchInput.Focus()
+		return m, nil
+	}
+
+	if d := m.GetSelectedDownload(); d != nil && d.moving && key.Matches(msg,
+		m.keys.Dashboard.Delete, m.keys.Dashboard.PurgeFile, m.keys.Dashboard.Pause,
+		m.keys.Dashboard.Refresh, m.keys.Dashboard.AssignCategory) {
+		m.addStyledLogEntry(logError, types.ErrMoving.Error())
 		return m, nil
 	}
 
 	// Tab switching
 	pinnedGuard := func() bool {
 		if m.pinnedTab != -1 {
-			m.addLogEntry(LogStyleError.Render("\u25c6 Tab is pinned \u2014 press t to unpin"))
+			m.addStyledLogEntry(logError, "\u25c6 Tab is pinned \u2014 press "+m.keys.Dashboard.PinTab.Help().Key+" to unpin")
 			return true
 		}
 		return false
@@ -70,6 +68,12 @@ func (m RootModel) updateDashboard(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	if key.Matches(msg, m.keys.Dashboard.TabAll) {
+		if pinnedGuard() {
+			return m, nil
+		}
+		return switchTab(TabAll)
+	}
 	if key.Matches(msg, m.keys.Dashboard.TabQueued) {
 		if pinnedGuard() {
 			return m, nil
@@ -98,6 +102,7 @@ func (m RootModel) updateDashboard(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	// Add download
 	if key.Matches(msg, m.keys.Dashboard.Add) {
 		m.state = InputState
+		m.hideMirrors = false
 		m.focusedInput = 0
 		m.inputs[0].Focus()
 		// Use default download dir from settings
@@ -111,6 +116,7 @@ func (m RootModel) updateDashboard(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.inputs[3].Blur()
 		m.inputs[1].SetValue("") // Clear mirrors
 		m.inputs[1].Blur()
+		m.pendingHeaders = nil // clear stale headers
 
 		url := ""
 		if config.Resolve[bool](m.Settings.General.ClipboardMonitor) {
@@ -120,12 +126,21 @@ func (m RootModel) updateDashboard(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// Add from clipboard
+	if key.Matches(msg, m.keys.Dashboard.AddFromClipboard) {
+		text, err := clipboard.Read()
+		if err == nil && text != "" {
+			return m.handleClipboardPaste(text)
+		}
+		return m, nil
+	}
+
 	// Next / Prev Tab
 	if key.Matches(msg, m.keys.Dashboard.NextTab) {
 		if pinnedGuard() {
 			return m, nil
 		}
-		m.activeTab = (m.activeTab + 1) % 3
+		m.activeTab = (m.activeTab + 1) % dashboardTabCount
 		m.ManualTabSwitch = true
 		m.UpdateListItems()
 		return m, nil
@@ -134,7 +149,7 @@ func (m RootModel) updateDashboard(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		if pinnedGuard() {
 			return m, nil
 		}
-		m.activeTab = (m.activeTab + 2) % 3 // +2 mod 3 = prev
+		m.activeTab = (m.activeTab + dashboardTabCount - 1) % dashboardTabCount
 		m.ManualTabSwitch = true
 		m.UpdateListItems()
 		return m, nil
@@ -142,28 +157,31 @@ func (m RootModel) updateDashboard(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 
 	// Delete download
 	if key.Matches(msg, m.keys.Dashboard.Delete) {
-		if m.list.FilterState() == list.Filtering {
-			// Fall through
-		} else if d := m.GetSelectedDownload(); d != nil {
-			if m.Service == nil {
-				m.addLogEntry(LogStyleError.Render("✖ Service unavailable"))
+		if d := m.GetSelectedDownload(); d != nil {
+			if !d.done || d.err != nil {
+				m.removeTargetID = d.ID
+				m.quitConfirmFocused = 1 // default focus on "Cancel"
+				m.state = RemoveConfirmState
 				return m, nil
 			}
-			targetID := d.ID
+			return m.deleteDownload(d.ID)
+		}
+	}
 
-			// Call Service Delete
-			if err := m.Service.Delete(targetID); err != nil {
-				// If the download is not found, it's already gone from the engine/DB.
-				// We still remove it from our local list to avoid it being "stuck".
-				if errors.Is(err, types.ErrNotFound) {
-					m.removeDownloadByID(targetID)
-				} else {
-					m.addLogEntry(LogStyleError.Render("✖ Delete failed: " + err.Error()))
-				}
-			} else {
-				m.removeDownloadByID(targetID)
+	// Delete download + file from disk (purge)
+	if key.Matches(msg, m.keys.Dashboard.PurgeFile) {
+		if d := m.GetSelectedDownload(); d != nil {
+			if !d.done || d.err != nil {
+				m.addStyledLogEntry(logError, "\u2716 Purge is only for successfully completed downloads")
+				return m, nil
 			}
-			m.UpdateListItems()
+			if m.Service == nil {
+				m.addStyledLogEntry(logError, "\u2716 Service unavailable")
+				return m, nil
+			}
+			m.purgeTargetID = d.ID
+			m.quitConfirmFocused = 1 // default focus on "Cancel"
+			m.state = PurgeConfirmState
 			return m, nil
 		}
 	}
@@ -172,27 +190,32 @@ func (m RootModel) updateDashboard(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if key.Matches(msg, m.keys.Dashboard.Pause) {
 		if d := m.GetSelectedDownload(); d != nil {
 			if m.Service == nil {
-				m.addLogEntry(LogStyleError.Render("✖ Service unavailable"))
+				m.addStyledLogEntry(logError, "\u2716 Service unavailable")
 				return m, nil
 			}
-			if !d.done {
-				if d.paused {
-					// Resume
-					d.paused = false
-					d.resuming = true
-					if err := m.Service.Resume(d.ID); err != nil {
-						m.addLogEntry(LogStyleError.Render("✖ Resume failed: " + err.Error()))
-						d.paused = true // Revert
-						d.resuming = false
-					}
+			if d.paused || d.err != nil {
+				// Resume paused and errored downloads; keep their state on failure.
+				if err := m.Service.Resume(d.ID); err != nil {
+					m.addStyledLogEntry(logError, "\u2716 Resume failed: "+err.Error())
 				} else {
-					// Pause
-					if err := m.Service.Pause(d.ID); err != nil {
-						m.addLogEntry(LogStyleError.Render("✖ Pause failed: " + err.Error()))
-					} else {
-						d.resuming = false
-						d.pausing = true
-					}
+					d.done = false
+					d.err = nil
+					d.paused = false
+					d.pausing = false
+					d.resuming = true
+					d.started = false
+					d.Speed = 0
+					d.Connections = 0
+					m.UpdateListItems()
+					return m, m.spinner.Tick
+				}
+			} else if !d.done {
+				// Pause an active download; completed downloads remain untouched.
+				if err := m.Service.Pause(d.ID); err != nil {
+					m.addStyledLogEntry(logError, "\u2716 Pause failed: "+err.Error())
+				} else {
+					d.resuming = false
+					d.pausing = true
 				}
 			}
 		}
@@ -201,6 +224,27 @@ func (m RootModel) updateDashboard(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	}
 
 	// Open file
+
+	if key.Matches(msg, m.keys.Dashboard.CopyID) {
+		if d := m.GetSelectedDownload(); d != nil && d.ID != "" {
+			if err := clipboard.Write(d.ID); err != nil {
+				m.addStyledLogEntry(logError, "Copy ID failed: "+err.Error())
+			} else {
+				m.addStyledLogEntry(logComplete, "ID copied")
+			}
+		}
+		return m, nil
+	}
+	if key.Matches(msg, m.keys.Dashboard.CopyURL) {
+		if d := m.GetSelectedDownload(); d != nil && d.URL != "" {
+			if err := clipboard.Write(d.URL); err != nil {
+				m.addStyledLogEntry(logError, "Copy URL failed: "+err.Error())
+			} else {
+				m.addStyledLogEntry(logComplete, "URL copied")
+			}
+		}
+		return m, nil
+	}
 	if key.Matches(msg, m.keys.Dashboard.OpenFile) {
 		if d := m.GetSelectedDownload(); d != nil {
 			canOpen := d.done || (config.Resolve[bool](m.Settings.Network.SequentialDownload) && !d.paused && d.Downloaded > 0)
@@ -215,11 +259,25 @@ func (m RootModel) updateDashboard(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// Open folder
+	if key.Matches(msg, m.keys.Dashboard.OpenFolder) {
+		if d := m.GetSelectedDownload(); d != nil {
+			if d.Destination != "" {
+				filePath := d.Destination
+				if !d.done {
+					filePath = d.Destination + types.IncompleteSuffix
+				}
+				_ = utils.OpenContainingFolder(filePath)
+			}
+		}
+		return m, nil
+	}
+
 	// Refresh URL
 	if key.Matches(msg, m.keys.Dashboard.Refresh) {
 		if d := m.GetSelectedDownload(); d != nil {
 			if m.Service == nil {
-				m.addLogEntry(LogStyleError.Render("✖ Service unavailable"))
+				m.addStyledLogEntry(logError, "\u2716 Service unavailable")
 				return m, nil
 			}
 			// Only allow refresh if download is paused or errored
@@ -228,7 +286,7 @@ func (m RootModel) updateDashboard(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 				m.urlUpdateInput.SetValue(d.URL)
 				m.urlUpdateInput.Focus()
 			} else {
-				m.addLogEntry(LogStyleError.Render("✖ Pause download before refreshing URL"))
+				m.addStyledLogEntry(logError, "\u2716 Pause download before refreshing URL")
 			}
 		}
 		return m, nil
@@ -254,53 +312,67 @@ func (m RootModel) updateDashboard(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	}
 
 	if key.Matches(msg, m.keys.Dashboard.Settings) {
+		if err := m.refreshSettings(); err != nil {
+			m.addLogEntry("Failed to retrieve settings: " + err.Error())
+			return m, nil
+		}
+		m.clearSettingsSearch()
 		m.snapshotSettings()
 		m.state = SettingsState
 		m.SettingsActiveTab = 0
 		m.SettingsSelectedRow = 0
 		m.SettingsIsEditing = false
+		m.SettingsFocusedPane = 1
+		return m, nil
+	}
+
+	if key.Matches(msg, m.keys.Dashboard.SpeedLimits) {
+		if err := m.refreshSettings(); err != nil {
+			m.addLogEntry("Failed to retrieve settings: " + err.Error())
+			return m, nil
+		}
+		m.snapshotSettings()
+		m.state = SpeedLimitsState
+		m.speedLimitsCursor = 0
+		m.speedLimitsIsEditing = false
+		m.SettingsInput.SetValue("")
 		return m, nil
 	}
 
 	if key.Matches(msg, m.keys.Dashboard.CategoryFilter) {
+		m.categoryPickerAssign = false
+		m.categoryPickerTarget = ""
 		if !config.Resolve[bool](m.Settings.Categories.CategoryEnabled) || len(m.Settings.Categories.Categories) == 0 {
-			if m.categoryFilter != "" {
-				m.categoryFilter = ""
-				m.addLogEntry(LogStyleStarted.Render("📂 Filter: All"))
-				m.UpdateListItems()
-				return m, nil
-			}
-			m.addLogEntry(LogStyleError.Render("✖ Enable categories in Settings first"))
+			m.addStyledLogEntry(logError, "\u2716 Enable categories in Settings first")
 			return m, nil
 		}
-		names := config.CategoryNames(m.Settings.Categories.Categories)
-		cycle := append([]string{""}, names...)
-		cycle = append(cycle, "Uncategorized")
-		current := 0
-		for i, n := range cycle {
-			if n == m.categoryFilter {
-				current = i
-				break
-			}
+		m.categoryPickerCursor = m.categoryFilterPickerCursor()
+		m.state = CategoryPickerState
+		return m, nil
+	}
+	if key.Matches(msg, m.keys.Dashboard.AssignCategory) && m.GetSelectedDownload() != nil {
+		d := m.GetSelectedDownload()
+		m.categoryPickerAssign = true
+		if !config.Resolve[bool](m.Settings.Categories.CategoryEnabled) || len(m.Settings.Categories.Categories) == 0 {
+			m.addStyledLogEntry(logError, "\u2716 Enable categories in Settings first")
+			return m, nil
 		}
-		m.categoryFilter = cycle[(current+1)%len(cycle)]
-		label := m.categoryFilter
-		if label == "" {
-			label = "All"
-		}
-		m.addLogEntry(LogStyleStarted.Render("📂 Filter: " + label))
-		m.UpdateListItems()
+		m.categoryPickerTarget = d.ID
+		m.categoryPickerCursor = 0
+		m.state = CategoryPickerState
 		return m, nil
 	}
 
 	if key.Matches(msg, m.keys.Dashboard.PinTab) {
 		if m.pinnedTab == m.activeTab {
 			m.pinnedTab = -1
-			m.addLogEntry(LogStyleStarted.Render("\u25c6 Tab Unpinned"))
+			m.addStyledLogEntry(logStarted, "\u25c6 Tab Unpinned")
 		} else {
 			m.pinnedTab = m.activeTab
 			var tabName string
 			switch m.activeTab {
+			case TabAll:
+				tabName = "All"
 			case TabActive:
 				tabName = "Active"
 			case TabDone:
@@ -308,7 +380,7 @@ func (m RootModel) updateDashboard(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			default:
 				tabName = "Queued"
 			}
-			m.addLogEntry(LogStyleStarted.Render("\u25c6 Tab Pinned: " + tabName))
+			m.addStyledLogEntry(logStarted, "\u25c6 Tab Pinned: "+tabName)
 		}
 		return m, nil
 	}
@@ -354,4 +426,57 @@ func (m RootModel) updateDashboard(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.list, cmd = m.list.Update(msg)
 	return m, cmd
+}
+
+func (m RootModel) handleClipboardPaste(text string) (tea.Model, tea.Cmd) {
+	url, headers := clipboard.ParseCurl(text)
+	if url == "" {
+		if strings.HasPrefix(strings.TrimSpace(text), "http") {
+			url = strings.TrimSpace(text)
+		} else {
+			url = clipboard.ReadURL()
+		}
+		if url == "" {
+			return m, nil
+		}
+		m.pendingHeaders = nil // clear stale headers
+		m.state = InputState
+		m.hideMirrors = false
+		m.focusedInput = 0
+		m.inputs[0].Focus()
+
+		defaultDir := config.Resolve[string](m.Settings.General.DefaultDownloadDir)
+		if defaultDir == "" {
+			defaultDir = "."
+		}
+		m.inputs[2].SetValue(defaultDir)
+		m.inputs[2].Blur()
+		m.inputs[3].SetValue("")
+		m.inputs[3].Blur()
+		m.inputs[1].SetValue("") // Clear mirrors
+		m.inputs[1].Blur()
+		m.inputs[0].SetValue(url)
+		return m, nil
+	} else {
+		defaultDir := config.Resolve[string](m.Settings.General.DefaultDownloadDir)
+		if defaultDir == "" {
+			defaultDir = "."
+		}
+
+		m.pendingHeaders = headers
+		m.state = InputState
+		m.hideMirrors = true
+		m.focusedInput = 0
+		m.inputs[0].Focus()
+
+		m.inputs[2].SetValue(defaultDir)
+		m.inputs[2].Blur()
+		m.inputs[3].SetValue("")
+		m.inputs[3].Blur()
+		m.inputs[1].SetValue("") // Clear mirrors
+		m.inputs[1].Blur()
+		m.inputs[0].SetValue(url)
+
+		return m, nil
+	}
 }

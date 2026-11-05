@@ -49,7 +49,7 @@ func InitTray(app *App) {
 	onReady := func() {
 		systray.SetIcon(trayIcon)
 		systray.SetTitle("FluxGet")
-		systray.SetTooltip("FluxGet — download manager")
+		systray.SetTooltip("FluxGet \u2014 download manager")
 
 		summary := systray.AddMenuItem("No active downloads", "")
 		summary.Disable()
@@ -62,9 +62,9 @@ func InitTray(app *App) {
 			parent := systray.AddMenuItem("", "")
 			s := &traySlot{
 				parent: parent,
-				pause:  parent.AddSubMenuItem("⏸  Pause", "Pause this download"),
-				resume: parent.AddSubMenuItem("▶  Resume", "Resume this download"),
-				cancel: parent.AddSubMenuItem("✕  Cancel", "Remove this download"),
+				pause:  parent.AddSubMenuItem("\u23F8  Pause", "Pause this download"),
+				resume: parent.AddSubMenuItem("\u25B6  Resume", "Resume this download"),
+				cancel: parent.AddSubMenuItem("\u2715  Cancel", "Remove this download"),
 			}
 			parent.Hide()
 			slots[i] = s
@@ -169,7 +169,7 @@ func refreshTray(summary *systray.MenuItem, slots []*traySlot) {
 func trayLabel(d trayStatus) string {
 	name := d.Filename
 	if len(name) > 32 {
-		name = name[:31] + "…"
+		name = name[:31] + "\u2026"
 	}
 	var b strings.Builder
 	b.WriteString(name)
@@ -179,12 +179,12 @@ func trayLabel(d trayStatus) string {
 		b.WriteString("  (queued)")
 	}
 	if d.TotalSize > 0 {
-		fmt.Fprintf(&b, " — %.0f%% · %s/%s", d.Progress*100, fmtBytes(d.Downloaded), fmtBytes(d.TotalSize))
+		fmt.Fprintf(&b, " \u2014 %.0f%% \u00B7 %s/%s", d.Progress*100, fmtBytes(d.Downloaded), fmtBytes(d.TotalSize))
 	} else if d.Downloaded > 0 {
-		fmt.Fprintf(&b, " — %s", fmtBytes(d.Downloaded))
+		fmt.Fprintf(&b, " \u2014 %s", fmtBytes(d.Downloaded))
 	}
 	if d.Status == "downloading" && d.Speed > 0 {
-		fmt.Fprintf(&b, "  ↓ %s/s", fmtBytes(int64(d.Speed)))
+		fmt.Fprintf(&b, "  \u2193 %s/s", fmtBytes(int64(d.Speed)))
 	}
 	return b.String()
 }

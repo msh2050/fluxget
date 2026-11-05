@@ -43,6 +43,7 @@ html, body, #app {
   width: 360px;
   height: 540px;
   overflow: hidden;
+  color-scheme: dark;
 }
 
 body {
@@ -322,6 +323,60 @@ body {
 @keyframes refresh-spin {
   to { transform: rotate(360deg); }
 }
+
+/* === Clear Buttons (History tab header) === */
+.clear-btn {
+  flex: 0 0 32px;
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  background: var(--bg-base);
+  color: rgba(228, 228, 235, 0.65);
+  cursor: pointer;
+  transition: all 0.18s ease;
+}
+
+.clear-btn:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+
+.clear-btn:hover:not(:disabled).completed {
+  color: var(--success);
+  border-color: rgba(74, 222, 128, 0.4);
+  background: rgba(74, 222, 128, 0.08);
+  transform: translateY(-1px);
+}
+
+.clear-btn:hover:not(:disabled).failed {
+  color: var(--error);
+  border-color: rgba(248, 113, 113, 0.4);
+  background: rgba(248, 113, 113, 0.08);
+  transform: translateY(-1px);
+}
+
+.clear-btn:active:not(:disabled) {
+  transform: translateY(0);
+}
+
+.clear-btn.clearing {
+  opacity: 0.6;
+  animation: clear-pulse 0.9s ease-in-out infinite;
+}
+
+.clear-icon {
+  width: 14px;
+  height: 14px;
+}
+
+@keyframes clear-pulse {
+  0%, 100% { opacity: 0.6; }
+  50% { opacity: 0.3; }
+}
+
 
 .view-tab {
   flex: 1;
@@ -802,7 +857,8 @@ body {
   gap: 6px;
 }
 
-.auth-input input {
+.auth-input input,
+.auth-input select {
   flex: 1;
   min-width: 0;
   height: 28px;
@@ -812,6 +868,16 @@ body {
   background: var(--bg-elevated);
   color: var(--text-primary);
   font-size: 12px;
+}
+
+.auth-input select {
+  cursor: pointer;
+  outline: none;
+}
+
+.auth-input select:focus,
+.auth-input input:focus {
+  border-color: var(--accent-primary);
 }
 
 .auth-input button {

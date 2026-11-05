@@ -11,12 +11,13 @@ import (
 	"net/http"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/msh2050/fluxget/internal/config"
-	"github.com/msh2050/fluxget/internal/core"
-	"github.com/msh2050/fluxget/internal/engine/events"
+	downloadservice "github.com/msh2050/fluxget/internal/service"
+	"github.com/msh2050/fluxget/internal/types"
 	"github.com/msh2050/fluxget/internal/stream"
 	"github.com/msh2050/fluxget/internal/utils"
 	"github.com/msh2050/fluxget/internal/webui"
@@ -29,21 +30,163 @@ var (
 	ErrNoDestinationPath  = errors.New("download has no destination path")
 )
 
-func registerHTTPRoutes(mux *http.ServeMux, port int, defaultOutputDir string, service core.DownloadService) {
-	mux.HandleFunc("/ytdlp", func(w http.ResponseWriter, r *http.Request) {
-		handleYtDlp(w, r, defaultOutputDir, service)
-	})
+type rateLimitSettingsService interface {
+	SetGlobalRateLimit(rate int64) error
+	SetDefaultRateLimit(rate int64) error
+}
 
+type ResumeBatchRequest struct {
+	IDs []string `json:"ids"`
+}
+
+type downloadActionResult struct {
+	ID    string `json:"id"`
+	Error string `json:"error,omitempty"`
+}
+
+func registerHTTPRoutes(mux *http.ServeMux, port int, defaultOutputDir string, service downloadservice.DownloadService) {
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSONResponse(w, http.StatusOK, map[string]interface{}{
 			"status":  "ok",
 			"port":    port,
+			"mode":    activeServerMode,
 			"version": Version,
 			"commit":  Commit,
 		})
 	})
 
 	mux.HandleFunc("/events", eventsHandler(service))
+
+	// ── FluxGet routes ────────────────────────────────────────────────────────
+	// POST /stream — native HLS/DASH engine (ffmpeg mux) with yt-dlp fallback
+	mux.HandleFunc("/stream", func(w http.ResponseWriter, r *http.Request) {
+		handleStream(w, r, defaultOutputDir, service)
+	})
+	// POST /ytdlp — explicit yt-dlp download
+	mux.HandleFunc("/ytdlp", func(w http.ResponseWriter, r *http.Request) {
+		handleYtDlp(w, r, defaultOutputDir, service)
+	})
+	// GET /ui — web dashboard
+	mux.Handle("/ui", webui.Handler())
+	mux.Handle("/ui/", webui.Handler())
+	// GET/POST /gui/settings — flat settings view used by the desktop GUI and web UI
+	mux.HandleFunc("/gui/settings", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			writeJSONResponse(w, http.StatusOK, flattenSettings(getSettings()))
+		case http.MethodPost:
+			var flat flatSettings
+			if err := decodeJSONBody(r, &flat); err != nil {
+				http.Error(w, "Invalid body: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			s := getSettings()
+			applyFlatSettings(s, flat)
+			if err := config.SaveSettings(s); err != nil {
+				http.Error(w, "Failed to save: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			setGlobalSettings(s)
+			applyEngineSettings(s)
+			// Let the live service pick up the new file (same path as /settings/reload).
+			if reloader, ok := service.(interface{ ReloadSettingsFromDisk() error }); ok {
+				_ = reloader.ReloadSettingsFromDisk()
+			}
+			// Auto-start side-effect (systemd user service + XDG autostart). Non-fatal.
+			_ = utils.SetAutoStart(flat.AutoStart)
+			writeJSONResponse(w, http.StatusOK, map[string]string{"status": "saved"})
+		default:
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+
+	mux.HandleFunc("/capabilities", requireMethod(http.MethodGet, func(w http.ResponseWriter, r *http.Request) {
+		_, results := service.(downloadservice.ResultService)
+		artifacts := false
+		if owner, ok := service.(interface{ SupportsArtifactPolicies() bool }); ok {
+			artifacts = owner.SupportsArtifactPolicies()
+		}
+		writeJSONResponse(w, http.StatusOK, serverCapabilities{SchemaVersion: 1, Features: map[string]bool{"finalized_results": results, "artifact_sha256": artifacts, "destination_policy": artifacts}})
+	}))
+
+	// Settings persistence and live application are serialized by the owner.
+	mux.HandleFunc("/settings", func(w http.ResponseWriter, r *http.Request) {
+		owner, ok := service.(downloadservice.SettingsService)
+		if !ok {
+			http.Error(w, "Settings service unavailable", http.StatusNotImplemented)
+			return
+		}
+		if r.Method == http.MethodGet {
+			settings, err := owner.GetSettings()
+			if err != nil {
+				http.Error(w, "Failed to retrieve settings: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			settings.Extension.AuthToken.Value = ""
+			writeJSONResponse(w, http.StatusOK, settings)
+			return
+		}
+		if r.Method != http.MethodPost && r.Method != http.MethodPut && r.Method != http.MethodPatch {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		editor, ok := service.(downloadservice.SettingsEditor)
+		if !ok {
+			http.Error(w, "Settings editing unavailable", http.StatusNotImplemented)
+			return
+		}
+		var patch config.SettingsPatch
+		var restartRequired bool
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		if r.Method == http.MethodPut || r.Method == http.MethodPost {
+			current, err := owner.GetSettings()
+			if err != nil {
+				http.Error(w, "Failed to retrieve settings: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			updated := current.Clone()
+			if r.Method == http.MethodPost {
+				fields, err := decodeSettingsPatch(r)
+				if err == nil {
+					err = applySettingsPatch(updated, fields)
+				}
+				if err != nil {
+					http.Error(w, "Invalid settings: "+err.Error(), jsonDecodeErrorStatus(err))
+					return
+				}
+			} else if err := decodeJSONBody(r, updated); err != nil {
+				http.Error(w, "Invalid settings: "+err.Error(), jsonDecodeErrorStatus(err))
+				return
+			}
+			if err := updated.NormalizeValues(); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			patch = config.DiffSettings(current, updated)
+			restartRequired = updated.RequiresRestartComparedTo(current)
+		} else if err := decodeJSONBody(r, &patch); err != nil {
+			http.Error(w, "Invalid settings patch: "+err.Error(), jsonDecodeErrorStatus(err))
+			return
+		}
+		updated, err := editor.PatchSettings(patch)
+		if err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, downloadservice.ErrInvalidSettings) {
+				status = http.StatusBadRequest
+			}
+			if errors.Is(err, config.ErrSettingsConflict) {
+				status = http.StatusConflict
+			}
+			http.Error(w, err.Error(), status)
+			return
+		}
+		if r.Method == http.MethodPut || r.Method == http.MethodPost {
+			writeJSONResponse(w, http.StatusOK, map[string]interface{}{"status": "updated", "restart_required": restartRequired})
+			return
+		}
+		updated.Extension.AuthToken.Value = ""
+		writeJSONResponse(w, http.StatusOK, updated)
+	})
 
 	mux.HandleFunc("/download", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
@@ -59,22 +202,68 @@ func registerHTTPRoutes(mux *http.ServeMux, port int, defaultOutputDir string, s
 		}
 		handleDownload(w, r, defaultOutputDir, service)
 	})
+	mux.HandleFunc("/download/result", requireMethod(http.MethodGet, withRequiredID(func(w http.ResponseWriter, _ *http.Request, id string) {
+		owner, ok := service.(downloadservice.ResultService)
+		if !ok {
+			http.Error(w, "Finalized results are unavailable on this server", http.StatusNotImplemented)
+			return
+		}
+		// Only this endpoint certifies the post-finalization status contract.
+		w.Header().Set("X-Surge-Result-Version", "1")
+		status, err := owner.GetResult(id)
+		if err != nil {
+			code := lifecycleErrorStatus(err)
+			if errors.Is(err, downloadservice.ErrArtifactUnavailable) {
+				code = http.StatusConflict
+			}
+			http.Error(w, "Unable to retrieve finalized download result", code)
+			return
+		}
+		if status == nil {
+			http.Error(w, "Result unavailable", http.StatusInternalServerError)
+			return
+		}
+		result := *status
+		result.URL, result.Error = "", "" // No source credentials or raw errors in result snapshots.
+		writeJSONResponse(w, http.StatusOK, result)
+	})))
+	mux.HandleFunc("/download/duplicate", requireMethod(http.MethodPost, handleDuplicateCheck))
+
+	mux.HandleFunc("/download/batch", func(w http.ResponseWriter, r *http.Request) {
+		handleBatchDownload(w, r, defaultOutputDir, service)
+	})
 
 	mux.HandleFunc("/pause", requireMethod(http.MethodPost, withRequiredID(func(w http.ResponseWriter, _ *http.Request, id string) {
 		if err := service.Pause(id); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			http.Error(w, err.Error(), lifecycleErrorStatus(err))
 			return
 		}
-		writeJSONResponse(w, http.StatusOK, map[string]string{"status": "paused", "id": id})
+		writeJSONResponse(w, http.StatusOK, map[string]string{"status": "pause_requested", "id": id})
 	})))
+
+	// Cancellation retains the same resumable checkpoint and record as pause.
+	// Keep the destructive Delete operation separate for existing API clients.
+	mux.HandleFunc("/cancel", requireMethod(http.MethodPost, withRequiredID(func(w http.ResponseWriter, _ *http.Request, id string) {
+		if err := service.Pause(id); err != nil {
+			http.Error(w, err.Error(), lifecycleErrorStatus(err))
+			return
+		}
+		writeJSONResponse(w, http.StatusOK, map[string]string{"status": "cancel_requested", "id": id})
+	})))
+
+	mux.HandleFunc("/pause-all", requireMethod(http.MethodPost, handlePauseAll(service)))
 
 	mux.HandleFunc("/resume", requireMethod(http.MethodPost, withRequiredID(func(w http.ResponseWriter, _ *http.Request, id string) {
 		if err := service.Resume(id); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			http.Error(w, err.Error(), lifecycleErrorStatus(err))
 			return
 		}
-		writeJSONResponse(w, http.StatusOK, map[string]string{"status": "resumed", "id": id})
+		writeJSONResponse(w, http.StatusOK, map[string]string{"status": "resume_requested", "id": id})
 	})))
+
+	mux.HandleFunc("/resume/batch", requireMethod(http.MethodPost, handleBatchResume(service)))
+
+	mux.HandleFunc("/resume-all", requireMethod(http.MethodPost, handleResumeAll(service)))
 
 	mux.HandleFunc("/delete", requireMethods(withRequiredID(func(w http.ResponseWriter, _ *http.Request, id string) {
 		if err := service.Delete(id); err != nil {
@@ -82,6 +271,14 @@ func registerHTTPRoutes(mux *http.ServeMux, port int, defaultOutputDir string, s
 			return
 		}
 		writeJSONResponse(w, http.StatusOK, map[string]string{"status": "deleted", "id": id})
+	}), http.MethodDelete, http.MethodPost))
+
+	mux.HandleFunc("/purge", requireMethods(withRequiredID(func(w http.ResponseWriter, _ *http.Request, id string) {
+		if err := service.Purge(id); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSONResponse(w, http.StatusOK, map[string]string{"status": "purged", "id": id})
 	}), http.MethodDelete, http.MethodPost))
 
 	mux.HandleFunc("/list", requireMethod(http.MethodGet, func(w http.ResponseWriter, _ *http.Request) {
@@ -93,19 +290,87 @@ func registerHTTPRoutes(mux *http.ServeMux, port int, defaultOutputDir string, s
 		writeJSONResponse(w, http.StatusOK, statuses)
 	}))
 
-	mux.HandleFunc("/history", requireMethod(http.MethodGet, func(w http.ResponseWriter, _ *http.Request) {
-		history, err := service.History()
-		if err != nil {
-			http.Error(w, "Failed to retrieve history: "+err.Error(), http.StatusInternalServerError)
+	mux.HandleFunc("/shutdown", requireMethod(http.MethodPost, func(w http.ResponseWriter, r *http.Request) {
+		writeJSONResponse(w, http.StatusAccepted, map[string]interface{}{
+			"status": "shutting_down",
+		})
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		requestGlobalShutdown("API requested shutdown")
+	}))
+
+	mux.HandleFunc("/publish", requireMethod(http.MethodPost, func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Message string `json:"message"`
+		}
+		if err := decodeJSONBody(r, &request); err != nil {
+			http.Error(w, "Error Decoding body :"+err.Error(), jsonDecodeErrorStatus(err))
 			return
 		}
-		sort.Slice(history, func(left, right int) bool {
-			if history[left].CompletedAt == history[right].CompletedAt {
-				return history[left].ID > history[right].ID
-			}
-			return history[left].CompletedAt > history[right].CompletedAt
+		if request.Message == "" {
+			http.Error(w, "Empty message field", http.StatusBadRequest)
+			return
+		}
+
+		event := types.DownloadEvent{
+			Type:    types.EventSystem,
+			Message: request.Message,
+		}
+		if err := service.Publish(event); err != nil {
+			http.Error(w, "Error publishing to Event stream:"+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		writeJSONResponse(w, http.StatusOK, map[string]interface{}{
+			"status": "event_published",
 		})
-		writeJSONResponse(w, http.StatusOK, history)
+	}))
+
+	mux.HandleFunc("/history", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			history, err := service.History()
+			if err != nil {
+				http.Error(w, "Failed to retrieve history: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			sort.Slice(history, func(left, right int) bool {
+				if history[left].CompletedAt == history[right].CompletedAt {
+					return history[left].ID > history[right].ID
+				}
+				return history[left].CompletedAt > history[right].CompletedAt
+			})
+			writeJSONResponse(w, http.StatusOK, history)
+		case http.MethodDelete:
+			clearCount, err := service.ClearCompleted()
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			writeJSONResponse(w, http.StatusOK, map[string]interface{}{
+				"cleared": clearCount,
+				"status":  "done",
+			})
+		default:
+			http.Error(w, "Method not allowed!", http.StatusBadRequest)
+		}
+	})
+
+	mux.HandleFunc("/settings/reload", requireMethod(http.MethodPost, func(w http.ResponseWriter, r *http.Request) {
+		reloader, ok := service.(interface{ ReloadSettingsFromDisk() error })
+		if !ok {
+			http.Error(w, "Settings service unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		err := reloader.ReloadSettingsFromDisk()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSONResponse(w, http.StatusOK, map[string]interface{}{
+			"status": "reloaded",
+		})
 	}))
 
 	mux.HandleFunc("/open-file", requireMethod(http.MethodPost, withRequiredID(func(w http.ResponseWriter, r *http.Request, id string) {
@@ -148,19 +413,31 @@ func registerHTTPRoutes(mux *http.ServeMux, port int, defaultOutputDir string, s
 		writeJSONResponse(w, http.StatusOK, map[string]string{"status": "ok", "id": id})
 	})))
 
-	// POST /stream — native HLS/DASH downloader with ffmpeg mux, yt-dlp fallback
-	mux.HandleFunc("/stream", func(w http.ResponseWriter, r *http.Request) {
-		handleStream(w, r, defaultOutputDir, service)
-	})
-
-	// GET /ui — web dashboard
-	mux.Handle("/ui", webui.Handler())
-	mux.Handle("/ui/", webui.Handler())
+	mux.HandleFunc("/category", requireMethod(http.MethodPut, withRequiredID(func(w http.ResponseWriter, r *http.Request, id string) {
+		backend, ok := service.(downloadCategoryService)
+		if !ok {
+			http.Error(w, "Category assignment unsupported", http.StatusNotImplemented)
+			return
+		}
+		var req struct {
+			Category string `json:"category"`
+			Move     bool   `json:"move"`
+		}
+		if err := decodeJSONBody(r, &req); err != nil {
+			http.Error(w, "Invalid request body", jsonDecodeErrorStatus(err))
+			return
+		}
+		if err := backend.AssignCategory(id, req.Category, req.Move); err != nil {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+		writeJSONResponse(w, http.StatusOK, map[string]string{"status": "updated"})
+	})))
 
 	mux.HandleFunc("/update-url", requireMethod(http.MethodPut, withRequiredID(func(w http.ResponseWriter, r *http.Request, id string) {
 		var req map[string]string
 		if err := decodeJSONBody(r, &req); err != nil {
-			http.Error(w, "Invalid request body", http.StatusBadRequest)
+			http.Error(w, "Invalid request body", jsonDecodeErrorStatus(err))
 			return
 		}
 
@@ -178,38 +455,251 @@ func registerHTTPRoutes(mux *http.ServeMux, port int, defaultOutputDir string, s
 		writeJSONResponse(w, http.StatusOK, map[string]string{"status": "updated", "id": id, "url": newURL})
 	})))
 
-	// GET /settings — return flat settings for the GUI
-	// POST /settings — update settings from the GUI
-	mux.HandleFunc("/settings", func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodGet, "":
-			s := getSettings()
-			writeJSONResponse(w, http.StatusOK, flattenSettings(s))
-		case http.MethodPost:
-			var flat flatSettings
-			if err := decodeJSONBody(r, &flat); err != nil {
-				http.Error(w, "Invalid body: "+err.Error(), http.StatusBadRequest)
-				return
-			}
-			s := getSettings()
-			applyFlatSettings(s, flat)
-			if err := config.SaveSettings(s); err != nil {
-				http.Error(w, "Failed to save: "+err.Error(), http.StatusInternalServerError)
-				return
-			}
-			globalSettings = s
-			applyEngineSettings(s)
-			// Apply auto-start side-effect (systemd service + XDG autostart entry).
-			// Errors are non-fatal — settings are already saved.
-			_ = utils.SetAutoStart(flat.AutoStart)
-			writeJSONResponse(w, http.StatusOK, map[string]string{"status": "saved"})
-		default:
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	mux.HandleFunc("/clear-completed", requireMethod(http.MethodPost, func(w http.ResponseWriter, _ *http.Request) {
+		count, err := service.ClearCompleted()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
 		}
-	})
+		writeJSONResponse(w, http.StatusOK, map[string]int64{"deleted": count})
+	}))
+
+	mux.HandleFunc("/clear-failed", requireMethod(http.MethodPost, func(w http.ResponseWriter, _ *http.Request) {
+		count, err := service.ClearFailed()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSONResponse(w, http.StatusOK, map[string]int64{"deleted": count})
+	}))
+	mux.HandleFunc("/rate-limit", requireMethod(http.MethodPost, func(w http.ResponseWriter, r *http.Request) {
+		id := r.URL.Query().Get("id")
+		if id == "" {
+			http.Error(w, "Missing id parameter", http.StatusBadRequest)
+			return
+		}
+		if isRateLimitInheritRequest(r) {
+			if err := service.ClearRateLimit(id); err != nil {
+				http.Error(w, err.Error(), statusCodeForRateLimitError(err))
+				return
+			}
+			writeJSONResponse(w, http.StatusOK, map[string]string{"status": "rate_limit_inherited", "id": id})
+			return
+		}
+		rate, rateStr, ok := parseRateLimitQuery(w, r)
+		if !ok {
+			return
+		}
+
+		if err := service.SetRateLimit(id, rate); err != nil {
+			http.Error(w, err.Error(), statusCodeForRateLimitError(err))
+			return
+		}
+		status := "rate_limited"
+		if rate == 0 {
+			status = "rate_unlimited"
+		}
+		writeJSONResponse(w, http.StatusOK, map[string]string{"status": status, "id": id, "rate": rateStr})
+	}))
+
+	mux.HandleFunc("/rate-limit/global", requireMethod(http.MethodPost, func(w http.ResponseWriter, r *http.Request) {
+		limiter, ok := service.(rateLimitSettingsService)
+		if !ok {
+			http.Error(w, "Service does not support global rate limits", http.StatusNotImplemented)
+			return
+		}
+		rate, rateStr, ok := parseRateLimitQuery(w, r)
+		if !ok {
+			return
+		}
+		if err := limiter.SetGlobalRateLimit(rate); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		status := "global_rate_limited"
+		if rate == 0 {
+			status = "global_rate_unlimited"
+		}
+		writeJSONResponse(w, http.StatusOK, map[string]string{"status": status, "rate": rateStr})
+	}))
+
+	mux.HandleFunc("/rate-limit/default", requireMethod(http.MethodPost, func(w http.ResponseWriter, r *http.Request) {
+		limiter, ok := service.(rateLimitSettingsService)
+		if !ok {
+			http.Error(w, "Service does not support default rate limits", http.StatusNotImplemented)
+			return
+		}
+		rate, rateStr, ok := parseRateLimitQuery(w, r)
+		if !ok {
+			return
+		}
+		if err := limiter.SetDefaultRateLimit(rate); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		status := "default_rate_limited"
+		if rate == 0 {
+			status = "default_rate_unlimited"
+		}
+		writeJSONResponse(w, http.StatusOK, map[string]string{"status": status, "rate": rateStr})
+	}))
 }
 
-func eventsHandler(service core.DownloadService) http.HandlerFunc {
+func handleBatchResume(service downloadservice.DownloadService) http.HandlerFunc {
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req ResumeBatchRequest
+		if err := decodeJSONBody(r, &req); err != nil {
+			http.Error(w, fmt.Sprintf("Invalid JSON body :%v", err), jsonDecodeErrorStatus(err))
+			return
+		}
+
+		if len(req.IDs) == 0 {
+			http.Error(w, "Download IDs are required.", http.StatusBadRequest)
+			return
+		}
+
+		errs := service.ResumeBatch(req.IDs)
+		res := make([]downloadActionResult, len(req.IDs))
+
+		if len(errs) < len(req.IDs) {
+			var serviceError error
+			if len(errs) > 0 {
+				serviceError = errs[0]
+			}
+			for i, id := range req.IDs {
+				res[i].ID = id
+				if serviceError != nil {
+					res[i].Error = serviceError.Error()
+				}
+			}
+
+			if serviceError != nil {
+				writeJSONResponse(w, http.StatusServiceUnavailable, map[string]interface{}{
+					"status":  "error",
+					"error":   serviceError.Error(),
+					"results": res,
+				})
+				return
+			}
+		} else {
+			for i, id := range req.IDs {
+				res[i].ID = id
+				if errs[i] != nil {
+					res[i].Error = errs[i].Error()
+				}
+
+			}
+		}
+		writeJSONResponse(w, http.StatusOK, map[string]interface{}{
+			"status":  "done",
+			"results": res,
+		})
+	}
+}
+
+func handlePauseAll(service downloadservice.DownloadService) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		downloadList, err := service.List()
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Error getting downloads :%v", err), http.StatusInternalServerError)
+			return
+		}
+
+		results := make([]downloadActionResult, 0)
+		pauseCount := 0
+
+		for _, download := range downloadList {
+			if download.Status != "completed" && download.Status != "paused" && download.Status != "error" {
+				result := downloadActionResult{
+					ID: download.ID,
+				}
+				if err := service.Pause(download.ID); err != nil {
+					result.Error = err.Error()
+				} else {
+					pauseCount++
+				}
+				results = append(results, result)
+			}
+		}
+		writeJSONResponse(w, http.StatusOK, map[string]interface{}{
+			"results": results,
+			"status":  "done",
+			"paused":  pauseCount,
+		})
+	}
+}
+
+func handleResumeAll(service downloadservice.DownloadService) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		downloadList, err := service.List()
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Error getting downloads :%v", err), http.StatusInternalServerError)
+			return
+		}
+		results := make([]downloadActionResult, 0)
+		resumeCount := 0
+
+		for _, download := range downloadList {
+			if download.Status == "paused" {
+				result := downloadActionResult{
+					ID: download.ID,
+				}
+				if err := service.Resume(download.ID); err != nil {
+					result.Error = err.Error()
+				} else {
+					resumeCount++
+				}
+				results = append(results, result)
+			}
+		}
+
+		writeJSONResponse(w, http.StatusOK, map[string]interface{}{
+			"results": results,
+			"status":  "done",
+			"resumed": resumeCount,
+		})
+	}
+}
+
+func statusCodeForRateLimitError(err error) int {
+	if errors.Is(err, types.ErrNotFound) {
+		return http.StatusNotFound
+	}
+	return http.StatusInternalServerError
+}
+
+func isRateLimitInheritRequest(r *http.Request) bool {
+	query := r.URL.Query()
+	for _, inherit := range query["inherit"] {
+		normalized := strings.ToLower(strings.TrimSpace(inherit))
+		if normalized == "true" || normalized == "1" || normalized == "yes" || utils.IsRateLimitInherit(inherit) {
+			return true
+		}
+	}
+
+	return utils.IsRateLimitInherit(query.Get("rate"))
+}
+
+func parseRateLimitQuery(w http.ResponseWriter, r *http.Request) (int64, string, bool) {
+	rateStr := r.URL.Query().Get("rate")
+	if rateStr == "" {
+		http.Error(w, "Missing rate parameter", http.StatusBadRequest)
+		return 0, "", false
+	}
+	rate, err := strconv.ParseInt(rateStr, 10, 64)
+	if err != nil {
+		http.Error(w, "Invalid rate parameter (expected: integer bytes/sec, e.g. 10485760 for 10 MB/s)", http.StatusBadRequest)
+		return 0, "", false
+	}
+	if rate < 0 {
+		http.Error(w, "Rate parameter must be non-negative", http.StatusBadRequest)
+		return 0, "", false
+	}
+	return rate, rateStr, true
+}
+
+func eventsHandler(service downloadservice.DownloadService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
@@ -223,19 +713,28 @@ func eventsHandler(service core.DownloadService) http.HandlerFunc {
 		}
 		defer cleanup()
 
-		flusher, ok := w.(http.Flusher)
+		_, ok := w.(http.Flusher)
 		if !ok {
 			http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
 			return
 		}
-		flusher.Flush()
+		controller := http.NewResponseController(w)
+		defer func() { _ = controller.SetWriteDeadline(time.Time{}) }()
+		if err := prepareSSEWrite(controller); err != nil {
+			return
+		}
+		if err := flushSSEWrite(controller); err != nil {
+			return
+		}
 
 		// Send an initial comment immediately so clients fire their `open` event
 		// even when there are no download events yet. WebKitGTK's EventSource (the
 		// Wails GUI webview) only considers the stream open once it receives body
 		// bytes — without this the GUI shows "offline" until the first download.
 		_, _ = fmt.Fprint(w, ": connected\n\n")
-		flusher.Flush()
+		if err := flushSSEWrite(controller); err != nil {
+			return
+		}
 
 		// Heartbeat keeps idle connections open through proxies and lets the
 		// client tell "connected but idle" apart from "disconnected".
@@ -248,16 +747,21 @@ func eventsHandler(service core.DownloadService) http.HandlerFunc {
 			case <-done:
 				return
 			case <-ticker.C:
+				if err := prepareSSEWrite(controller); err != nil {
+					return
+				}
 				if _, err := fmt.Fprint(w, ": ping\n\n"); err != nil {
 					return
 				}
-				flusher.Flush()
+				if err := flushSSEWrite(controller); err != nil {
+					return
+				}
 			case msg, ok := <-stream:
 				if !ok {
 					return
 				}
 
-				frames, err := events.EncodeSSEMessages(msg)
+				frames, err := types.EncodeSSEMessages(msg)
 				if err != nil {
 					utils.Debug("Error encoding SSE event: %v", err)
 					continue
@@ -266,14 +770,43 @@ func eventsHandler(service core.DownloadService) http.HandlerFunc {
 					continue
 				}
 
-				for _, frame := range frames {
-					_, _ = fmt.Fprintf(w, "event: %s\n", frame.Event)
-					_, _ = fmt.Fprintf(w, "data: %s\n\n", frame.Data)
+				if err := prepareSSEWrite(controller); err != nil {
+					return
 				}
-				flusher.Flush()
+				for _, frame := range frames {
+					if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", frame.Event, frame.Data); err != nil {
+						return
+					}
+				}
+				if err := flushSSEWrite(controller); err != nil {
+					return
+				}
 			}
 		}
 	}
+}
+
+// Bound writes per SSE batch so a stalled socket cannot retain a subscriber
+// indefinitely. Test/middleware writers may not expose deadline support.
+func prepareSSEWrite(controller *http.ResponseController) error {
+	err := controller.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	if errors.Is(err, http.ErrNotSupported) {
+		return nil
+	}
+	return err
+}
+
+// Flush under the current deadline, then leave idle streams without a deadline.
+// An expired write deadline cannot reliably be renewed after an idle interval.
+func flushSSEWrite(controller *http.ResponseController) error {
+	if err := controller.Flush(); err != nil {
+		return err
+	}
+	err := controller.SetWriteDeadline(time.Time{})
+	if errors.Is(err, http.ErrNotSupported) {
+		return nil
+	}
+	return err
 }
 
 func requireMethod(method string, next http.HandlerFunc) http.HandlerFunc {
@@ -314,7 +847,7 @@ func writeJSONResponse(w http.ResponseWriter, status int, payload interface{}) {
 	}
 }
 
-func resolveDownloadDestPath(service core.DownloadService, id string) (string, error) {
+func resolveDownloadDestPath(service downloadservice.DownloadService, id string) (string, error) {
 	if service == nil {
 		return "", ErrServiceUnavailable
 	}
@@ -383,12 +916,50 @@ func decodeJSONBody(r *http.Request, dst interface{}) error {
 	defer func() {
 		_ = r.Body.Close()
 	}()
-	return json.NewDecoder(r.Body).Decode(dst)
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(dst); err != nil {
+		return err
+	}
+	var trailing json.RawMessage
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("multiple JSON values in request body")
+	}
+	return nil
+}
+
+func jsonDecodeErrorStatus(err error) int {
+	var limitErr *http.MaxBytesError
+	if errors.As(err, &limitErr) {
+		return http.StatusRequestEntityTooLarge
+	}
+	return http.StatusBadRequest
+}
+
+type downloadCategoryService interface {
+	AssignCategory(string, string, bool) error
+}
+
+// lifecycleErrorStatus gives clients a stable distinction between missing jobs,
+// transition conflicts, and an unavailable engine without parsing diagnostics.
+func lifecycleErrorStatus(err error) int {
+	switch {
+	case errors.Is(err, types.ErrNotFound):
+		return http.StatusNotFound
+	case errors.Is(err, types.ErrCompleted), errors.Is(err, types.ErrPausing), errors.Is(err, types.ErrAlreadyActive):
+		return http.StatusConflict
+	case errors.Is(err, types.ErrServiceUnavailable), errors.Is(err, types.ErrEngineNotInit), errors.Is(err, types.ErrPoolNotInit):
+		return http.StatusServiceUnavailable
+	default:
+		return http.StatusInternalServerError
+	}
 }
 
 // handleStream handles POST /stream — auto-detects URL type and picks the best
 // download strategy: native HLS/DASH parser, YouTube adaptive formats, or yt-dlp fallback.
-func handleStream(w http.ResponseWriter, r *http.Request, defaultOutputDir string, service core.DownloadService) {
+func handleStream(w http.ResponseWriter, r *http.Request, defaultOutputDir string, service downloadservice.DownloadService) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
@@ -522,7 +1093,7 @@ func handleStream(w http.ResponseWriter, r *http.Request, defaultOutputDir strin
 
 // handleYtDlp handles POST /ytdlp — starts a yt-dlp download for video URLs.
 // The extension sends video/stream URLs here; regular file downloads go to /download.
-func handleYtDlp(w http.ResponseWriter, r *http.Request, defaultOutputDir string, service core.DownloadService) {
+func handleYtDlp(w http.ResponseWriter, r *http.Request, defaultOutputDir string, service downloadservice.DownloadService) {
 	// CORS preflight
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")

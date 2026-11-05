@@ -6,8 +6,8 @@ package ytdlp
 import (
 	"bufio"
 	"context"
-	"io"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -16,8 +16,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/msh2050/fluxget/internal/engine/events"
 	"github.com/google/uuid"
+	"github.com/msh2050/fluxget/internal/types"
 )
 
 var debugLog *log.Logger
@@ -46,23 +46,24 @@ var cookiePlatforms = []string{
 
 // Publisher is the subset of core.DownloadService we need.
 type Publisher interface {
-	Publish(msg interface{}) error
+	Publish(msg types.DownloadEvent) error
 }
 
 // Request holds everything needed to start a yt-dlp download.
 type Request struct {
-	URL      string
-	Title    string // used as filename hint
-	Format   string // yt-dlp format selector, e.g. "bestvideo+bestaudio/best"
-	DestDir  string
-	Headers  map[string]string
+	URL     string
+	Title   string // used as filename hint
+	Format  string // yt-dlp format selector, e.g. "bestvideo+bestaudio/best"
+	DestDir string
+	Headers map[string]string
 }
 
 // NeedsYtDlp returns true for URLs that should be handled by yt-dlp.
 // The host list and priority order mirrors IDMNetMon.dll's site dispatch table
 // (decompiled, lines 35974-36059):
-//   Lumberjack manifest → MPD extension → YouTube CDN hosts → Facebook →
-//   Vimeo → Instagram → ok.ru/mycdn → hydrax.to → generic HLS/DASH → yt-dlp platforms
+//
+//	Lumberjack manifest → MPD extension → YouTube CDN hosts → Facebook →
+//	Vimeo → Instagram → ok.ru/mycdn → hydrax.to → generic HLS/DASH → yt-dlp platforms
 //
 // CDN hosts (googlevideo.com, fbcdn.net, vimeocdn.com, cdninstagram.com, etc.)
 // serve direct media URLs and are handled by the native stream engine, not yt-dlp.
@@ -194,7 +195,7 @@ func Start(ctx context.Context, pub Publisher, req Request) (string, error) {
 	bin := findBin()
 	if _, err := exec.LookPath(bin); err != nil {
 		if bin == "yt-dlp" {
-			return "", fmt.Errorf("yt-dlp not found in PATH — install it with: pip install yt-dlp")
+			return "", fmt.Errorf("yt-dlp not found in PATH \u2014 install it with: pip install yt-dlp")
 		}
 	}
 
@@ -245,7 +246,7 @@ func Start(ctx context.Context, pub Publisher, req Request) (string, error) {
 	if filename == "" {
 		filename = filenameFromURL(req.URL)
 	}
-	_ = pub.Publish(events.DownloadQueuedMsg{
+	_ = pub.Publish(types.DownloadEvent{Type: types.EventQueued,
 		DownloadID: id,
 		Filename:   filename,
 		URL:        req.URL,
@@ -256,17 +257,17 @@ func Start(ctx context.Context, pub Publisher, req Request) (string, error) {
 		cmd := exec.CommandContext(ctx, bin, args...)
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {
-			_ = pub.Publish(events.DownloadErrorMsg{DownloadID: id, Filename: filename, Err: err})
+			_ = pub.Publish(types.DownloadEvent{Type: types.EventError, DownloadID: id, Filename: filename, Err: err})
 			return
 		}
 		var stderrBuf strings.Builder
 		cmd.Stderr = &stderrBuf
 		if err := cmd.Start(); err != nil {
-			_ = pub.Publish(events.DownloadErrorMsg{DownloadID: id, Filename: filename, Err: err})
+			_ = pub.Publish(types.DownloadEvent{Type: types.EventError, DownloadID: id, Filename: filename, Err: err})
 			return
 		}
 
-		_ = pub.Publish(events.DownloadStartedMsg{
+		_ = pub.Publish(types.DownloadEvent{Type: types.EventStarted,
 			DownloadID: id,
 			URL:        req.URL,
 			Filename:   filename,
@@ -297,13 +298,13 @@ func Start(ctx context.Context, pub Publisher, req Request) (string, error) {
 			}
 
 			if status == "downloading" || status == "finished" {
-				_ = pub.Publish(events.ProgressMsg{
-					DownloadID:        id,
-					Downloaded:        lastDownloaded,
-					Total:             lastTotal,
-					Speed:             speed,
-					Elapsed:           time.Since(start),
-					ActiveConnections: 1,
+				_ = pub.Publish(types.DownloadEvent{Type: types.EventProgress,
+					DownloadID:  id,
+					Downloaded:  lastDownloaded,
+					Total:       lastTotal,
+					Speed:       speed,
+					Elapsed:     time.Since(start),
+					Connections: 1,
 				})
 			}
 		}
@@ -353,13 +354,13 @@ func Start(ctx context.Context, pub Publisher, req Request) (string, error) {
 							lastTotal = total
 						}
 						if status == "downloading" || status == "finished" {
-							_ = pub.Publish(events.ProgressMsg{
-								DownloadID:        id,
-								Downloaded:        lastDownloaded,
-								Total:             lastTotal,
-								Speed:             speed,
-								Elapsed:           time.Since(start),
-								ActiveConnections: 1,
+							_ = pub.Publish(types.DownloadEvent{Type: types.EventProgress,
+								DownloadID:  id,
+								Downloaded:  lastDownloaded,
+								Total:       lastTotal,
+								Speed:       speed,
+								Elapsed:     time.Since(start),
+								Connections: 1,
 							})
 						}
 					}
@@ -369,7 +370,7 @@ func Start(ctx context.Context, pub Publisher, req Request) (string, error) {
 						if elapsed.Seconds() > 0 && lastTotal > 0 {
 							avgSpeed = float64(lastTotal) / elapsed.Seconds()
 						}
-						_ = pub.Publish(events.DownloadCompleteMsg{
+						_ = pub.Publish(types.DownloadEvent{Type: types.EventComplete,
 							DownloadID: id,
 							Filename:   filename,
 							Elapsed:    elapsed,
@@ -396,7 +397,7 @@ func Start(ctx context.Context, pub Publisher, req Request) (string, error) {
 					}
 				}
 			}
-			_ = pub.Publish(events.DownloadErrorMsg{
+			_ = pub.Publish(types.DownloadEvent{Type: types.EventError,
 				DownloadID: id,
 				Filename:   filename,
 				DestPath:   destDir,
@@ -413,7 +414,7 @@ func Start(ctx context.Context, pub Publisher, req Request) (string, error) {
 		if elapsed.Seconds() > 0 && lastTotal > 0 {
 			avgSpeed = float64(lastTotal) / elapsed.Seconds()
 		}
-		_ = pub.Publish(events.DownloadCompleteMsg{
+		_ = pub.Publish(types.DownloadEvent{Type: types.EventComplete,
 			DownloadID: id,
 			Filename:   filename,
 			Elapsed:    elapsed,

@@ -11,6 +11,12 @@ import (
 
 var testAnsiEscapeRE = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 
+func TestNewDownloadListDisablesBuiltInFiltering(t *testing.T) {
+	if NewDownloadList(80, 20).FilteringEnabled() {
+		t.Fatal("download list filtering must remain disabled; dashboard search owns filtering")
+	}
+}
+
 func TestDownloadItem_Description(t *testing.T) {
 	spinnerView := "\u280b"
 
@@ -30,6 +36,7 @@ func TestDownloadItem_Description(t *testing.T) {
 			name: "Resuming State",
 			model: &DownloadModel{
 				resuming: true,
+				started:  true,
 			},
 			expected: "\u280b Resuming...",
 		},
@@ -61,6 +68,20 @@ func TestDownloadItem_Description(t *testing.T) {
 	}
 }
 
+func TestDownloadDelegateReservesRoomForCategory(t *testing.T) {
+	d := newDownloadDelegate()
+	m := list.New([]list.Item{}, d, 42, 10)
+	item := DownloadItem{
+		download: &DownloadModel{Filename: strings.Repeat("very-long-name-", 8) + ".mkv"},
+		category: "Shows",
+	}
+	var buf bytes.Buffer
+	d.Render(&buf, m, 0, item)
+	if got := testAnsiEscapeRE.ReplaceAllString(buf.String(), ""); !strings.Contains(got, "[Shows]") {
+		t.Fatalf("long-title row omitted category: %q", got)
+	}
+}
+
 func BenchmarkDownloadDelegateRender(b *testing.B) {
 	d := newDownloadDelegate()
 	m := list.New([]list.Item{}, d, 100, 100)
@@ -81,5 +102,30 @@ func BenchmarkDownloadDelegateRender(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		buf.Reset()
 		d.Render(&buf, m, 0, di)
+	}
+}
+
+func TestDownloadItemCompletedHidesSpeedLimit(t *testing.T) {
+	for _, rate := range []int64{0, 10 * 1024 * 1024} {
+		d := &DownloadModel{Speed: 1024 * 1024, RateLimit: rate, RateLimitSet: true}
+		item := DownloadItem{download: d}
+		if got := strings.Contains(item.Description(), "Limit:"); got != (rate > 0) {
+			t.Fatalf("active download limit visibility = %v for rate %d", got, rate)
+		}
+		d.done = true
+		if strings.Contains(item.Description(), "Limit:") {
+			t.Fatal("completed download should hide its speed limit")
+		}
+	}
+}
+
+func TestCompletedDownloadDescriptionShowsOnlyDownloadedSize(t *testing.T) {
+	d := &DownloadModel{done: true, Total: 100 * 1024 * 1024, Downloaded: 1234}
+	text := testAnsiEscapeRE.ReplaceAllString((DownloadItem{download: d}).Description(), "")
+	if strings.Contains(text, "%") || strings.Contains(text, " / ") || strings.Contains(text, "100 MiB") {
+		t.Fatalf("completed description contains progress or server size: %q", text)
+	}
+	if !strings.Contains(text, "1.2 KiB") {
+		t.Fatalf("completed description lacks actual size: %q", text)
 	}
 }

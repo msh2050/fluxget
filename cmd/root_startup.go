@@ -3,18 +3,73 @@ package cmd
 import (
 	"fmt"
 	"path/filepath"
-	"sync/atomic"
 
 	"github.com/msh2050/fluxget/internal/config"
-	"github.com/msh2050/fluxget/internal/engine/state"
+	"github.com/msh2050/fluxget/internal/scheduler"
+	"github.com/msh2050/fluxget/internal/service"
+	"github.com/msh2050/fluxget/internal/store"
+	"github.com/msh2050/fluxget/internal/types"
 	"github.com/msh2050/fluxget/internal/utils"
 )
+
+// initializeLocalEngine is called only by local TUI/server owners, after the
+// instance lock is acquired. Client and metadata commands never create a pool.
+func initializeLocalEngine() error {
+	if GlobalService != nil {
+		if err := GlobalService.Shutdown(); err != nil {
+			return fmt.Errorf("stop previous local service: %w", err)
+		}
+	}
+	if lifecycle := currentLifecycle(); lifecycle != nil {
+		lifecycle.Shutdown()
+	}
+	if GlobalPool != nil {
+		GlobalPool.GracefulShutdown()
+	}
+	if cleanup := takeLifecycleCleanup(); cleanup != nil {
+		cleanup()
+	}
+	globalLifecycleMu.Lock()
+	GlobalService = nil
+	GlobalLifecycle = nil
+	globalLifecycleMu.Unlock()
+	GlobalPool = nil
+	GlobalProgressCh = nil
+	globalHTTPServerMu.Lock()
+	server := globalHTTPServer
+	globalHTTPServer = nil
+	globalHTTPServerMu.Unlock()
+	if server != nil {
+		_ = server.Close()
+	}
+
+	setGlobalSettings(nil)
+	settings := getSettings()
+	setGlobalSettings(settings)
+	applyEngineSettings(settings) // FluxGet: stream segment workers, subtitles toggle
+	if err := initializeGlobalState(); err != nil {
+		return err
+	}
+	GlobalProgressCh = make(chan types.DownloadEvent, types.ProgressChannelBuffer)
+	GlobalPool = scheduler.New(GlobalProgressCh, config.Resolve[int](settings.Network.MaxConcurrentDownloads))
+	return nil
+}
+
+// initializeClientState prepares local history/auth/logging only when needed.
+// Explicit remote clients use the configured endpoint without touching local
+// settings, state directories, history, or a local download engine.
+func initializeClientState() error {
+	if resolveHostTarget() != "" {
+		return nil
+	}
+	return initializeGlobalState()
+}
 
 func runStartupIntegrityCheck() string {
 	// Normalize downloads stuck in "downloading" status from a prior crash/kill.
 	// This must happen before ValidateIntegrity so the newly-paused entries
 	// are included in the integrity check and eligible for auto-resume.
-	if normalized, err := state.NormalizeStaleDownloads(); err != nil {
+	if normalized, err := store.NormalizeStaleDownloads(); err != nil {
 		msg := fmt.Sprintf("Startup: failed to normalize stale downloads: %v", err)
 		utils.Debug("%s", msg)
 	} else if normalized > 0 {
@@ -24,7 +79,7 @@ func runStartupIntegrityCheck() string {
 	// Validate integrity of paused/queued downloads before auto-resume.
 	// This removes entries whose .surge files are missing/tampered and
 	// also cleans orphan .surge files that no longer have DB entries.
-	if removed, err := state.ValidateIntegrity(); err != nil {
+	if removed, err := store.ValidateIntegrity(); err != nil {
 		msg := fmt.Sprintf("Startup integrity check failed: %v", err)
 		return msg
 	} else if removed > 0 {
@@ -46,10 +101,11 @@ func initializeGlobalState() error {
 	}
 
 	// Config engine state
-	state.Configure(stateDBPath)
+	store.Configure(stateDBPath)
 
 	// Config logging
 	utils.ConfigureDebug(logsDir)
+	utils.Debug("Surge %s (commit %s)", Version, Commit)
 
 	// Clean up old logs (keeping retention-1 because a new log will be created immediately after)
 	retention := config.Resolve[int](getSettings().General.LogRetentionCount)
@@ -62,20 +118,41 @@ func initializeGlobalState() error {
 }
 
 func getSettings() *config.Settings {
-	if globalSettings != nil {
-		return globalSettings
+	if owner, ok := GlobalService.(service.SettingsService); ok {
+		if settings, err := owner.GetSettings(); err == nil {
+			return settings
+		}
+	}
+	if settings := getGlobalSettings(); settings != nil {
+		return settings
 	}
 	settings, err := config.LoadSettings()
 	if err != nil {
-		return config.DefaultSettings()
+		utils.Debug("Warning: failed to load settings: %v - using defaults", err)
+		defaults := config.DefaultSettings()
+		defaults.StartupWarnings = append(defaults.StartupWarnings,
+			fmt.Sprintf("Config: failed to read settings file (%v) - all settings reset to defaults", err))
+		return defaults
 	}
 	return settings
+}
+
+func getGlobalSettings() *config.Settings {
+	globalSettingsMu.RLock()
+	defer globalSettingsMu.RUnlock()
+	return globalSettings.Clone()
+}
+
+func setGlobalSettings(settings *config.Settings) {
+	globalSettingsMu.Lock()
+	globalSettings = settings.Clone()
+	globalSettingsMu.Unlock()
 }
 
 func resumePausedDownloads() {
 	settings := getSettings()
 
-	pausedEntries, err := state.LoadPausedDownloads()
+	pausedEntries, err := store.LoadPausedDownloads()
 	if err != nil {
 		return
 	}
@@ -89,8 +166,8 @@ func resumePausedDownloads() {
 		if GlobalService == nil || entry.ID == "" {
 			continue
 		}
-		if err := GlobalService.Resume(entry.ID); err == nil {
-			atomic.AddInt32(&activeDownloads, 1)
+		if err := GlobalService.Resume(entry.ID); err != nil {
+			utils.Debug("Failed to resume download %s at startup: %v", entry.ID, err)
 		}
 	}
 }

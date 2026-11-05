@@ -1,0 +1,734 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/msh2050/fluxget/internal/config"
+	"github.com/msh2050/fluxget/internal/orchestrator"
+	"github.com/msh2050/fluxget/internal/scheduler"
+	"github.com/msh2050/fluxget/internal/store"
+	"github.com/msh2050/fluxget/internal/testutil"
+	"github.com/msh2050/fluxget/internal/types"
+	"github.com/msh2050/fluxget/internal/utils"
+)
+
+func setupTestService(t *testing.T) (*LocalDownloadService, *httptest.Server, string, <-chan string) {
+	testutil.SetupStateDB(t)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "1024")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(make([]byte, 1024))
+	}))
+
+	progressCh := make(chan types.DownloadEvent, 10)
+	pool := scheduler.New(progressCh, 1)
+	eb := orchestrator.NewEventBus()
+	mgr := orchestrator.NewLifecycleManager(pool, eb, nil)
+
+	// Ensure config directory exists for settings tests
+	tmpDir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", tmpDir)
+	t.Setenv("APPDATA", tmpDir)
+	t.Setenv("XDG_STATE_HOME", tmpDir)
+
+	svc := NewLocalDownloadService(mgr)
+
+	// Mock event worker to handle EventRemoved
+	ch, cleanup := eb.Subscribe()
+	removed := make(chan string, 10)
+	go func() {
+		for e := range ch {
+			if e.Type == types.EventRemoved {
+				_ = store.DeleteState(e.DownloadID)
+				removed <- e.DownloadID
+			}
+		}
+	}()
+	t.Cleanup(cleanup)
+
+	return svc, ts, tmpDir, removed
+}
+
+func TestLocalDownloadService_AddWithID_UsesProvidedID(t *testing.T) {
+	svc, globalTs, tmpDir, _ := setupTestService(t)
+	defer globalTs.Close()
+	t.Cleanup(func() { _ = svc.Shutdown() })
+
+	blockCh := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "1024")
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		if r.Header.Get("Range") != "bytes=0-0" {
+			select {
+			case <-blockCh:
+			case <-r.Context().Done():
+			}
+		}
+	}))
+	defer ts.Close()
+	defer close(blockCh)
+
+	customID := "test-id-123"
+	id, err := svc.AddWithID(ts.URL, tmpDir, "test.txt", nil, nil, customID, false, 1, 0)
+
+	if err != nil {
+		t.Fatalf("AddWithID failed: %v", err)
+	}
+	if id != customID {
+		t.Errorf("expected ID %s, got %s", customID, id)
+	}
+
+	status, err := svc.GetStatus(customID)
+	if err != nil {
+		t.Fatalf("GetStatus failed: %v", err)
+	}
+	if status.ID != customID {
+		t.Errorf("expected status ID %s, got %s", customID, status.ID)
+	}
+}
+
+func TestLocalDownloadService_StreamEvents(t *testing.T) {
+	svc, ts, tmpDir, _ := setupTestService(t)
+	defer ts.Close()
+
+	ch, cleanup, err := svc.StreamEvents(context.Background())
+	if err != nil {
+		t.Fatalf("StreamEvents failed: %v", err)
+	}
+	defer cleanup()
+
+	// Add a download to generate an event
+	_, _ = svc.Add(ts.URL, tmpDir, "event.txt", nil, nil, false, 1, 0)
+
+	select {
+	case <-ch:
+		// Received an event
+	case <-time.After(1 * time.Second):
+		t.Fatal("timed out waiting for event")
+	}
+
+	// Shutting down should close the channel
+	if err := svc.Shutdown(); err != nil {
+		t.Errorf("Shutdown failed: %v", err)
+	}
+
+	// Drain the channel until it is closed
+	closed := false
+	timeout := time.After(2 * time.Second)
+	for !closed {
+		select {
+		case _, ok := <-ch:
+			if !ok {
+				closed = true
+			}
+		case <-timeout:
+			t.Fatal("timed out waiting for channel to close")
+		}
+	}
+}
+
+func TestLocalDownloadService_RateLimits(t *testing.T) {
+	svc, ts, tmpDir, _ := setupTestService(t)
+	defer ts.Close()
+	t.Cleanup(func() { _ = svc.Shutdown() })
+
+	err := svc.SetRateLimit("invalid", 100)
+	if err == nil {
+		t.Error("expected error setting rate limit on unknown ID")
+	}
+
+	err = svc.SetGlobalRateLimit(-1)
+	if err == nil {
+		t.Error("expected error for negative global rate limit")
+	}
+
+	err = svc.SetDefaultRateLimit(-1)
+	if err == nil {
+		t.Error("expected error for negative default rate limit")
+	}
+
+	// Test Global Rate Limit (which saves settings)
+	err = svc.SetGlobalRateLimit(5000)
+	if err != nil {
+		t.Errorf("SetGlobalRateLimit failed: %v", err)
+	}
+
+	settings := svc.lifecycle.GetSettings()
+	if rate, err := utils.ParseRateLimitValue(settings.Network.GlobalRateLimit.Value); err != nil || rate != 5000 {
+		t.Errorf("expected GlobalRateLimit to resolve to 5000 B/s, got %v (error: %v)", settings.Network.GlobalRateLimit.Value, err)
+	}
+
+	// Test Default Rate Limit
+	err = svc.SetDefaultRateLimit(1000)
+	if err != nil {
+		t.Errorf("SetDefaultRateLimit failed: %v", err)
+	}
+
+	// Use a blocking server so the download stays active in the scheduler
+	// (prevents it from completing before we can test rate limit operations)
+	blockCh := make(chan struct{})
+	rateTs := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "1024")
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		if r.Header.Get("Range") != "bytes=0-0" {
+			select {
+			case <-blockCh:
+			case <-r.Context().Done():
+			}
+		}
+	}))
+	defer rateTs.Close()
+	defer close(blockCh)
+
+	// Add a download and set its specific rate limit
+	id, _ := svc.Add(rateTs.URL, tmpDir, "rate.txt", nil, nil, false, 1, 0)
+
+	err = svc.SetRateLimit(id, 2000)
+	if err != nil {
+		t.Errorf("SetRateLimit failed: %v", err)
+	}
+
+	status, _ := svc.GetStatus(id)
+	if status.RateLimit != 2000 {
+		t.Errorf("expected rate limit 2000, got %d", status.RateLimit)
+	}
+
+	// Clear it
+	err = svc.ClearRateLimit(id)
+	if err != nil {
+		t.Errorf("ClearRateLimit failed: %v", err)
+	}
+
+	status, _ = svc.GetStatus(id)
+	if status.RateLimit != 1000 { // fallback to default
+		t.Errorf("expected rate limit 1000 (default) after clear, got %d", status.RateLimit)
+	}
+}
+
+func TestLocalDownloadService_Purge(t *testing.T) {
+	svc, ts, tmpDir, _ := setupTestService(t)
+	defer ts.Close()
+	t.Cleanup(func() { _ = svc.Shutdown() })
+
+	blockCh := make(chan struct{})
+	purgeTs := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "1024")
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		if r.Header.Get("Range") != "bytes=0-0" {
+			select {
+			case <-blockCh:
+			case <-r.Context().Done():
+			}
+		}
+	}))
+	defer purgeTs.Close()
+	defer close(blockCh)
+
+	id, _ := svc.AddWithID(purgeTs.URL, tmpDir, "purge.txt", nil, nil, "purge-id", false, 1, 0)
+
+	status, err := svc.GetStatus(id)
+	if err != nil {
+		t.Fatalf("GetStatus failed: %v", err)
+	}
+	t.Logf("GetStatus before purge returned destPath: %s", status.DestPath)
+
+	err = svc.Purge(id)
+	if err != nil {
+		t.Errorf("Purge failed: %v", err)
+	}
+
+	// Check that the file was deleted
+	if _, err := os.Stat(filepath.Join(tmpDir, "purge.txt")); !os.IsNotExist(err) {
+		t.Errorf("file purge.txt was not deleted")
+	}
+	if _, err := os.Stat(filepath.Join(tmpDir, "purge.txt"+types.IncompleteSuffix)); !os.IsNotExist(err) {
+		t.Errorf("file purge.txt.surge was not deleted")
+	}
+}
+
+func TestLocalDownloadService_HistoryAndList(t *testing.T) {
+	svc, ts, tmpDir, _ := setupTestService(t)
+	defer ts.Close()
+	t.Cleanup(func() { _ = svc.Shutdown() })
+
+	blockCh := make(chan struct{})
+	listTs := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "1024")
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		if r.Header.Get("Range") != "bytes=0-0" {
+			select {
+			case <-blockCh:
+			case <-r.Context().Done():
+			}
+		}
+	}))
+	defer listTs.Close()
+	defer close(blockCh)
+
+	_, err := svc.Add(listTs.URL, tmpDir, "list1.txt", nil, nil, false, 1, 0)
+	if err != nil {
+		t.Fatalf("Add failed: %v", err)
+	}
+
+	// Add a dummy completed download to store
+	testutil.SeedMasterList(t, types.DownloadRecord{
+		ID:       "db-id",
+		Status:   "completed",
+		Filename: "db.txt",
+	})
+
+	// Seed an errored download to verify Error survives a DB round-trip via List/GetStatus.
+	testutil.SeedMasterList(t, types.DownloadRecord{
+		ID:       "db-error-id",
+		Status:   "error",
+		Error:    "connection reset by peer",
+		Filename: "failed.txt",
+	})
+
+	list, err := svc.List()
+	if err != nil {
+		t.Fatalf("List failed: %v", err)
+	}
+
+	if len(list) < 2 {
+		t.Errorf("expected at least 2 items in list, got %d", len(list))
+	}
+
+	// Assert the errored record appears in List with its Error field propagated.
+	var errorFound *types.DownloadStatus
+	for i := range list {
+		if list[i].ID == "db-error-id" {
+			errorFound = &list[i]
+			break
+		}
+	}
+	if errorFound == nil {
+		t.Fatal("errored download missing from list")
+	}
+	if errorFound.Status != "error" {
+		t.Errorf("error record status = %q, want %q", errorFound.Status, "error")
+	}
+	if errorFound.Error != "connection reset by peer" {
+		t.Errorf("error record Error = %q, want %q", errorFound.Error, "connection reset by peer")
+	}
+
+	// Assert GetStatus also propagates Error for DB-backed records.
+	gotStatus, err := svc.GetStatus("db-error-id")
+	if err != nil {
+		t.Fatalf("GetStatus failed for error record: %v", err)
+	}
+	if gotStatus.Error != "connection reset by peer" {
+		t.Errorf("GetStatus Error = %q, want %q", gotStatus.Error, "connection reset by peer")
+	}
+
+	history, err := svc.History()
+	if err != nil {
+		t.Fatalf("History failed: %v", err)
+	}
+
+	if len(history) != 1 {
+		t.Errorf("expected 1 history item, got %d", len(history))
+	}
+
+	count, _ := svc.ClearCompleted()
+	if count != 1 {
+		t.Errorf("expected 1 completed item to be cleared, got %d", count)
+	}
+}
+
+func TestLocalDownloadService_Delete(t *testing.T) {
+	svc, ts, tmpDir, removed := setupTestService(t)
+	defer ts.Close()
+	t.Cleanup(func() { _ = svc.Shutdown() })
+
+	id, _ := svc.Add(ts.URL, tmpDir, "delete.txt", nil, nil, false, 1, 0)
+
+	err := svc.Delete(id)
+	if err != nil {
+		t.Errorf("Delete failed: %v", err)
+	}
+
+	select {
+	case removedID := <-removed:
+		if removedID != id {
+			t.Fatalf("removed download ID = %q, want %q", removedID, id)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for removal event to be processed")
+	}
+
+	// Check if it's gone
+	_, err = svc.GetStatus(id)
+	if err == nil {
+		t.Error("expected error getting status of deleted download")
+	}
+}
+
+func TestSettingsReadDuringRateUpdates(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	t.Setenv("APPDATA", dir)
+	pool := scheduler.New(make(chan types.DownloadEvent, 100), 1)
+	mgr := orchestrator.NewLifecycleManager(pool, nil, config.DefaultSettings())
+	defer mgr.Shutdown()
+	svc := NewLocalDownloadService(mgr)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 50; i++ {
+			if err := svc.SetGlobalRateLimit(int64(i)); err != nil {
+				t.Error(err)
+				return
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 1000; i++ {
+			if _, err := svc.GetSettings(); err != nil {
+				t.Error(err)
+				return
+			}
+		}
+	}()
+	wg.Wait()
+}
+
+func TestUpdateSettingsAppliesInheritedRateLimit(t *testing.T) {
+	testutil.SetupStateDB(t)
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	t.Setenv("APPDATA", dir)
+	pool := scheduler.New(make(chan types.DownloadEvent, 100), 1)
+	settings := config.DefaultSettings()
+	settings.General.DefaultDownloadDir.Value = dir
+	settings.Categories.Categories = nil
+	mgr := orchestrator.NewLifecycleManager(pool, nil, settings)
+	defer mgr.Shutdown()
+	svc := NewLocalDownloadService(mgr)
+	block := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-block:
+		case <-r.Context().Done():
+		}
+	}))
+	defer ts.Close()
+	defer close(block)
+	cfg := types.DownloadRecord{ID: "queued-limit", URL: ts.URL, Filename: "file", DestPath: filepath.Join(dir, "file"), Status: "queued"}
+	if err := store.AddToMasterList(cfg); err != nil {
+		t.Fatal(err)
+	}
+	pool.Add(cfg)
+	settings.Network.DefaultDownloadRateLimit.Value = "1 KiB/s"
+	if err := svc.UpdateSettings(settings); err != nil {
+		t.Fatal(err)
+	}
+	queued := pool.GetAll()
+	if len(queued) != 1 || queued[0].RateLimit != 1024 {
+		t.Fatalf("queued rate = %#v", queued)
+	}
+	loaded, err := config.LoadSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Network.DefaultDownloadRateLimit.Value != "1 KiB/s" {
+		t.Fatalf("persisted rate = %v", loaded.Network.DefaultDownloadRateLimit.Value)
+	}
+	settings.Network.DefaultDownloadRateLimit.Value = "2 KiB/s"
+	if snapshot, _ := svc.GetSettings(); snapshot.Network.DefaultDownloadRateLimit.Value != "1 KiB/s" {
+		t.Fatal("caller mutation changed live settings")
+	}
+	if err := config.SaveSettings(settings); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.ReloadSettingsFromDisk(); err != nil {
+		t.Fatal(err)
+	}
+	queued = pool.GetAll()
+	if len(queued) != 1 || queued[0].RateLimit != 2048 {
+		t.Fatalf("reloaded queued rate = %#v", queued)
+	}
+	records, err := store.LoadMasterList()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records.Downloads) != 1 || records.Downloads[0].RateLimit != 2048 {
+		t.Fatalf("reloaded persisted rate = %#v", records)
+	}
+}
+
+func TestConcurrentSettingsPatchesPreserveBothEdits(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("APPDATA", t.TempDir())
+	baseline := config.DefaultSettings()
+	baseline.Categories.Categories = nil
+	mgr := orchestrator.NewLifecycleManager(nil, nil, baseline)
+	defer mgr.Shutdown()
+	svc := NewLocalDownloadService(mgr)
+	var wg sync.WaitGroup
+	for _, key := range []string{"auto_resume", "warn_on_duplicate"} {
+		edited := baseline.Clone()
+		edited.FindSetting("General", key).Value = !config.Resolve[bool](baseline.FindSetting("General", key))
+		patch := config.DiffSettings(baseline, edited)
+		wg.Go(func() {
+			if _, err := svc.PatchSettings(patch); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	wg.Wait()
+	got, _ := svc.GetSettings()
+	persisted, err := config.LoadSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"auto_resume", "warn_on_duplicate"} {
+		if got.FindSetting("General", key).Value == baseline.FindSetting("General", key).Value || got.FindSetting("General", key).Value != persisted.FindSetting("General", key).Value {
+			t.Fatalf("lost edit or persistence mismatch: %s", key)
+		}
+	}
+}
+
+func TestFailedSettingsPersistenceLeavesOwnerUnchanged(t *testing.T) {
+	settings := config.DefaultSettings()
+	settings.Categories.Categories = nil
+	mgr := orchestrator.NewLifecycleManager(nil, nil, settings)
+	defer mgr.Shutdown()
+	svc := NewLocalDownloadService(mgr)
+	blocker := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(blocker, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_CONFIG_HOME", blocker)
+	t.Setenv("APPDATA", blocker)
+	updated := settings.Clone()
+	updated.Network.GlobalRateLimit.Value = "1024 B/s"
+	if err := svc.UpdateSettings(updated); err == nil {
+		t.Fatal("expected persistence failure")
+	}
+	current, _ := svc.GetSettings()
+	if current.Network.GlobalRateLimit.Value != settings.Network.GlobalRateLimit.Value {
+		t.Fatal("failed save published new settings")
+	}
+	if _, err := svc.PatchSettings(config.DiffSettings(settings, updated)); err == nil {
+		t.Fatal("expected patch persistence failure")
+	}
+	current, _ = svc.GetSettings()
+	if current.Network.GlobalRateLimit.Value != settings.Network.GlobalRateLimit.Value {
+		t.Fatal("failed patch published new settings")
+	}
+}
+
+func TestSettingsOwnerRejectsInvalidSnapshotsWithoutMutatingCaller(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("APPDATA", t.TempDir())
+	baseline := config.DefaultSettings()
+	baseline.Categories.Categories = nil
+	mgr := orchestrator.NewLifecycleManager(nil, nil, baseline)
+	defer mgr.Shutdown()
+	svc := NewLocalDownloadService(mgr)
+	invalid := baseline.Clone()
+	invalid.General.AutoResume = nil
+	if err := svc.UpdateSettings(invalid); !errors.Is(err, ErrInvalidSettings) {
+		t.Fatalf("expected invalid settings error, got %v", err)
+	}
+	if err := svc.UpdateSettings(nil); !errors.Is(err, ErrInvalidSettings) {
+		t.Fatalf("expected nil settings error, got %v", err)
+	}
+	updated := baseline.Clone()
+	updated.Network.MaxConcurrentDownloads.Value = float64(5)
+	if err := svc.UpdateSettings(updated); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := updated.Network.MaxConcurrentDownloads.Value.(float64); !ok {
+		t.Fatal("owner mutated caller during normalization")
+	}
+	updated.Network.MaxConcurrentDownloads.Value = 6
+	current, _ := svc.GetSettings()
+	if current.Network.MaxConcurrentDownloads.Value != 5 {
+		t.Fatal("owner retained caller snapshot")
+	}
+	persisted, err := config.LoadSettings()
+	if err != nil || persisted.Network.MaxConcurrentDownloads.Value != 5 {
+		t.Fatalf("settings not persisted: %v", err)
+	}
+}
+
+func TestMissingCategoryDirectoryDoesNotBlockSettingsSave(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("APPDATA", t.TempDir())
+	categoryDir := filepath.Join(t.TempDir(), "new-category")
+	for _, enabled := range []bool{false, true} {
+		settings := config.DefaultSettings()
+		settings.Categories.CategoryEnabled.Value = enabled
+		settings.Categories.Categories = []config.Category{{Name: "Archive", Pattern: ".*", Path: categoryDir}}
+		mgr := orchestrator.NewLifecycleManager(nil, nil, settings)
+		svc := NewLocalDownloadService(mgr)
+		settings.General.AutoResume.Value = true
+		err := svc.UpdateSettings(settings)
+		mgr.Shutdown()
+		if err != nil {
+			t.Fatalf("enabled=%v: unrelated save blocked: %v", enabled, err)
+		}
+		loaded, err := config.LoadSettings()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !config.Resolve[bool](loaded.General.AutoResume) || len(loaded.Categories.Categories) != 1 || loaded.Categories.Categories[0].Path != categoryDir {
+			t.Fatalf("enabled=%v: reload lost settings or category path", enabled)
+		}
+		if _, err := os.Stat(categoryDir); !os.IsNotExist(err) {
+			t.Fatalf("settings save created category directory: %v", err)
+		}
+	}
+}
+
+func TestListCompletedDownloadUsesActualFileSize(t *testing.T) {
+	testutil.SetupStateDB(t)
+	path := filepath.Join(t.TempDir(), "completed.bin")
+	if err := os.WriteFile(path, make([]byte, 1234), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AddToMasterList(types.DownloadRecord{ID: "actual-size", Filename: "completed.bin", DestPath: path, Status: "completed", TotalSize: 9999, Downloaded: 9999}); err != nil {
+		t.Fatal(err)
+	}
+	statuses, err := NewLocalDownloadService(nil).List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(statuses) != 1 || statuses[0].TotalSize != 1234 || statuses[0].Downloaded != 1234 {
+		t.Fatalf("completed status should use file size: %+v", statuses)
+	}
+}
+
+func TestCategoryAssignmentIsDurableAndExposedByService(t *testing.T) {
+	testutil.SetupStateDB(t)
+	settings := config.DefaultSettings()
+	settings.Categories.Categories = []config.Category{{Name: "Videos", Path: t.TempDir(), Pattern: ".*"}}
+	mgr := orchestrator.NewLifecycleManager(nil, orchestrator.NewEventBus(), settings)
+	svc := NewLocalDownloadService(mgr)
+	t.Cleanup(func() {
+		if err := svc.Shutdown(); err != nil {
+			t.Errorf("shutdown: %v", err)
+		}
+	})
+	entry := types.DownloadRecord{ID: "category", Status: "paused", DestPath: filepath.Join(t.TempDir(), "file.bin")}
+	if err := store.AddToMasterList(entry); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.AssignCategory(entry.ID, "Videos", true); err != nil {
+		t.Fatal(err)
+	}
+	status, err := svc.GetStatus(entry.ID)
+	if err != nil || status.CategoryOverride == nil || *status.CategoryOverride != "Videos" || status.DestPath != entry.DestPath {
+		t.Fatalf("status=%+v error=%v", status, err)
+	}
+	if err := svc.AssignCategory(entry.ID, "", false); err != nil {
+		t.Fatal(err)
+	}
+	statuses, err := svc.List()
+	if err != nil || len(statuses) != 1 || statuses[0].CategoryOverride == nil || *statuses[0].CategoryOverride != "" {
+		t.Fatalf("list=%+v error=%v", statuses, err)
+	}
+	if err := svc.AssignCategory(entry.ID, "missing", false); err == nil {
+		t.Fatal("unknown category accepted")
+	}
+}
+
+func TestCompletedFileMissingIsTransient(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "file.bin")
+	if !completedFileMissing("completed", path) {
+		t.Fatal("missing completed file not detected")
+	}
+	if completedFileMissing("paused", path) {
+		t.Fatal("paused file treated as missing")
+	}
+	if err := os.WriteFile(path, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if completedFileMissing("completed", path) {
+		t.Fatal("restored file still missing")
+	}
+}
+
+func TestAssignCategoryMissingRecordReturnsNotFound(t *testing.T) {
+	testutil.SetupStateDB(t)
+	settings := config.DefaultSettings()
+	settings.General.DefaultDownloadDir.Value = t.TempDir()
+	mgr := orchestrator.NewLifecycleManager(nil, nil, settings)
+	svc := NewLocalDownloadService(mgr)
+	t.Cleanup(func() { _ = svc.Shutdown() })
+	if err := svc.AssignCategory("missing", "", true); !errors.Is(err, types.ErrNotFound) {
+		t.Fatalf("got %v, want not found", err)
+	}
+}
+
+func TestMovingStatusAndMutationGuards(t *testing.T) {
+	testutil.SetupStateDB(t)
+	mgr := orchestrator.NewLifecycleManager(nil, nil, config.DefaultSettings())
+	svc := NewLocalDownloadService(mgr)
+	t.Cleanup(func() { _ = svc.Shutdown() })
+	source := filepath.Join(t.TempDir(), "file.bin")
+	if err := os.WriteFile(source, []byte("contents"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AddToMasterList(types.DownloadRecord{ID: "moving", Status: "completed", DestPath: source}); err != nil {
+		t.Fatal(err)
+	}
+	err := store.MoveCompletedCategory("moving", "Videos", t.TempDir(), func(moving bool) {
+		if !moving {
+			return
+		}
+		status, err := svc.GetStatus("moving")
+		if err != nil || status == nil || !status.Moving {
+			t.Errorf("moving status missing: %+v %v", status, err)
+		}
+		statuses, err := svc.List()
+		if err != nil || len(statuses) != 1 || !statuses[0].Moving {
+			t.Errorf("moving list status missing: %+v %v", statuses, err)
+		}
+		for _, mutate := range []func() error{
+			func() error { return svc.AssignCategory("moving", "", false) },
+			func() error { return svc.Delete("moving") },
+			func() error { return svc.Purge("moving") },
+			func() error { return svc.UpdateURL("moving", "other") },
+			func() error { return svc.SetRateLimit("moving", 1) },
+			func() error { return svc.ClearRateLimit("moving") },
+			func() error { return svc.Resume("moving") },
+		} {
+			if err := mutate(); !errors.Is(err, types.ErrMoving) {
+				t.Errorf("mutation returned %v, want moving", err)
+			}
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, err := svc.GetStatus("moving")
+	if err != nil || status.Moving {
+		t.Fatalf("moving status did not clear: %+v %v", status, err)
+	}
+}

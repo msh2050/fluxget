@@ -4,13 +4,14 @@ import (
 	"context"
 	"testing"
 
-	"github.com/msh2050/fluxget/internal/core"
-	"github.com/msh2050/fluxget/internal/engine/events"
-	"github.com/msh2050/fluxget/internal/engine/types"
+	"github.com/msh2050/fluxget/internal/config"
+	"github.com/msh2050/fluxget/internal/service"
 	"github.com/msh2050/fluxget/internal/tui"
+	"github.com/msh2050/fluxget/internal/types"
 )
 
 type fakeRemoteDownloadService struct {
+	listCalls    int
 	addCalls     int
 	lastURL      string
 	lastPath     string
@@ -18,17 +19,34 @@ type fakeRemoteDownloadService struct {
 	lastExplicit bool
 }
 
-var _ core.DownloadService = (*fakeRemoteDownloadService)(nil)
+type settingsCapableRemoteService struct {
+	*fakeRemoteDownloadService
+	settings    *config.Settings
+	updateCalls int
+}
+
+func (s *settingsCapableRemoteService) GetSettings() (*config.Settings, error) {
+	return s.settings.Clone(), nil
+}
+
+func (s *settingsCapableRemoteService) UpdateSettings(settings *config.Settings) error {
+	s.settings = settings.Clone()
+	s.updateCalls++
+	return nil
+}
+
+var _ service.DownloadService = (*fakeRemoteDownloadService)(nil)
 
 func (f *fakeRemoteDownloadService) List() ([]types.DownloadStatus, error) {
+	f.listCalls++
 	return nil, nil
 }
 
-func (f *fakeRemoteDownloadService) History() ([]types.DownloadEntry, error) {
+func (f *fakeRemoteDownloadService) History() ([]types.DownloadRecord, error) {
 	return nil, nil
 }
 
-func (f *fakeRemoteDownloadService) Add(url, path, filename string, mirrors []string, headers map[string]string, isExplicitCategory bool, totalSize int64, supportsRange bool) (string, error) {
+func (f *fakeRemoteDownloadService) Add(url, path, filename string, mirrors []string, headers map[string]string, isExplicitCategory bool, workers int, minChunkSize int64) (string, error) {
 	f.addCalls++
 	f.lastURL = url
 	f.lastPath = path
@@ -37,7 +55,7 @@ func (f *fakeRemoteDownloadService) Add(url, path, filename string, mirrors []st
 	return "remote-add-id", nil
 }
 
-func (f *fakeRemoteDownloadService) AddWithID(url, path, filename string, mirrors []string, headers map[string]string, id string, totalSize int64, supportsRange bool) (string, error) {
+func (f *fakeRemoteDownloadService) AddWithID(url, path, filename string, mirrors []string, headers map[string]string, id string, isExplicitCategory bool, workers int, minChunkSize int64) (string, error) {
 	return id, nil
 }
 
@@ -51,12 +69,14 @@ func (f *fakeRemoteDownloadService) UpdateURL(id string, newURL string) error { 
 
 func (f *fakeRemoteDownloadService) Delete(id string) error { return nil }
 
-func (f *fakeRemoteDownloadService) StreamEvents(ctx context.Context) (<-chan interface{}, func(), error) {
-	ch := make(chan interface{})
+func (f *fakeRemoteDownloadService) Purge(id string) error { return nil }
+
+func (f *fakeRemoteDownloadService) StreamEvents(ctx context.Context) (<-chan types.DownloadEvent, func(), error) {
+	ch := make(chan types.DownloadEvent)
 	return ch, func() { close(ch) }, nil
 }
 
-func (f *fakeRemoteDownloadService) Publish(msg interface{}) error { return nil }
+func (f *fakeRemoteDownloadService) Publish(msg types.DownloadEvent) error { return nil }
 
 func (f *fakeRemoteDownloadService) GetStatus(id string) (*types.DownloadStatus, error) {
 	return nil, nil
@@ -64,8 +84,23 @@ func (f *fakeRemoteDownloadService) GetStatus(id string) (*types.DownloadStatus,
 
 func (f *fakeRemoteDownloadService) Shutdown() error { return nil }
 
+func (f *fakeRemoteDownloadService) ClearCompleted() (int64, error) { return 0, nil }
+
+func (f *fakeRemoteDownloadService) ClearFailed() (int64, error)              { return 0, nil }
+func (f *fakeRemoteDownloadService) SetRateLimit(id string, rate int64) error { return nil }
+
+func (f *fakeRemoteDownloadService) ClearRateLimit(id string) error { return nil }
+
 func TestNewRemoteRootModel_UsesNilOrchestrator(t *testing.T) {
-	m := newRemoteRootModel("https://example.com:1700", nil)
+	setupIsolatedCmdState(t)
+	setTUITestMode(t)
+	settings := config.DefaultSettings()
+	settings.General.AutoResume.Value = true
+	if err := config.SaveSettings(settings); err != nil {
+		t.Fatalf("SaveSettings: %v", err)
+	}
+
+	m := newRemoteRootModel("https://example.com:1700", nil, nil, nil)
 
 	if m.Orchestrator != nil {
 		t.Fatal("expected remote root model to use nil orchestrator")
@@ -79,15 +114,24 @@ func TestNewRemoteRootModel_UsesNilOrchestrator(t *testing.T) {
 	if m.ServerPort != 1700 {
 		t.Fatalf("server port = %d, want 1700", m.ServerPort)
 	}
+	if !config.Resolve[bool](m.Settings.General.AutoResume) {
+		t.Fatal("remote model did not load the existing client settings")
+	}
+	if !m.SettingsReadOnly || m.SaveSettingsFunc != nil {
+		t.Fatal("remote model must not persist settings without a daemon-backed store")
+	}
 }
 
 func TestNewRemoteRootModel_DownloadRequestUsesServiceAdd(t *testing.T) {
+	setupIsolatedCmdState(t)
+	setTUITestMode(t)
 	service := &fakeRemoteDownloadService{}
-	m := newRemoteRootModel("https://example.com:1700", service)
+	m := newRemoteRootModel("https://example.com:1700", service, nil, nil)
 	m.Settings.Extension.ExtensionPrompt.Value = false
 	m.Settings.General.WarnOnDuplicate.Value = false
 
-	updated, cmd := m.Update(events.DownloadRequestMsg{
+	updated, cmd := m.Update(types.DownloadEvent{
+		Type:     types.EventRequest,
 		URL:      "https://example.com/file.bin",
 		Filename: "file.bin",
 		Path:     ".",
@@ -117,6 +161,63 @@ func TestNewRemoteRootModel_DownloadRequestUsesServiceAdd(t *testing.T) {
 	if selected.ID != "remote-add-id" {
 		t.Fatalf("queued download ID = %q, want remote-add-id", selected.ID)
 	}
+}
+
+func TestNewRemoteRootModel_UsesDaemonSettingsStore(t *testing.T) {
+	setupIsolatedCmdState(t)
+	setTUITestMode(t)
+	settings := config.DefaultSettings()
+	settings.Categories.Categories = nil
+	settings.General.AutoResume.Value = true
+	remote := &settingsCapableRemoteService{
+		fakeRemoteDownloadService: &fakeRemoteDownloadService{},
+		settings:                  settings,
+	}
+
+	m := newRemoteRootModel("https://example.com:1700", remote, nil, nil)
+	if m.SettingsReadOnly || m.SaveSettingsFunc == nil {
+		t.Fatal("daemon-backed settings should be writable")
+	}
+	m.Settings.General.AutoResume.Value = false
+	if err := m.SaveSettingsFunc(m.Settings); err != nil {
+		t.Fatalf("SaveSettingsFunc: %v", err)
+	}
+	if remote.updateCalls != 1 || config.Resolve[bool](remote.settings.General.AutoResume) {
+		t.Fatal("remote settings store did not receive update")
+	}
+}
+
+func TestNewRemoteRootModel_UsesPrefetchedStatusesAndSettings(t *testing.T) {
+	setTUITestMode(t)
+	service := &fakeRemoteDownloadService{}
+	settings := config.DefaultSettings()
+	statuses := []types.DownloadStatus{{
+		ID:       "prefetched-id",
+		URL:      "https://example.com/file.bin",
+		Filename: "file.bin",
+		Status:   "queued",
+	}}
+
+	m := newRemoteRootModel("https://example.com:1700", service, statuses, settings)
+
+	if service.listCalls != 0 {
+		t.Fatalf("service.List calls = %d, want 0", service.listCalls)
+	}
+	if m.Settings == settings || config.Resolve[bool](m.Settings.General.AutoResume) != config.Resolve[bool](settings.General.AutoResume) {
+		t.Fatal("expected remote model to copy the loaded client settings")
+	}
+	m.UpdateListItems()
+	selected := m.GetSelectedDownload()
+	if selected == nil || selected.ID != "prefetched-id" {
+		t.Fatalf("selected download = %#v, want prefetched-id", selected)
+	}
+}
+
+func setTUITestMode(t *testing.T) {
+	t.Helper()
+	previous := tui.IsTestMode
+	tui.IsTestMode = true
+	t.Cleanup(func() { tui.IsTestMode = previous })
 }
 
 func TestParseConnectTarget_ParsesIPv6AddressWithPort(t *testing.T) {

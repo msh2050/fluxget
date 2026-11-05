@@ -8,11 +8,12 @@ import (
 	"testing"
 
 	"github.com/msh2050/fluxget/internal/config"
-	"github.com/msh2050/fluxget/internal/core"
-	"github.com/msh2050/fluxget/internal/download"
-	"github.com/msh2050/fluxget/internal/engine/state"
-	"github.com/msh2050/fluxget/internal/engine/types"
-	"github.com/msh2050/fluxget/internal/processing"
+	"github.com/msh2050/fluxget/internal/orchestrator"
+	"github.com/msh2050/fluxget/internal/scheduler"
+	"github.com/msh2050/fluxget/internal/service"
+	"github.com/msh2050/fluxget/internal/store"
+	"github.com/msh2050/fluxget/internal/testutil"
+	"github.com/msh2050/fluxget/internal/types"
 )
 
 func TestHandleDownload_HeadlessMode_AutoApprovesNonDuplicate(t *testing.T) {
@@ -42,23 +43,34 @@ func TestHandleDownload_HeadlessMode_AutoApprovesNonDuplicate(t *testing.T) {
 	}
 
 	// Mock server for probe
-	probeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	probeServer := testutil.NewHTTPServerT(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Length", "1024")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(make([]byte, 10))
 	}))
 	defer probeServer.Close()
 
-	progressCh := make(chan any, 10)
+	progressCh := make(chan types.DownloadEvent, 10)
 	GlobalProgressCh = progressCh
-	GlobalPool = download.NewWorkerPool(progressCh, 1)
+	if GlobalPool != nil {
+		GlobalPool.GracefulShutdown()
+	}
+	tmpPool := scheduler.New(progressCh, 1)
+	t.Cleanup(func() {
+		if tmpPool != nil {
+			tmpPool.GracefulShutdown()
+		}
+	})
+	GlobalPool = tmpPool
 
-	// Mock lifecycle to bypass real downloads
-	GlobalLifecycle = processing.NewLifecycleManager(func(url, path, filename string, _ []string, headers map[string]string, explicit bool, totalSize int64, supportsRange bool) (string, error) {
-		return "queued-id", nil
-	}, nil)
+	eventBus := orchestrator.NewEventBus()
+	t.Cleanup(func() { eventBus.Shutdown() })
+	getAll := func() []types.DownloadRecord { return GlobalPool.GetAll() }
+	tmpLifecycle := orchestrator.NewLifecycleManager(GlobalPool, eventBus, nil, buildActiveDownloadChecker(getAll))
+	t.Cleanup(func() { tmpLifecycle.Shutdown() })
+	GlobalLifecycle = tmpLifecycle
 
-	svc := core.NewLocalDownloadService(GlobalPool)
+	svc := service.NewLocalDownloadService(GlobalLifecycle)
 	GlobalService = svc
 
 	// Verify it auto-approves even with ExtensionPrompt=true
@@ -99,20 +111,35 @@ func TestHandleDownload_HeadlessMode_RejectsDuplicateWithWarn(t *testing.T) {
 		t.Fatalf("SaveSettings failed: %v", err)
 	}
 
-	progressCh := make(chan any, 10)
+	progressCh := make(chan types.DownloadEvent, 10)
 	GlobalProgressCh = progressCh
-	GlobalPool = download.NewWorkerPool(progressCh, 1)
+	if GlobalPool != nil {
+		GlobalPool.GracefulShutdown()
+	}
+	tmpPool := scheduler.New(progressCh, 1)
+	t.Cleanup(func() {
+		if tmpPool != nil {
+			tmpPool.GracefulShutdown()
+		}
+	})
+	GlobalPool = tmpPool
 
 	// Seed the DB with a "duplicate" entry
 	url := "http://example.com/duplicate.bin"
-	_ = state.AddToMasterList(types.DownloadEntry{
+	_ = store.AddToMasterList(types.DownloadRecord{
 		ID:       "dup-id",
 		URL:      url,
 		Filename: "duplicate.bin",
 		Status:   "completed",
 	})
 
-	svc := core.NewLocalDownloadService(GlobalPool)
+	eventBus := orchestrator.NewEventBus()
+	t.Cleanup(func() { eventBus.Shutdown() })
+	getAll := func() []types.DownloadRecord { return GlobalPool.GetAll() }
+	tmpLifecycle := orchestrator.NewLifecycleManager(GlobalPool, eventBus, nil, buildActiveDownloadChecker(getAll))
+	t.Cleanup(func() { tmpLifecycle.Shutdown() })
+	GlobalLifecycle = tmpLifecycle
+	svc := service.NewLocalDownloadService(GlobalLifecycle)
 	GlobalService = svc
 
 	// Verify it still rejects duplicates when WarnOnDuplicate is on
@@ -152,14 +179,29 @@ func TestHandleDownload_HeadlessMode_RejectsExtensionPromptDuplicate(t *testing.
 	}
 
 	url := "http://example.com/already-downloaded.bin"
-	_ = state.AddToMasterList(types.DownloadEntry{
+	_ = store.AddToMasterList(types.DownloadRecord{
 		ID: "ext-dup-id", URL: url, Filename: "already-downloaded.bin", Status: "completed",
 	})
 
-	progressCh := make(chan any, 10)
+	progressCh := make(chan types.DownloadEvent, 10)
 	GlobalProgressCh = progressCh
-	GlobalPool = download.NewWorkerPool(progressCh, 1)
-	svc := core.NewLocalDownloadService(GlobalPool)
+	if GlobalPool != nil {
+		GlobalPool.GracefulShutdown()
+	}
+	tmpPool := scheduler.New(progressCh, 1)
+	t.Cleanup(func() {
+		if tmpPool != nil {
+			tmpPool.GracefulShutdown()
+		}
+	})
+	GlobalPool = tmpPool
+	eventBus := orchestrator.NewEventBus()
+	t.Cleanup(func() { eventBus.Shutdown() })
+	getAll := func() []types.DownloadRecord { return GlobalPool.GetAll() }
+	tmpLifecycle := orchestrator.NewLifecycleManager(GlobalPool, eventBus, nil, buildActiveDownloadChecker(getAll))
+	t.Cleanup(func() { tmpLifecycle.Shutdown() })
+	GlobalLifecycle = tmpLifecycle
+	svc := service.NewLocalDownloadService(GlobalLifecycle)
 	GlobalService = svc
 
 	body := fmt.Sprintf(`{"url": %q, "skip_approval": false}`, url)

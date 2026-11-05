@@ -8,10 +8,12 @@ import (
 	"time"
 
 	"github.com/msh2050/fluxget/internal/config"
+	"github.com/msh2050/fluxget/internal/service"
 	"github.com/msh2050/fluxget/internal/tui/colors"
 	"github.com/msh2050/fluxget/internal/tui/components"
 	"github.com/msh2050/fluxget/internal/utils"
 
+	"charm.land/bubbles/v2/key"
 	"charm.land/lipgloss/v2"
 )
 
@@ -27,7 +29,7 @@ func (m RootModel) viewSettings() string {
 			Padding(DefaultPaddingY, DefaultPaddingX*2).
 			Foreground(colors.LightGray()).
 			Render("Terminal too small for settings view")
-		box := renderBtopBox(PaneTitleStyle.Render(" Settings "), "", content, width, height, colors.Magenta())
+		box := renderBtopBox(PaneTitleStyle.Render(" Settings "), m.settingsSearchTitle(), content, width, height, colors.Magenta())
 		return m.renderModalWithOverlay(box)
 	}
 
@@ -37,11 +39,10 @@ func (m RootModel) viewSettings() string {
 			Padding(1, 2).
 			Foreground(colors.LightGray()).
 			Render("No settings categories available")
-		box := renderBtopBox(PaneTitleStyle.Render(" Settings "), "", content, width, height, colors.Magenta())
+		box := renderBtopBox(PaneTitleStyle.Render(" Settings "), m.settingsSearchTitle(), content, width, height, colors.Magenta())
 		return m.renderModalWithOverlay(box)
 	}
 
-	metadata := config.GetSettingsMetadata()
 	activeTab := m.SettingsActiveTab
 	if activeTab < 0 {
 		activeTab = 0
@@ -51,16 +52,7 @@ func (m RootModel) viewSettings() string {
 	}
 
 	currentCategory := categories[activeTab]
-	settingsMeta := metadata[currentCategory]
-	if len(settingsMeta) == 0 {
-		content := lipgloss.NewStyle().
-			Padding(1, 2).
-			Foreground(colors.LightGray()).
-			Render("No settings available in this category")
-		box := renderBtopBox(PaneTitleStyle.Render(" Settings "), "", content, width, height, colors.Magenta())
-		return m.renderModalWithOverlay(box)
-	}
-
+	settingsMeta := m.buildSettingsMetaForCategory(currentCategory)
 	selectedRow := m.SettingsSelectedRow
 	if selectedRow < 0 {
 		selectedRow = 0
@@ -70,6 +62,13 @@ func (m RootModel) viewSettings() string {
 	}
 
 	settingsValues := m.getSettingsValues(currentCategory)
+	if m.settingsSearchQuery != "" {
+		for _, category := range categories {
+			for key, value := range m.getSettingsValues(category) {
+				settingsValues[key] = value
+			}
+		}
+	}
 	tabBar := m.renderSettingsTabBar(categories, activeTab, width-(ProgressBarWidthOffset+HeaderWidthOffset))
 	helpText := m.renderSettingsHelp(width - (ProgressBarWidthOffset + HeaderWidthOffset))
 
@@ -111,7 +110,9 @@ func (m RootModel) viewSettings() string {
 	}
 
 	var content string
-	if width >= 72 && bodyHeight >= 8 {
+	if len(settingsMeta) == 0 {
+		content = formatSettingsBlock("No matching settings", width-BoxStyle.GetHorizontalFrameSize(), bodyHeight)
+	} else if width >= 72 && bodyHeight >= 8 {
 		content = m.renderSettingsTwoColumn(settingsMeta, selectedRow, settingsValues, width, bodyHeight)
 	} else {
 		content = m.renderSettingsCompact(settingsMeta, selectedRow, settingsValues, width, bodyHeight)
@@ -139,7 +140,7 @@ func (m RootModel) viewSettings() string {
 
 	fullContent := lipgloss.JoinVertical(lipgloss.Left, parts...)
 
-	box := renderBtopBox(PaneTitleStyle.Render(" Settings "), "", fullContent, width, height, colors.Magenta())
+	box := renderBtopBox(PaneTitleStyle.Render(" Settings "), m.settingsSearchTitle(), fullContent, width, height, colors.Magenta())
 	return m.renderModalWithOverlay(box)
 }
 
@@ -147,6 +148,12 @@ func shortSettingsCategoryLabel(label string) string {
 	switch label {
 	case "General":
 		return "Gen"
+	case "Downloads":
+		return "DLs"
+	case "Advanced":
+		return "Adv"
+	case "Appearance":
+		return "Look"
 	case "Network":
 		return "Net"
 	case "Performance":
@@ -177,7 +184,16 @@ func (m RootModel) renderSettingsTabBar(categories []string, activeTab int, maxW
 		return tabs
 	}
 
-	settingsActiveTab := lipgloss.NewStyle().Foreground(colors.Magenta())
+	var settingsActiveTab lipgloss.Style
+	if m.SettingsFocusedPane == 0 {
+		settingsActiveTab = lipgloss.NewStyle().
+			Foreground(colors.ContrastForeground(colors.Magenta())).
+			Background(colors.Magenta()).
+			Bold(true)
+	} else {
+		settingsActiveTab = lipgloss.NewStyle().Foreground(colors.Magenta())
+	}
+
 	tryBars := []string{
 		components.RenderNumberedTabBar(makeTabs(false), activeTab, settingsActiveTab, TabStyle),
 		components.RenderTabBar(makeTabs(false), activeTab, settingsActiveTab, TabStyle),
@@ -191,29 +207,69 @@ func (m RootModel) renderSettingsTabBar(categories []string, activeTab int, maxW
 	}
 
 	fallback := fmt.Sprintf("[%d/%d] %s", activeTab+1, len(categories), categories[activeTab])
-	return lipgloss.NewStyle().
-		Foreground(colors.Gray()).
+	fallbackStyle := lipgloss.NewStyle().Foreground(colors.Gray())
+	if m.SettingsFocusedPane == 0 {
+		fallbackStyle = lipgloss.NewStyle().
+			Foreground(colors.ContrastForeground(colors.Magenta())).
+			Background(colors.Magenta()).
+			Bold(true)
+	}
+	return fallbackStyle.
 		Width(maxWidth).
 		Align(lipgloss.Center).
 		Render(fallback)
 }
 
 func (m RootModel) renderSettingsHelp(width int) string {
+	if m.SettingsReadOnly {
+		return utils.WrapText("Read-only settings \u00B7 "+m.keys.Settings.Close.Help().Key+" close", width)
+	}
 	if width < 1 {
 		width = 1
 	}
 
-	helpText := m.help.View(m.keys.Settings)
-	if width < 60 {
-		helpText = "esc: save/close  tab: next tab  enter: edit"
+	help := m.help
+	help.SetWidth(width)
+	helpText := help.View(m.keys.Settings)
+	if !m.SettingsIsEditing && m.categoryListFocused() {
+		keys := []key.Binding{m.keys.Settings.Up, m.keys.Settings.Down, m.keys.Settings.Edit}
+		switch m.getCurrentSettingType() {
+		case config.TypeCustomCategory:
+			keys = append(keys, m.keys.Settings.DeleteCategory)
+		case config.TypeCustomCategoryAdd:
+			// Add has no existing category to delete or setting to reset.
+		default:
+			keys = append(keys, m.keys.Settings.Reset)
+		}
+		keys = append(keys, m.keys.Settings.Close)
+		helpText = help.ShortHelpView(keys)
+		var secondary []key.Binding
+		if m.settingsSearchQuery == "" && m.getCurrentSettingType() == config.TypeCustomCategory {
+			secondary = append(secondary, m.keys.Settings.MoveCategoryUp, m.keys.Settings.MoveCategoryDown)
+		}
+		if len(secondary) > 0 {
+			helpText = lipgloss.JoinVertical(lipgloss.Center, helpText, help.ShortHelpView(secondary))
+		}
 	}
-	if width < 40 {
-		helpText = "esc close | enter edit"
+	if m.SettingsIsEditing {
+		helpText = help.View(m.keys.SettingsEditor)
+		if typ := m.getCurrentSettingType(); typ == config.TypeCustomCategory || typ == config.TypeCustomCategoryAdd {
+			navigation := []key.Binding{
+				key.NewBinding(key.WithKeys("tab", "down"), key.WithHelp("tab/\u2193", "next field")),
+				key.NewBinding(key.WithKeys("shift+tab", "up"), key.WithHelp("shift+tab/\u2191", "prev field")),
+			}
+			if m.catMgrEditField == 3 && !m.IsRemote {
+				navigation = append(navigation, m.keys.Settings.Browse)
+			}
+			helpText = lipgloss.JoinVertical(lipgloss.Center, helpText, help.ShortHelpView(navigation))
+		}
 	}
 
 	return lipgloss.NewStyle().
 		Foreground(colors.Gray()).
 		Width(width).
+		Height(2).
+		AlignVertical(lipgloss.Bottom).
 		Align(lipgloss.Center).
 		Render(helpText)
 }
@@ -241,7 +297,7 @@ func formatSettingsBlock(content string, width, rows int) string {
 	return strings.Join(lines, "\n")
 }
 
-func renderSettingsListViewport(settingsMeta []config.SettingMeta, selectedRow, rows, innerWidth int) string {
+func (m RootModel) renderSettingsListViewport(settingsMeta []config.SettingMeta, selectedRow, rows, innerWidth int) string {
 	if rows < 1 {
 		rows = 1
 	}
@@ -260,11 +316,26 @@ func renderSettingsListViewport(settingsMeta []config.SettingMeta, selectedRow, 
 		selectedRow = len(settingsMeta) - 1
 	}
 
-	start := 0
-	if selectedRow >= rows {
-		start = selectedRow - rows + 1
+	// Keep the category toggle separate from the editable rules without adding
+	// a navigable row to the settings model.
+	visualRows := make([]int, 0, len(settingsMeta)+1)
+	selectedVisualRow := selectedRow
+	for i, meta := range settingsMeta {
+		if m.settingsSearchQuery == "" && i > 0 && settingsMeta[i-1].Key == "category_enabled" &&
+			(meta.Type == config.TypeCustomCategory || meta.Type == config.TypeCustomCategoryAdd) {
+			visualRows = append(visualRows, -1)
+			if selectedRow >= i {
+				selectedVisualRow++
+			}
+		}
+		visualRows = append(visualRows, i)
 	}
-	maxStart := len(settingsMeta) - rows
+
+	start := selectedVisualRow - (rows / 2)
+	if start < 0 {
+		start = 0
+	}
+	maxStart := len(visualRows) - rows
 	if maxStart < 0 {
 		maxStart = 0
 	}
@@ -274,25 +345,35 @@ func renderSettingsListViewport(settingsMeta []config.SettingMeta, selectedRow, 
 
 	lines := make([]string, 0, rows)
 	for i := 0; i < rows; i++ {
-		idx := start + i
-		if idx >= len(settingsMeta) {
+		visualIndex := start + i
+		if visualIndex >= len(visualRows) || visualRows[visualIndex] < 0 {
 			lines = append(lines, "")
 			continue
 		}
-
+		idx := visualRows[visualIndex]
 		meta := settingsMeta[idx]
 		prefix := "  "
 		style := lipgloss.NewStyle().Foreground(colors.LightGray())
 		if idx == selectedRow {
-			prefix = "\u25b8 "
-			style = lipgloss.NewStyle().Foreground(colors.Magenta()).Bold(true)
+			if m.SettingsFocusedPane == 1 {
+				prefix = "> "
+				style = lipgloss.NewStyle().Foreground(colors.Cyan()).Bold(true)
+			} else {
+				prefix = "  "
+				style = lipgloss.NewStyle().Foreground(colors.Gray()).Bold(true)
+			}
 		}
 
 		if meta.Key == "max_global_connections" {
-			style = lipgloss.NewStyle().Foreground(colors.ThemeColor("#aaaaaa", "238"))
+			style = lipgloss.NewStyle().Foreground(colors.LightGray())
 			if idx == selectedRow {
-				prefix = "# "
-				style = lipgloss.NewStyle().Foreground(colors.Gray())
+				if m.SettingsFocusedPane == 1 {
+					prefix = "# "
+					style = lipgloss.NewStyle().Foreground(colors.Gray())
+				} else {
+					prefix = "  "
+					style = lipgloss.NewStyle().Foreground(colors.Gray())
+				}
 			}
 		}
 
@@ -305,7 +386,11 @@ func renderSettingsListViewport(settingsMeta []config.SettingMeta, selectedRow, 
 		// Truncate to avoid line wrapping which breaks parent height constraints
 		label = utils.TruncateMiddle(label, maxLabelLen)
 
-		lines = append(lines, style.Width(innerWidth).MaxWidth(innerWidth).Render(prefix+label))
+		line := style.Width(innerWidth).MaxWidth(innerWidth).Render(prefix + label)
+		if idx == selectedRow {
+			line = shadeSelectedRow(line, innerWidth, colors.SettingsSelectionBackground())
+		}
+		lines = append(lines, line)
 	}
 
 	return strings.Join(lines, "\n")
@@ -324,18 +409,39 @@ func (m RootModel) renderSettingsDetailBlock(settingsMeta []config.SettingMeta, 
 
 	meta := settingsMeta[selectedRow]
 	value := settingsValues[meta.Key]
-	unit := m.getSettingUnit()
-	unitStyle := lipgloss.NewStyle().Foreground(colors.Gray())
 
+	unit := settingUnitSuffix(meta.Unit)
+	unitStyle := lipgloss.NewStyle().Foreground(colors.LightGray())
+
+	valueLabel := "Value: "
+	if !m.SettingsIsEditing && !m.SettingsReadOnly {
+		switch meta.Type {
+		case config.TypeString, config.TypeInt, config.TypeInt64, config.TypeFloat64, config.TypeDuration:
+			valueLabel = "[" + m.keys.Settings.Edit.Help().Key + "] Change value: "
+		}
+	}
 	var valueStr string
 	if m.SettingsIsEditing {
-		valueStr = m.SettingsInput.View() + unitStyle.Render(unit)
+		if meta.Type == config.TypeCustomCategory || meta.Type == config.TypeCustomCategoryAdd {
+			valueStr = lipgloss.JoinVertical(lipgloss.Left,
+				m.renderCategoryInputLine("Name:", 0, innerWidth),
+				"",
+				m.renderCategoryInputLine("Desc:", 1, innerWidth),
+				"",
+				m.renderCategoryInputLine("Regex:", 2, innerWidth),
+				"",
+				m.renderCategoryInputLine("Path:", 3, innerWidth),
+			)
+			valueLabel = ""
+		} else {
+			valueStr = m.SettingsInput.View() + unitStyle.Render(unit)
+		}
 	} else {
 		switch meta.Type {
-		case "auth_token":
+		case config.TypeAuthToken:
 			token := GetAuthToken()
 			if token == "" {
-				valueStr = lipgloss.NewStyle().Foreground(colors.Gray()).Render("(Not generated yet)")
+				valueStr = lipgloss.NewStyle().Foreground(colors.LightGray()).Render("(Not generated yet)")
 			} else {
 				if m.ExtensionTokenCopied {
 					valueStr = lipgloss.NewStyle().Foreground(colors.StateDownloading()).Bold(true).Render("Copied!")
@@ -344,28 +450,57 @@ func (m RootModel) renderSettingsDetailBlock(settingsMeta []config.SettingMeta, 
 					if len(token) > 16 {
 						displayToken = token[:8] + "..." + token[len(token)-8:]
 					}
-					valueStr = displayToken + lipgloss.NewStyle().Foreground(colors.Gray()).Render(" [Enter to Copy]")
+					valueStr = displayToken + lipgloss.NewStyle().Foreground(colors.LightGray()).Render(" ["+m.keys.Settings.Edit.Help().Key+"] Copy")
 				}
 			}
-		case "link":
-			valueStr = lipgloss.NewStyle().Foreground(colors.Cyan()).Render("Open [Enter]")
+		case config.TypeLink:
+			valueStr = lipgloss.NewStyle().Foreground(colors.Cyan()).Render("[" + m.keys.Settings.Edit.Help().Key + "] Open")
+			valueLabel = "Action: "
+		case config.TypeCustomCategoryAdd:
+			valueStr = lipgloss.NewStyle().Foreground(colors.Cyan()).Render("[" + m.keys.Settings.Edit.Help().Key + "] Create Category")
+			valueLabel = "Action: "
+		case config.TypeCustomCategory:
+			cat, ok := value.(config.Category)
+			if !ok {
+				break
+			}
+			labelStyle := lipgloss.NewStyle().Foreground(colors.LightGray()).Width(8)
+			valueStr = lipgloss.JoinVertical(lipgloss.Left,
+				lipgloss.JoinHorizontal(lipgloss.Top, labelStyle.Render("Name:"), utils.TruncateMiddle(cat.Name, innerWidth-20)),
+				"",
+				lipgloss.JoinHorizontal(lipgloss.Top, labelStyle.Render("Desc:"), utils.TruncateMiddle(cat.Description, innerWidth-20)),
+				"",
+				lipgloss.JoinHorizontal(lipgloss.Top, labelStyle.Render("Regex:"), utils.TruncateMiddle(cat.Pattern, innerWidth-20)),
+				"",
+				lipgloss.JoinHorizontal(lipgloss.Top, labelStyle.Render("Path:"), utils.TruncateMiddle(cat.Path, innerWidth-20)),
+			)
+			valueLabel = ""
 		default:
-			valueStr = formatSettingValueForEdit(value, meta.Type, meta.Key, true) + unitStyle.Render(unit)
+			valueStr = formatSettingValueForEdit(value, meta.Type, meta.Unit, meta.Key, true)
+			if valueStr != "\u221E" {
+				valueStr += unitStyle.Render(unit)
+			}
 			if meta.Key == "max_global_connections" {
 				valueStr += " (Ignored)"
 			}
 		}
 	}
 
-	valueLabel := "Value: "
-	if (meta.Key == "default_download_dir" || meta.Key == "theme_path") && !m.SettingsIsEditing {
-		valueLabel = "[Tab] Browse: "
-	}
-	if meta.Type == "link" {
-		valueLabel = "Action: "
+	if meta.Key == "default_download_dir" && !m.SettingsIsEditing {
+		if path, ok := value.(string); ok && path == "" {
+			valueStr = "(current directory)"
+		}
 	}
 
-	valueLabelStyle := lipgloss.NewStyle().Foreground(colors.Cyan()).Bold(true)
+	if (meta.Key == "default_download_dir" || meta.Key == "theme_path") && !m.SettingsIsEditing {
+		valueLabel = "[" + m.keys.Settings.Browse.Help().Key + "] Browse: "
+	}
+
+	if !m.SettingsIsEditing && !m.SettingsReadOnly && meta.Type == config.TypeBool {
+		valueLabel = "[" + m.keys.Settings.Edit.Help().Key + "] Toggle: "
+	}
+
+	valueLabelStyle := lipgloss.NewStyle().Foreground(colors.LightGray()).Bold(true)
 	valueContentStyle := lipgloss.NewStyle().Foreground(colors.White())
 
 	labelRendered := valueLabelStyle.Render(valueLabel)
@@ -374,10 +509,18 @@ func (m RootModel) renderSettingsDetailBlock(settingsMeta []config.SettingMeta, 
 		availableValueWidth = 5
 	}
 
-	valueDisplay := lipgloss.JoinHorizontal(lipgloss.Top,
-		labelRendered,
-		valueContentStyle.Render(utils.TruncateTwoLines(valueStr, availableValueWidth)),
-	)
+	var valueDisplay string
+	if meta.Type == config.TypeCustomCategory || meta.Type == config.TypeCustomCategoryAdd {
+		valueDisplay = lipgloss.JoinHorizontal(lipgloss.Top,
+			labelRendered,
+			valueContentStyle.Render(valueStr),
+		)
+	} else {
+		valueDisplay = lipgloss.JoinHorizontal(lipgloss.Top,
+			labelRendered,
+			valueContentStyle.Render(utils.TruncateTwoLines(valueStr, availableValueWidth)),
+		)
+	}
 	valueDisplay = lipgloss.NewStyle().Width(innerWidth).MaxWidth(innerWidth).Render(valueDisplay)
 
 	divider := lipgloss.NewStyle().Foreground(colors.Gray()).Render(strings.Repeat("\u2500", innerWidth))
@@ -392,13 +535,22 @@ func (m RootModel) renderSettingsDetailBlock(settingsMeta []config.SettingMeta, 
 	}
 
 	wrappedDesc := utils.WrapText(desc, innerWidth)
+	if meta.Key == "category_enabled" {
+		priority := utils.WrapText("Categories are checked from top to bottom; the first match wins.", innerWidth)
+		wrappedDesc += "\n\n" + lipgloss.NewStyle().Bold(true).Render(priority)
+	}
 	descDisplay := lipgloss.NewStyle().
 		Foreground(colors.LightGray()).
 		Width(innerWidth).
 		MaxWidth(innerWidth).
 		Render(wrappedDesc)
 
+	titleStyle := lipgloss.NewStyle().Foreground(colors.Magenta()).Bold(true)
+	titleDisplay := titleStyle.Width(innerWidth).MaxWidth(innerWidth).Render(meta.Label)
+
 	detail := lipgloss.JoinVertical(lipgloss.Left,
+		titleDisplay,
+		"",
 		valueDisplay,
 		"",
 		divider,
@@ -409,8 +561,17 @@ func (m RootModel) renderSettingsDetailBlock(settingsMeta []config.SettingMeta, 
 	return formatSettingsBlock(detail, innerWidth, rows)
 }
 
+func calculateSettingsPaneWidths(modalWidth int) (leftWidth, rightWidth int) {
+	leftWidth, rightWidth = CalculateTwoColumnWidths(modalWidth, 32, 22)
+	innerWidthForModal := modalWidth - BoxStyle.GetHorizontalFrameSize()
+	if leftWidth > 0 && innerWidthForModal > leftWidth+1 {
+		rightWidth = innerWidthForModal - leftWidth - 1
+	}
+	return leftWidth, rightWidth
+}
+
 func (m RootModel) renderSettingsTwoColumn(settingsMeta []config.SettingMeta, selectedRow int, settingsValues map[string]interface{}, modalWidth, bodyHeight int) string {
-	leftWidth, rightWidth := CalculateTwoColumnWidths(modalWidth, 32, 22)
+	leftWidth, rightWidth := calculateSettingsPaneWidths(modalWidth)
 
 	if leftWidth < 12 || rightWidth < 14 {
 		return m.renderSettingsCompact(settingsMeta, selectedRow, settingsValues, modalWidth, bodyHeight)
@@ -421,7 +582,7 @@ func (m RootModel) renderSettingsTwoColumn(settingsMeta []config.SettingMeta, se
 	if listRows < 1 {
 		listRows = 1
 	}
-	listContent := renderSettingsListViewport(settingsMeta, selectedRow, listRows, leftWidth-(BoxStyle.GetHorizontalFrameSize()*2))
+	listContent := m.renderSettingsListViewport(settingsMeta, selectedRow, listRows, leftWidth-(BoxStyle.GetHorizontalFrameSize()*2))
 	listBox := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(colors.Gray()).
@@ -475,7 +636,7 @@ func (m RootModel) renderSettingsCompact(settingsMeta []config.SettingMeta, sele
 		}
 	}
 
-	list := renderSettingsListViewport(settingsMeta, selectedRow, listRows, innerWidth)
+	list := m.renderSettingsListViewport(settingsMeta, selectedRow, listRows, innerWidth)
 	detail := m.renderSettingsDetailBlock(settingsMeta, selectedRow, settingsValues, innerWidth, detailRows)
 	divider := lipgloss.NewStyle().Foreground(colors.Gray()).Render(strings.Repeat("\u2500", innerWidth))
 
@@ -507,8 +668,7 @@ func (m *RootModel) normalizeSettingsSelection() {
 		m.SettingsActiveTab = len(categories) - 1
 	}
 
-	settingsMap := config.GetSettingsMetadata()
-	settingsList := settingsMap[categories[m.SettingsActiveTab]]
+	settingsList := m.buildSettingsMetaForCategory(categories[m.SettingsActiveTab])
 	if len(settingsList) == 0 {
 		m.SettingsSelectedRow = 0
 		if m.SettingsIsEditing {
@@ -529,11 +689,15 @@ func (m *RootModel) normalizeSettingsSelection() {
 func (m *RootModel) updateSettingsInputWidthForViewport() {
 	modalWidth, _ := GetSettingsDimensions(m.width, m.height)
 	var targetWidth int
+	var catInputWidth int
 	if modalWidth >= 72 {
-		_, rightWidth := CalculateTwoColumnWidths(modalWidth, 32, 22)
-		targetWidth = rightWidth - 10 // Fixed offset for labels
+		_, rightWidth := calculateSettingsPaneWidths(modalWidth)
+
+		targetWidth = rightWidth - 10   // Fixed offset for labels
+		catInputWidth = rightWidth - 12 // rightWidth - 4 (padding) - 8 (label width)
 	} else {
-		targetWidth = modalWidth - 16 // Fixed offset for labels
+		targetWidth = modalWidth - 16   // Fixed offset for labels
+		catInputWidth = modalWidth - 10 // modalWidth - 2 (padding) - 8 (label width)
 	}
 
 	if targetWidth < MinSettingsInputW {
@@ -543,57 +707,35 @@ func (m *RootModel) updateSettingsInputWidthForViewport() {
 		targetWidth = MaxSettingsInputW
 	}
 
+	if catInputWidth < MinSettingsInputW {
+		catInputWidth = MinSettingsInputW
+	}
+	if catInputWidth > MaxSettingsInputW {
+		catInputWidth = MaxSettingsInputW
+	}
+
 	m.SettingsInput.SetWidth(targetWidth)
+	for i := range m.catMgrInputs {
+		m.catMgrInputs[i].SetWidth(catInputWidth)
+	}
 }
 
 // getSettingsValues returns a map of setting key -> value for a category
 func (m RootModel) getSettingsValues(category string) map[string]interface{} {
 	values := make(map[string]interface{})
-
-	val := reflect.ValueOf(m.Settings).Elem()
-	typ := val.Type()
-
-	var catVal reflect.Value
-	var found bool
-	for i := 0; i < typ.NumField(); i++ {
-		field := typ.Field(i)
-		label := field.Tag.Get("ui_label")
-		if label == "" {
-			label = field.Name
-		}
-		if label == category {
-			catVal = val.Field(i)
-			found = true
-			break
-		}
-	}
-
-	if !found {
+	if m.Settings == nil {
 		return values
 	}
 
-	if catVal.Kind() == reflect.Struct {
-		catTyp := catVal.Type()
-		for i := 0; i < catTyp.NumField(); i++ {
-			field := catTyp.Field(i)
-			if field.Tag.Get("ui_ignored") == "true" {
-				continue
-			}
+	for _, meta := range config.GetSettingsMetadata()[category] {
+		if setting := m.Settings.FindSetting(category, meta.Key); setting != nil {
+			values[meta.Key] = setting.Value
+		}
+	}
 
-			key := field.Tag.Get("json")
-			if key == "" {
-				key = field.Name
-			}
-			valInterface := catVal.Field(i).Interface()
-			if setting, ok := valInterface.(*config.Setting); ok {
-				if setting != nil {
-					values[key] = setting.Value
-				} else {
-					values[key] = nil
-				}
-			} else {
-				values[key] = valInterface
-			}
+	if category == "Categories" {
+		for i, cat := range m.Settings.Categories.Categories {
+			values[fmt.Sprintf("category_%d", i)] = cat
 		}
 	}
 
@@ -602,156 +744,173 @@ func (m RootModel) getSettingsValues(category string) map[string]interface{} {
 
 // setSettingValue sets a setting value from string input
 func (m *RootModel) setSettingValue(category, key, value string) error {
-	val := reflect.ValueOf(m.Settings).Elem()
-	typ := val.Type()
-
-	var catVal reflect.Value
-	var foundCat bool
-	for i := 0; i < typ.NumField(); i++ {
-		field := typ.Field(i)
-		label := field.Tag.Get("ui_label")
-		if label == "" {
-			label = field.Name
-		}
-		if label == category {
-			catVal = val.Field(i)
-			foundCat = true
-			break
-		}
-	}
-
-	if !foundCat || catVal.Kind() != reflect.Struct {
+	setting := m.Settings.FindSetting(category, key)
+	if setting == nil {
 		return nil
 	}
 
-	catTyp := catVal.Type()
-	for i := 0; i < catTyp.NumField(); i++ {
-		field := catTyp.Field(i)
-		if field.Tag.Get("ui_ignored") == "true" {
-			continue
-		}
-
-		fieldKey := field.Tag.Get("json")
-		if fieldKey == "" {
-			fieldKey = field.Name
-		}
-
-		if fieldKey == key {
-			targetField := catVal.Field(i)
-			if !targetField.CanSet() {
-				return nil
+	// Special logic for Theme to trigger app re-rendering internally
+	if key == "theme" {
+		var theme int
+		valLower := strings.ToLower(value)
+		switch valLower {
+		case "system", "adaptive", "0":
+			theme = config.ThemeAdaptive
+		case "light", "1":
+			theme = config.ThemeLight
+		case "dark", "2":
+			theme = config.ThemeDark
+		default:
+			if v, err := strconv.Atoi(value); err == nil && v >= 0 && v <= 2 {
+				theme = v
+			} else {
+				return nil // Invalid
 			}
-
-			if setting, ok := targetField.Interface().(*config.Setting); ok {
-				if setting == nil {
-					return nil
-				}
-
-				// Special logic for Theme to trigger app re-rendering internally
-				if key == "theme" {
-					var theme int
-					valLower := strings.ToLower(value)
-					switch valLower {
-					case "system", "adaptive", "0":
-						theme = config.ThemeAdaptive
-					case "light", "1":
-						theme = config.ThemeLight
-					case "dark", "2":
-						theme = config.ThemeDark
-					default:
-						if v, err := strconv.Atoi(value); err == nil && v >= 0 && v <= 2 {
-							theme = v
-						} else {
-							return nil // Invalid
-						}
-					}
-					setting.Value = theme
-					m.ApplyTheme(theme, config.Resolve[string](m.Settings.General.ThemePath))
-					return nil
-				}
-				if key == "theme_path" {
-					setting.Value = value
-					// Re-apply the current theme mode but with the brand new path
-					m.ApplyTheme(config.Resolve[int](m.Settings.General.Theme), value)
-					return nil
-				}
-
-				// Generic Parsing and Application
-				switch setting.Type {
-				case "bool":
-					// Typically toggled unless explicitly typed out
-					if value == "" {
-						if key == "auto_start" {
-							if m.ToggleServiceFunc == nil {
-								return fmt.Errorf("service management is not available on this platform")
-							}
-							newVal := !config.Resolve[bool](setting)
-							if err := m.ToggleServiceFunc(newVal); err != nil {
-								return fmt.Errorf("failed to update service: %w", err)
-							}
-							setting.Value = newVal
-							return nil
-						}
-						setting.Value = !config.Resolve[bool](setting)
-					} else {
-						b, _ := strconv.ParseBool(value)
-						setting.Value = b
-					}
-				case "string", "auth_token", "link":
-					setting.Value = value
-				case "int":
-					if key == "worker_buffer_size" {
-						if v, err := strconv.ParseFloat(value, 64); err == nil {
-							setting.Value = int(v * float64(config.KB))
-						}
-					} else {
-						if v, err := strconv.Atoi(value); err == nil {
-							setting.Value = v
-						}
-					}
-				case "int64":
-					// Handle KB/MB scaling gracefully if specified
-					if key == "min_chunk_size" {
-						if v, err := strconv.ParseFloat(value, 64); err == nil {
-							setting.Value = int64(v * float64(config.MB))
-						}
-					} else {
-						if v, err := strconv.ParseInt(value, 10, 64); err == nil {
-							setting.Value = v
-						}
-					}
-				case "duration":
-					if _, err := strconv.ParseFloat(value, 64); err == nil {
-						value += "s"
-					}
-					if v, err := time.ParseDuration(value); err == nil {
-						setting.Value = v
-					}
-				case "float64":
-					if v, err := strconv.ParseFloat(value, 64); err == nil {
-						setting.Value = v
-					}
-				}
-				return nil
-			}
-
-			return nil
 		}
+		setting.Value = theme
+		m.ApplyTheme(theme, config.Resolve[string](m.Settings.General.ThemePath))
+		return nil
+	}
+	if key == "theme_path" {
+		setting.Value = value
+		// Re-apply the current theme mode but with the brand new path
+		m.ApplyTheme(config.Resolve[int](m.Settings.General.Theme), value)
+		return nil
+	}
+
+	// Generic Parsing and Application
+	var parsedVal any
+
+	switch setting.Type {
+	case config.TypeBool:
+		// Typically toggled unless explicitly typed out
+		if value == "" {
+			if key == "auto_start" {
+				if m.ToggleServiceFunc == nil {
+					return fmt.Errorf("service management is not available on this platform")
+				}
+				newVal := !config.Resolve[bool](setting)
+				if err := m.ToggleServiceFunc(newVal); err != nil {
+					return fmt.Errorf("failed to update service: %w", err)
+				}
+				parsedVal = newVal
+			} else {
+				parsedVal = !config.Resolve[bool](setting)
+			}
+		} else {
+			b, err := strconv.ParseBool(value)
+			if err != nil {
+				return fmt.Errorf("invalid boolean")
+			}
+			parsedVal = b
+		}
+	case config.TypeString, config.TypeAuthToken, config.TypeLink:
+		if setting.Unit == config.UnitMegabytesPerSecond {
+			if _, err := strconv.ParseFloat(value, 64); err == nil {
+				value += " MiB/s"
+			}
+			if bps, err := utils.ParseRateLimitValue(value); err == nil {
+				value = utils.FormatRateLimit(bps)
+			}
+		}
+		parsedVal = value
+	case "int":
+		if setting.Unit == config.UnitKilobytes {
+			v, err := strconv.ParseFloat(value, 64)
+			if err != nil {
+				return fmt.Errorf("invalid number")
+			}
+			parsedVal = int(v * float64(utils.KiB))
+		} else {
+			v, err := strconv.Atoi(value)
+			if err != nil {
+				return fmt.Errorf("invalid number")
+			}
+			parsedVal = v
+		}
+	case "int64":
+		// Handle KB/MB scaling gracefully if specified
+		if setting.Unit == config.UnitMegabytes {
+			v, err := strconv.ParseFloat(value, 64)
+			if err != nil {
+				return fmt.Errorf("invalid number")
+			}
+			parsedVal = int64(v * float64(utils.MiB))
+		} else {
+			v, err := strconv.ParseInt(value, 10, 64)
+			if err != nil {
+				return fmt.Errorf("invalid number")
+			}
+			parsedVal = v
+		}
+	case config.TypeDuration:
+		if setting.Unit == config.UnitSeconds || setting.Unit == config.UnitMinutes {
+			if _, err := strconv.ParseFloat(value, 64); err == nil {
+				if setting.Unit == config.UnitMinutes {
+					value += "m"
+				} else {
+					value += "s"
+				}
+			}
+		}
+		v, err := time.ParseDuration(value)
+		if err != nil {
+			return fmt.Errorf("invalid duration")
+		}
+		parsedVal = v
+	case config.TypeFloat64:
+		v, err := strconv.ParseFloat(value, 64)
+		if err != nil {
+			return fmt.Errorf("invalid number")
+		}
+		parsedVal = v
+	default:
+		parsedVal = value
+	}
+
+	if !m.IsRemote || key != "default_download_dir" {
+		if err := setting.Validate(parsedVal); err != nil {
+			return err
+		}
+	}
+	setting.Value = parsedVal
+	if key == "auto_shutdown_after_downloads" {
+		m.applyAutoShutdownSettingChange()
 	}
 	return nil
 }
 
 func (m *RootModel) persistSettings() error {
-	if err := config.SaveSettings(m.Settings); err != nil {
-		return err
+	if m.SaveSettingsFunc == nil {
+		return nil
 	}
-	if reloader, ok := m.Service.(interface{ ReloadSettings() error }); ok {
-		if err := reloader.ReloadSettings(); err != nil {
-			return err
+	if m.SettingsBaseline != nil {
+		patch := config.DiffSettings(m.SettingsBaseline, m.Settings)
+		if patch.Empty() {
+			return nil
+		}
+		if editor, ok := m.Service.(service.SettingsEditor); ok {
+			settings, err := editor.PatchSettings(patch)
+			if err != nil {
+				return err
+			}
+			m.Settings = settings
+			m.SettingsBaseline = settings.Clone()
+			return nil
 		}
 	}
-	if m.Orchestrator != nil {
-		m.Orchestrator.ApplySettings(m.Settings)
+	if err := m.SaveSettingsFunc(m.Settings); err != nil {
+		return err
+	}
+	if _, ok := m.Service.(service.SettingsService); ok {
+		return nil // The settings owner already persisted and applied the snapshot.
+	}
+	if reloader, ok := m.Service.(interface {
+		ReloadSettings(settings *config.Settings) error
+	}); ok {
+		if err := reloader.ReloadSettings(m.Settings); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -765,7 +924,6 @@ func (m RootModel) getCurrentSettingKey() string {
 	return ""
 }
 
-// getCurrentSettingMeta returns the metadata for the currently selected setting
 func (m RootModel) getCurrentSettingMeta() *config.SettingMeta {
 	categories := config.CategoryOrder()
 	if m.SettingsActiveTab < 0 || m.SettingsActiveTab >= len(categories) {
@@ -773,21 +931,67 @@ func (m RootModel) getCurrentSettingMeta() *config.SettingMeta {
 	}
 
 	activeCategory := categories[m.SettingsActiveTab]
-	settingsMap := config.GetSettingsMetadata()
-	settingsList, ok := settingsMap[activeCategory]
-	if !ok || m.SettingsSelectedRow < 0 || m.SettingsSelectedRow >= len(settingsList) {
+	settingsList := m.buildSettingsMetaForCategory(activeCategory)
+	if m.SettingsSelectedRow < 0 || m.SettingsSelectedRow >= len(settingsList) {
 		return nil
 	}
 	return &settingsList[m.SettingsSelectedRow]
 }
 
+// buildSettingsMetaForCategory retrieves and dynamically augments metadata
+func (m RootModel) buildSettingsMetaForCategory(category string) []config.SettingMeta {
+	if m.settingsSearchQuery != "" {
+		unfiltered := m
+		unfiltered.settingsSearchQuery = ""
+		query := strings.ToLower(m.settingsSearchQuery)
+		var results []config.SettingMeta
+		for _, name := range config.CategoryOrder() {
+			for _, meta := range unfiltered.buildSettingsMetaForCategory(name) {
+				if strings.Contains(strings.ToLower(name+" "+meta.Label+" "+meta.Key+" "+meta.Description), query) {
+					meta.Label = "[" + name + "] " + meta.Label
+					results = append(results, meta)
+				}
+			}
+		}
+		return results
+	}
+
+	settingsMap := config.GetSettingsMetadata()
+	settingsList, ok := settingsMap[category]
+	if !ok {
+		return nil
+	}
+
+	if category == "Categories" {
+		baseMeta := make([]config.SettingMeta, len(settingsList))
+		copy(baseMeta, settingsList)
+		settingsList = baseMeta
+		if m.Settings != nil {
+			for i, cat := range m.Settings.Categories.Categories {
+				settingsList = append(settingsList, config.SettingMeta{
+					Key:   fmt.Sprintf("category_%d", i),
+					Label: fmt.Sprintf("[%s]", cat.Name),
+					Type:  config.TypeCustomCategory,
+				})
+			}
+		}
+		settingsList = append(settingsList, config.SettingMeta{
+			Key:   "add_category",
+			Label: "+ Add category...",
+			Type:  config.TypeCustomCategoryAdd,
+		})
+	}
+
+	return settingsList
+}
+
 // getCurrentSettingType returns the type of the currently selected setting
-func (m RootModel) getCurrentSettingType() string {
+func (m RootModel) getCurrentSettingType() config.SettingType {
 	meta := m.getCurrentSettingMeta()
 	if meta != nil {
 		return meta.Type
 	}
-	return "string"
+	return config.TypeString
 }
 
 // getSettingsCount returns the number of settings in the current category
@@ -795,114 +999,75 @@ func (m RootModel) getSettingsCount() int {
 	categories := config.CategoryOrder()
 	if m.SettingsActiveTab >= 0 && m.SettingsActiveTab < len(categories) {
 		activeCategory := categories[m.SettingsActiveTab]
-		settingsMap := config.GetSettingsMetadata()
-
-		if settingsList, ok := settingsMap[activeCategory]; ok {
-			return len(settingsList)
-		}
+		settingsList := m.buildSettingsMetaForCategory(activeCategory)
+		return len(settingsList)
 	}
 	return 0
 }
 
-// getSettingUnit returns the unit suffix for the currently selected setting
-func (m RootModel) getSettingUnit() string {
-	key := m.getCurrentSettingKey()
-	switch key {
-	case "min_chunk_size":
+func settingUnitSuffix(unit config.SettingUnit) string {
+	switch unit {
+	case config.UnitMegabytes:
 		return " MB"
-	case "worker_buffer_size":
+	case config.UnitKilobytes:
 		return " KB"
-	case "dial_hedge_count":
+	case config.UnitConnections:
 		return " conns"
-	case "max_task_retries":
+	case config.UnitRetries:
 		return " retries"
-	case "slow_worker_grace_period", "stall_timeout":
+	case config.UnitSeconds:
 		return " seconds"
-	case "slow_worker_threshold", "speed_ema_alpha":
+	case config.UnitMinutes:
+		return " minutes"
+	case config.UnitRatio:
 		return " (0.0-1.0)"
+	case config.UnitMegabytesPerSecond:
+		return " MiB/s"
 	default:
 		return ""
 	}
 }
 
 // formatSettingValueForEdit returns a plain value without units for editing
-func formatSettingValueForEdit(value interface{}, typ, key string, truncate bool) string {
-	switch key {
-	case "min_chunk_size":
-		var valInt64 int64
-		var ok bool
-		switch v := value.(type) {
-		case int64:
-			valInt64 = v
-			ok = true
-		case int:
-			valInt64 = int64(v)
-			ok = true
-		case float64:
-			valInt64 = int64(v)
-			ok = true
-		}
-		if ok {
-			mb := float64(valInt64) / float64(config.MB)
+func formatSettingValueForEdit(value interface{}, typ config.SettingType, unit config.SettingUnit, key string, truncate bool) string {
+	switch unit {
+	case config.UnitMegabytes:
+		if v, ok := asFloat64(value); ok {
+			mb := v / float64(utils.MiB)
 			return fmt.Sprintf("%.1f", mb)
 		}
-	case "worker_buffer_size":
-		var valInt int
-		var ok bool
-		switch v := value.(type) {
-		case int:
-			valInt = v
-			ok = true
-		case int64:
-			valInt = int(v)
-			ok = true
-		case float64:
-			valInt = int(v)
-			ok = true
-		}
-		if ok {
-			kb := float64(valInt) / float64(config.KB)
+	case config.UnitKilobytes:
+		if v, ok := asFloat64(value); ok {
+			kb := v / float64(utils.KiB)
 			return fmt.Sprintf("%.0f", kb)
 		}
-	case "slow_worker_grace_period", "stall_timeout":
-		// Show duration as plain seconds number (e.g., "5" instead of "5s")
-		var d time.Duration
-		var ok bool
-		switch v := value.(type) {
-		case time.Duration:
-			d = v
-			ok = true
-		case float64:
-			d = time.Duration(v)
-			ok = true
-		case int64:
-			d = time.Duration(v)
-			ok = true
-		case int:
-			d = time.Duration(v)
-			ok = true
+
+	case config.UnitSeconds:
+		if v, ok := asFloat64(value); ok {
+			// Numeric duration values use nanoseconds, including JSON numbers.
+			return strconv.FormatFloat(time.Duration(v).Seconds(), 'f', -1, 64)
 		}
-		if ok {
-			return fmt.Sprintf("%.0f", d.Seconds())
+	case config.UnitMinutes:
+		if v, ok := asFloat64(value); ok {
+			return strconv.FormatFloat(time.Duration(v).Minutes(), 'f', -1, 64)
+		}
+	case config.UnitMegabytesPerSecond:
+		if vStr, ok := value.(string); ok && vStr != "" {
+			if parsed, err := utils.ParseRateLimitValue(vStr); err == nil {
+				if parsed == 0 {
+					return "\u221E"
+				}
+				if truncate && parsed >= utils.MiB/1000 {
+					return strings.TrimRight(strings.TrimRight(fmt.Sprintf("%.3f", float64(parsed)/float64(utils.MiB)), "0"), ".")
+				}
+				return strconv.FormatFloat(float64(parsed)/float64(utils.MiB), 'f', -1, 64)
+			}
 		}
 	}
 
 	if key == "theme" {
-		var valInt int
-		var ok bool
-		switch v := value.(type) {
-		case int:
-			valInt = v
-			ok = true
-		case int64:
-			valInt = int(v)
-			ok = true
-		case float64:
-			valInt = int(v)
-			ok = true
-		}
-		if ok {
-			switch valInt {
+		if v, ok := asFloat64(value); ok {
+			switch int(v) {
 			case config.ThemeAdaptive:
 				return "< System >"
 			case config.ThemeLight:
@@ -918,112 +1083,50 @@ func formatSettingValueForEdit(value interface{}, typ, key string, truncate bool
 }
 
 // formatSettingValue formats a setting value for display
-func formatSettingValue(value interface{}, typ string, truncate bool) string {
+func formatSettingValue(value interface{}, typ config.SettingType, truncate bool) string {
 	if value == nil {
 		return "-"
 	}
 
 	switch typ {
-	case "bool":
-		var b bool
-		var ok bool
-		switch val := value.(type) {
-		case bool:
-			b = val
-			ok = true
-		case float64:
-			b = val != 0
-			ok = true
-		case int:
-			b = val != 0
-			ok = true
-		}
-		if ok {
+	case config.TypeBool:
+		if b, ok := value.(bool); ok {
 			if b {
 				return "True"
 			}
 			return "False"
 		}
-	case "duration":
-		var d time.Duration
-		var ok bool
-		switch val := value.(type) {
-		case time.Duration:
-			d = val
-			ok = true
-		case float64:
-			d = time.Duration(val)
-			ok = true
-		case int64:
-			d = time.Duration(val)
-			ok = true
-		case int:
-			d = time.Duration(val)
-			ok = true
-		case string:
-			if parsed, err := time.ParseDuration(val); err == nil {
-				d = parsed
-				ok = true
+		if v, ok := asFloat64(value); ok {
+			if v != 0 {
+				return "True"
 			}
+			return "False"
 		}
-		if ok {
+	case config.TypeDuration:
+		if d, ok := value.(time.Duration); ok {
 			return d.String()
 		}
-	case "int64":
-		var v int64
-		var ok bool
-		switch val := value.(type) {
-		case int64:
-			v = val
-			ok = true
-		case int:
-			v = int64(val)
-			ok = true
-		case float64:
-			v = int64(val)
-			ok = true
+		if s, ok := value.(string); ok {
+			if parsed, err := time.ParseDuration(s); err == nil {
+				return parsed.String()
+			}
 		}
-		if ok {
-			return fmt.Sprintf("%d", v)
+		if v, ok := asFloat64(value); ok {
+			return time.Duration(v).String()
 		}
-	case "int":
-		var v int
-		var ok bool
-		switch val := value.(type) {
-		case int:
-			v = val
-			ok = true
-		case int64:
-			v = int(val)
-			ok = true
-		case float64:
-			v = int(val)
-			ok = true
+	case config.TypeInt64:
+		if v, ok := asFloat64(value); ok {
+			return fmt.Sprintf("%d", int64(v))
 		}
-		if ok {
-			return fmt.Sprintf("%d", v)
+	case config.TypeInt:
+		if v, ok := asFloat64(value); ok {
+			return fmt.Sprintf("%d", int(v))
 		}
-	case "float64":
-		var v float64
-		var ok bool
-		switch val := value.(type) {
-		case float64:
-			v = val
-			ok = true
-		case float32:
-			v = float64(val)
-			ok = true
-		case int:
-			v = float64(val)
-			ok = true
-		case int64:
-			v = float64(val)
-			ok = true
-		}
-		if ok {
+	case config.TypeFloat64:
+		if v, ok := asFloat64(value); ok {
 			return fmt.Sprintf("%.2f", v)
 		}
-	case "string", "link":
+	case config.TypeString, config.TypeLink:
 		if s, ok := value.(string); ok {
 			if s == "" {
 				return "(default)"
@@ -1033,7 +1136,7 @@ func formatSettingValue(value interface{}, typ string, truncate bool) string {
 			}
 			return s
 		}
-	case "auth_token":
+	case config.TypeAuthToken:
 		return "********"
 	}
 
@@ -1059,40 +1162,30 @@ func (m *RootModel) resetSettingToDefault(category, key string, defaults *config
 		}
 	}
 
-	val1 := reflect.ValueOf(m.Settings).Elem()
-	val2 := reflect.ValueOf(defaults).Elem()
-	typ := val1.Type()
-
-	for i := 0; i < typ.NumField(); i++ {
-		field := typ.Field(i)
-		label := field.Tag.Get("ui_label")
-		if label == "" {
-			label = field.Name
-		}
-		if label == category {
-			catField1 := val1.Field(i)
-			catField2 := val2.Field(i)
-			if catField1.Kind() != reflect.Struct {
-				continue
-			}
-
-			catTyp := catField1.Type()
-			for j := 0; j < catTyp.NumField(); j++ {
-				f := catTyp.Field(j)
-				fieldKey := f.Tag.Get("json")
-				if fieldKey == "" {
-					fieldKey = f.Name
-				}
-				if fieldKey == key {
-					s1, ok1 := catField1.Field(j).Interface().(*config.Setting)
-					s2, ok2 := catField2.Field(j).Interface().(*config.Setting)
-					if ok1 && ok2 && s1 != nil && s2 != nil {
-						s1.Value = s2.Value
-						return nil
-					}
-				}
-			}
-		}
+	setting := m.Settings.FindSetting(category, key)
+	defaultSetting := defaults.FindSetting(category, key)
+	if setting != nil && defaultSetting != nil {
+		setting.Value = defaultSetting.Value
+	}
+	if key == "auto_shutdown_after_downloads" {
+		m.applyAutoShutdownSettingChange()
 	}
 	return nil
+}
+
+func (m RootModel) renderCategoryInputLine(label string, fieldIndex int, width int) string {
+	labelStyle := lipgloss.NewStyle().Foreground(colors.LightGray()).Width(8)
+	if m.catMgrEditField == fieldIndex {
+		labelStyle = labelStyle.Foreground(colors.Cyan()).Bold(true)
+	}
+
+	inputView := m.catMgrInputs[fieldIndex].View()
+	inputWidth := width - 8
+	if inputWidth < 5 {
+		inputWidth = 5
+	}
+	// Force the input view to fit within the allowed width
+	inputStyle := lipgloss.NewStyle().Width(inputWidth).MaxWidth(inputWidth)
+
+	return lipgloss.JoinHorizontal(lipgloss.Top, labelStyle.Render(label), inputStyle.Render(inputView))
 }

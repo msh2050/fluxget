@@ -1,7 +1,9 @@
 package tui
 
 import (
+	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"charm.land/bubbles/v2/key"
@@ -9,22 +11,172 @@ import (
 	"github.com/msh2050/fluxget/internal/bugreport"
 	"github.com/msh2050/fluxget/internal/clipboard"
 	"github.com/msh2050/fluxget/internal/config"
+	"github.com/msh2050/fluxget/internal/types"
 	"github.com/msh2050/fluxget/internal/utils"
 )
 
 var openBugReportBrowser = utils.OpenBrowser
 var writeBugReportClipboard = clipboard.Write
 
+func (m RootModel) updateSpeedLimits(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	if m.speedLimitsIsEditing {
+		if key.Matches(msg, m.keys.SettingsEditor.Confirm) {
+			// Save
+			value := m.SettingsInput.Value()
+			metaList := m.getSpeedLimitsMetadata()
+			if m.speedLimitsCursor >= 0 && m.speedLimitsCursor < len(metaList) {
+				meta := metaList[m.speedLimitsCursor]
+
+				valueStr := strings.TrimSpace(value)
+				if !utils.IsRateLimitInherit(valueStr) {
+					if _, err := strconv.ParseFloat(valueStr, 64); err != nil {
+						m.speedLimitsError = "Please enter a number (in MiB/s)"
+						if strings.HasPrefix(meta.Key, "dl:") {
+							m.speedLimitsError = "Please enter a number (in MiB/s) or -1"
+						}
+						return m, nil
+					}
+				}
+
+				oldValues := m.getSpeedLimitsValues()
+				oldVal := oldValues[meta.Key]
+
+				// The editor uses MiB/s; the shared parser preserves legacy MB/s defaults.
+				limitValue := valueStr
+				if !utils.IsRateLimitInherit(limitValue) {
+					limitValue += " MiB/s"
+				}
+				if err := m.setSpeedLimitValue(meta.Key, limitValue); err != nil {
+					m.speedLimitsError = err.Error()
+					return m, nil
+				}
+				m.speedLimitsError = ""
+
+				newValues := m.getSpeedLimitsValues()
+				newVal := newValues[meta.Key]
+
+				oldStr := strings.ReplaceAll(fmt.Sprintf("%v", oldVal), "\u221E", "0 MiB/s")
+				newStr := strings.ReplaceAll(fmt.Sprintf("%v", newVal), "\u221E", "0 MiB/s")
+
+				m.addStyledLogEntry(logComplete, fmt.Sprintf("\u2714 %s updated: %s \u2192 %s", meta.Label, oldStr, newStr))
+			}
+			m.speedLimitsIsEditing = false
+			m.SettingsInput.Blur()
+			return m, nil
+		}
+		if key.Matches(msg, m.keys.SettingsEditor.Cancel) {
+			m.speedLimitsIsEditing = false
+			m.speedLimitsError = ""
+			m.SettingsInput.Blur()
+			return m, nil
+		}
+		var cmd tea.Cmd
+		m.SettingsInput, cmd = m.SettingsInput.Update(msg)
+		return m, cmd
+	}
+
+	if key.Matches(msg, m.keys.SpeedLimits.Close) {
+		m.state = DashboardState
+		m.speedLimitsError = ""
+		return m, nil
+	}
+
+	metaList := m.getSpeedLimitsMetadata()
+	if m.speedLimitsCursor >= len(metaList) {
+		m.speedLimitsCursor = len(metaList) - 1
+	}
+	if m.speedLimitsCursor < 0 {
+		m.speedLimitsCursor = 0
+	}
+
+	if key.Matches(msg, m.keys.SpeedLimits.Up) {
+		m.speedLimitsError = ""
+		m.speedLimitsCursor--
+		if m.speedLimitsCursor < 0 {
+			m.speedLimitsCursor = 0
+		}
+		return m, nil
+	}
+	if key.Matches(msg, m.keys.SpeedLimits.Down) {
+		m.speedLimitsError = ""
+		m.speedLimitsCursor++
+		if m.speedLimitsCursor >= len(metaList) {
+			m.speedLimitsCursor = len(metaList) - 1
+		}
+		return m, nil
+	}
+	if key.Matches(msg, m.keys.SpeedLimits.Edit) {
+		m.speedLimitsError = ""
+		if m.speedLimitsCursor >= 0 && m.speedLimitsCursor < len(metaList) {
+			meta := metaList[m.speedLimitsCursor]
+			values := m.getSpeedLimitsValues()
+			val := values[meta.Key]
+
+			var valStr string
+			if vStr, ok := val.(string); ok {
+				valStr = vStr
+			} else {
+				valStr = fmt.Sprintf("%v", val)
+			}
+			// Strip display-only prefixes before pre-filling the edit input
+			if strings.HasPrefix(valStr, "inherit") {
+				valStr = "-1"
+			} else if bps, err := utils.ParseRateLimitValue(valStr); err == nil {
+				if bps == 0 {
+					valStr = "0"
+				} else {
+					valStr = strconv.FormatFloat(float64(bps)/float64(utils.MiB), 'f', -1, 64)
+					if valStr == "" {
+						valStr = "0"
+					}
+				}
+			}
+
+			m.speedLimitsIsEditing = true
+			m.SettingsInput.SetValue(valStr)
+			m.SettingsInput.Focus()
+			m.SettingsInput.CursorEnd()
+		}
+		return m, nil
+	}
+	if key.Matches(msg, m.keys.SpeedLimits.Reset) {
+		m.speedLimitsError = ""
+		if m.speedLimitsCursor >= 0 && m.speedLimitsCursor < len(metaList) {
+			meta := metaList[m.speedLimitsCursor]
+
+			oldValues := m.getSpeedLimitsValues()
+			oldVal := oldValues[meta.Key]
+
+			if err := m.resetSpeedLimitToDefault(meta.Key, config.DefaultSettings()); err != nil {
+				m.addStyledLogEntry(logError, "\u2716 Reset failed: "+err.Error())
+			} else {
+				newValues := m.getSpeedLimitsValues()
+				newVal := newValues[meta.Key]
+
+				oldStr := strings.ReplaceAll(fmt.Sprintf("%v", oldVal), "\u221E", "0 MiB/s")
+				newStr := strings.ReplaceAll(fmt.Sprintf("%v", newVal), "\u221E", "0 MiB/s")
+
+				m.addStyledLogEntry(logComplete, fmt.Sprintf("\u2714 %s reset: %s \u2192 %s", meta.Label, oldStr, newStr))
+			}
+		}
+		return m, nil
+	}
+
+	return m, nil
+}
+
 func (m RootModel) updateDuplicateWarning(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if key.Matches(msg, m.keys.Duplicate.Continue) {
 		// Continue anyway - startDownload handles unique filename generation
 		m.state = DashboardState
-		return m.startDownload(m.pendingURL, m.pendingMirrors, m.pendingHeaders, m.pendingPath, m.pendingIsDefaultPath, m.pendingFilename, "")
+		updated, cmd := m.startDownload(m.pendingURL, m.pendingMirrors, m.pendingHeaders, m.pendingPath, m.pendingIsDefaultPath, m.pendingFilename, m.pendingDownloadID, m.pendingWorkers, m.pendingMinChunkSize)
+		nextModel, nextCmd := updated.showNextPendingRequest()
+		return nextModel, tea.Batch(cmd, nextCmd)
 	}
 	if key.Matches(msg, m.keys.Duplicate.Cancel) {
 		// Cancel - don't add
 		m.state = DashboardState
-		return m, nil
+		return m.showNextPendingRequest()
 	}
 	if key.Matches(msg, m.keys.Duplicate.Focus) {
 		// Focus existing download - find it and select in list
@@ -35,17 +187,17 @@ func (m RootModel) updateDuplicateWarning(msg tea.KeyPressMsg) (tea.Model, tea.C
 			}
 		}
 		m.state = DashboardState
-		return m, nil
+		return m.showNextPendingRequest()
 	}
 	return m, nil
 }
 
 func (m RootModel) updateQuitConfirm(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-
 	confirmQuit := func() (tea.Model, tea.Cmd) {
 		if m.cancelEnqueue != nil {
 			m.cancelEnqueue()
 		}
+		m.releasePowerInhibitor()
 		m.shuttingDown = true
 		return m, shutdownCmd(m.Service)
 	}
@@ -77,10 +229,12 @@ func (m RootModel) updateQuitConfirm(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m RootModel) updateBatchConfirm(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-
 	if key.Matches(msg, m.keys.BatchConfirm.Confirm) {
 		// Add all URLs as downloads, skipping duplicates
-		path := config.Resolve[string](m.Settings.General.DefaultDownloadDir)
+		path := strings.TrimSpace(m.inputs[2].Value())
+		if path == "" {
+			path = config.Resolve[string](m.Settings.General.DefaultDownloadDir)
+		}
 		if path == "" {
 			path = "."
 		}
@@ -88,6 +242,34 @@ func (m RootModel) updateBatchConfirm(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) 
 		added := 0
 		skipped := 0
 		var batchCmds []tea.Cmd
+
+		pathChanged := path != m.batchFilePath
+
+		for _, request := range m.pendingBatchRequests {
+			requestPath := path
+			if !pathChanged && request.Path != "" {
+				requestPath = request.Path
+			}
+
+			isDefaultPath := m.isDefaultDownloadPath(requestPath)
+			if !pathChanged && request.IsExplicitCategory {
+				isDefaultPath = false
+			}
+			if requestPath == "" {
+				isDefaultPath = true
+				requestPath = m.defaultDownloadPath()
+			}
+			if m.checkForDuplicate(request.URL) != nil {
+				skipped++
+				continue
+			}
+			var cmd tea.Cmd
+			m, cmd = m.startDownload(request.URL, request.Mirrors, request.Headers, requestPath, isDefaultPath, request.Filename, request.DownloadID, request.Workers, request.MinChunkSize)
+			if cmd != nil {
+				batchCmds = append(batchCmds, cmd)
+			}
+			added++
+		}
 		for _, url := range m.pendingBatchURLs {
 			// Skip duplicate URLs
 			if m.checkForDuplicate(url) != nil {
@@ -95,7 +277,7 @@ func (m RootModel) updateBatchConfirm(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) 
 				continue
 			}
 			var cmd tea.Cmd
-			m, cmd = m.startDownload(url, nil, nil, path, true, "", "")
+			m, cmd = m.startDownload(url, nil, nil, path, true, "", "", 0, 0)
 			if cmd != nil {
 				batchCmds = append(batchCmds, cmd)
 			}
@@ -103,26 +285,30 @@ func (m RootModel) updateBatchConfirm(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) 
 		}
 
 		if skipped > 0 {
-			m.addLogEntry(LogStyleStarted.Render(fmt.Sprintf("\u2b07 Added %d downloads from batch (%d duplicates skipped)", added, skipped)))
+			m.addStyledLogEntry(logStarted, fmt.Sprintf("\u2b07 Added %d downloads from batch (%d duplicates skipped)", added, skipped))
 		} else {
-			m.addLogEntry(LogStyleStarted.Render(fmt.Sprintf("\u2b07 Added %d downloads from batch", added)))
+			m.addStyledLogEntry(logStarted, fmt.Sprintf("\u2b07 Added %d downloads from batch", added))
 		}
 		m.pendingBatchURLs = nil
+		m.pendingBatchRequests = nil
 		m.batchFilePath = ""
 		m.state = DashboardState
-		return m, tea.Batch(batchCmds...)
+		nextModel, nextCmd := m.showNextPendingRequest()
+		return nextModel, tea.Batch(append(batchCmds, nextCmd)...)
 	}
 	if key.Matches(msg, m.keys.BatchConfirm.Cancel) {
 		m.pendingBatchURLs = nil
+		m.pendingBatchRequests = nil
 		m.batchFilePath = ""
 		m.state = DashboardState
-		return m, nil
+		return m.showNextPendingRequest()
 	}
-	return m, nil
+	var cmd tea.Cmd
+	m.inputs[2], cmd = m.inputs[2].Update(msg)
+	return m, cmd
 }
 
 func (m RootModel) updateURLUpdate(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-
 	if key.Matches(msg, m.keys.Input.Esc) {
 		m.state = DashboardState
 		m.urlUpdateInput.SetValue("")
@@ -134,9 +320,9 @@ func (m RootModel) updateURLUpdate(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		if newURL != "" {
 			if d := m.GetSelectedDownload(); d != nil {
 				if err := m.Service.UpdateURL(d.ID, newURL); err != nil {
-					m.addLogEntry(LogStyleError.Render(fmt.Sprintf("\u2716 Failed to update URL: %s", err.Error())))
+					m.addStyledLogEntry(logError, fmt.Sprintf("\u2716 Failed to update URL: %s", err.Error()))
 				} else {
-					m.addLogEntry(LogStyleComplete.Render(fmt.Sprintf("\u2714 URL Updated: %s", d.Filename)))
+					m.addStyledLogEntry(logComplete, fmt.Sprintf("\u2714 URL Updated: %s", d.Filename))
 					d.URL = newURL
 				}
 			}
@@ -153,6 +339,12 @@ func (m RootModel) updateURLUpdate(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m RootModel) updateUpdateAvailable(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	if key.Matches(msg, m.keys.Update.Install) {
+		m.addStyledLogEntry(logStarted, "\u2b06 Installing Surge update...")
+		m.state = DashboardState
+		m.UpdateInfo = nil
+		return m, selfUpdateCmd(m.CurrentVersion)
+	}
 	if key.Matches(msg, m.keys.Update.OpenGitHub) {
 		// Open the release page in browser
 		if m.UpdateInfo != nil && m.UpdateInfo.ReleaseURL != "" {
@@ -168,15 +360,6 @@ func (m RootModel) updateUpdateAvailable(msg tea.KeyPressMsg) (tea.Model, tea.Cm
 		m.UpdateInfo = nil
 		return m, nil
 	}
-	if key.Matches(msg, m.keys.Update.NeverRemind) {
-		// Persist the setting and dismiss
-		m.Settings.General.SkipUpdateCheck.Value = true
-		_ = m.persistSettings()
-		m.state = DashboardState
-		m.UpdateInfo = nil
-		return m, nil
-	}
-
 	return m, nil
 }
 
@@ -184,6 +367,26 @@ func (m RootModel) updateBugReportTarget(msg tea.KeyPressMsg) (tea.Model, tea.Cm
 	if key.Matches(msg, m.keys.BugReport.Cancel) {
 		m = m.resetBugReportFlow()
 		return m, nil
+	}
+
+	m, decision, handled := m.handleYesNoSelection(msg)
+	if handled {
+		switch decision {
+		case yesNoYes:
+			m.bugReportIncludeSystemInfo = true
+			m.bugReportIncludeLatestLog = true
+			m.quitConfirmFocused = 0
+			m.state = BugReportSystemDetailsState
+			return m, nil
+		case yesNoNo:
+			reportURL := bugreport.ExtensionBugReportURL()
+			m = m.tryOpenBugReportURL(reportURL)
+			m = m.resetBugReportFlow()
+			return m, nil
+		case yesNoCancel:
+			m = m.resetBugReportFlow()
+			return m, nil
+		}
 	}
 
 	if key.Matches(msg, m.keys.BugReport.Core) {
@@ -302,21 +505,21 @@ func (m RootModel) buildCoreBugReportURL() string {
 
 func (m RootModel) tryOpenBugReportURL(reportURL string) RootModel {
 	if reportURL == "" {
-		m.addLogEntry(LogStyleError.Render("✖ Could not open browser. Try running surge bug-report from your terminal instead."))
+		m.addStyledLogEntry(logError, "\u2716 Could not open browser. Try running surge bug-report from your terminal instead.")
 		return m
 	}
 
 	if err := openBugReportBrowser(reportURL); err != nil {
 		if err := writeBugReportClipboard(reportURL); err == nil {
-			m.addLogEntry(LogStyleError.Render("✖ Could not open browser. URL copied to clipboard."))
+			m.addStyledLogEntry(logError, "\u2716 Could not open browser. URL copied to clipboard.")
 			return m
 		}
 
-		m.addLogEntry(LogStyleError.Render("✖ Could not open browser. Try running surge bug-report from your terminal instead."))
+		m.addStyledLogEntry(logError, "\u2716 Could not open browser. Try running surge bug-report from your terminal instead.")
 		return m
 	}
 
-	m.addLogEntry(LogStyleStarted.Render("🐞 Opening browser to file bug report..."))
+	m.addStyledLogEntry(logStarted, "\U0001F41E Opening browser to file bug report...")
 	return m
 }
 
@@ -333,6 +536,7 @@ func (m RootModel) updateRestartConfirm(msg tea.KeyPressMsg) (tea.Model, tea.Cmd
 		if m.cancelEnqueue != nil {
 			m.cancelEnqueue()
 		}
+		m.releasePowerInhibitor()
 		m.shuttingDown = true
 		m.RestartRequested = true
 		return m, shutdownCmd(m.Service)
@@ -359,19 +563,65 @@ func (m RootModel) updateRestartConfirm(msg tea.KeyPressMsg) (tea.Model, tea.Cmd
 	return m, nil
 }
 
-func (m RootModel) updateCategoryResetConfirm(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-	confirmReset := func() (tea.Model, tea.Cmd) {
-		defaults := config.DefaultSettings()
-		m.Settings.Categories = defaults.Categories
-		m.addLogEntry(LogStyleStarted.Render("\u2714 Categories reset to defaults"))
-		utils.Debug("Categories Reset to Defaults")
-		m.state = SettingsState
+func (m RootModel) updatePurgeConfirm(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	confirmPurge := func() (tea.Model, tea.Cmd) {
+		targetID := m.purgeTargetID
+		m.purgeTargetID = ""
 		m.quitConfirmFocused = 0
-		return m, nil
+		m.state = DashboardState
+
+		if m.Service == nil {
+			m.addStyledLogEntry(logError, "\u2716 Service unavailable")
+			return m, nil
+		}
+
+		filename := ""
+		if d := m.FindDownloadByID(targetID); d != nil {
+			filename = d.Filename
+		}
+		if filename == "" {
+			if status, err := m.Service.GetStatus(targetID); err == nil && status != nil {
+				filename = status.Filename
+			}
+			if filename == "" {
+				if history, err := m.Service.History(); err == nil {
+					for _, entry := range history {
+						if entry.ID == targetID {
+							filename = entry.Filename
+							break
+						}
+					}
+				}
+			}
+		}
+
+		err := m.Service.Purge(targetID)
+
+		m.removeDownloadByID(targetID)
+		m.cachedTotalSpeed = m.calcTotalSpeedBps()
+		m.UpdateListItems()
+
+		if err != nil {
+			if !errors.Is(err, types.ErrNotFound) {
+				m.addStyledLogEntry(logError, "\u2716 Purge failed: "+err.Error())
+				return m, nil
+			}
+		}
+
+		if filename != "" {
+			m.addStyledLogEntry(logStarted, "\u2714 Purged: "+filename)
+		} else {
+			m.addStyledLogEntry(logStarted, "\u2714 Purged download")
+		}
+
+		m, autoCmd := m.refreshAutoShutdown()
+		return m, autoCmd
 	}
-	cancelReset := func() (tea.Model, tea.Cmd) {
-		m.state = SettingsState
+
+	cancelPurge := func() (tea.Model, tea.Cmd) {
+		m.purgeTargetID = ""
 		m.quitConfirmFocused = 0
+		m.state = DashboardState
 		return m, nil
 	}
 
@@ -382,10 +632,75 @@ func (m RootModel) updateCategoryResetConfirm(msg tea.KeyPressMsg) (tea.Model, t
 
 	switch decision {
 	case yesNoYes:
-		return confirmReset()
+		return confirmPurge()
 	case yesNoNo, yesNoCancel:
-		return cancelReset()
+		return cancelPurge()
 	}
 
 	return m, nil
+}
+
+func (m RootModel) updateRemoveConfirm(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	confirmRemove := func() (tea.Model, tea.Cmd) {
+		targetID := m.removeTargetID
+		m.removeTargetID = ""
+		m.quitConfirmFocused = 0
+		m.state = DashboardState
+		model, deleteCmd := m.deleteDownload(targetID)
+		root, ok := model.(RootModel)
+		if !ok {
+			return model, deleteCmd
+		}
+		nextModel, nextCmd := root.showNextPendingRequest()
+		return nextModel, tea.Batch(deleteCmd, nextCmd)
+	}
+
+	cancelRemove := func() (tea.Model, tea.Cmd) {
+		m.removeTargetID = ""
+		m.quitConfirmFocused = 0
+		m.state = DashboardState
+		return m.showNextPendingRequest()
+	}
+
+	m, decision, handled := m.handleYesNoSelection(msg)
+	if !handled {
+		return m, nil
+	}
+
+	switch decision {
+	case yesNoYes:
+		return confirmRemove()
+	case yesNoNo, yesNoCancel:
+		return cancelRemove()
+	}
+
+	return m, nil
+}
+
+func (m RootModel) deleteDownload(targetID string) (tea.Model, tea.Cmd) {
+	if targetID == "" {
+		return m, nil
+	}
+
+	if m.Service == nil {
+		m.addStyledLogEntry(logError, "\u2716 Service unavailable")
+		return m, nil
+	}
+
+	if err := m.Service.Delete(targetID); err != nil {
+		// If the download is not found, it's already gone from the engine/DB.
+		// We still remove it from our local list to avoid it being "stuck".
+		if errors.Is(err, types.ErrNotFound) {
+			m.removeDownloadByID(targetID)
+		} else {
+			m.addStyledLogEntry(logError, "\u2716 Delete failed: "+err.Error())
+		}
+	} else {
+		m.removeDownloadByID(targetID)
+	}
+
+	m.cachedTotalSpeed = m.calcTotalSpeedBps()
+	m.UpdateListItems()
+	m, autoCmd := m.refreshAutoShutdown()
+	return m, autoCmd
 }

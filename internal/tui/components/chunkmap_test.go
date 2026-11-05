@@ -5,8 +5,8 @@ import (
 	"testing"
 
 	"charm.land/lipgloss/v2"
-	"github.com/msh2050/fluxget/internal/engine/types"
 	"github.com/msh2050/fluxget/internal/tui/colors"
+	"github.com/msh2050/fluxget/internal/types"
 )
 
 // Helper to check for colors

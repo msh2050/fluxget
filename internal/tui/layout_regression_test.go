@@ -16,9 +16,9 @@ import (
 
 	"charm.land/bubbles/v2/list"
 	"charm.land/lipgloss/v2"
-	"github.com/msh2050/fluxget/internal/engine/types"
-	"github.com/msh2050/fluxget/internal/processing"
+	"github.com/msh2050/fluxget/internal/orchestrator"
 	"github.com/msh2050/fluxget/internal/tui/components"
+	"github.com/msh2050/fluxget/internal/types"
 	"github.com/msh2050/fluxget/internal/version"
 )
 
@@ -74,7 +74,7 @@ var termSizes = []struct{ width, height int }{
 // ─────────────────────────────────────────────────────────────
 
 func TestLayout_DashboardWidthNeverExceeds(t *testing.T) {
-	m := InitialRootModel(1701, "test", nil, processing.NewLifecycleManager(nil, nil), false)
+	m := InitialRootModel(1701, "test", nil, orchestrator.NewLifecycleManager(nil, nil, nil), nil, false)
 	for _, tc := range termSizes {
 		m.width = tc.width
 		m.height = tc.height
@@ -85,7 +85,7 @@ func TestLayout_DashboardWidthNeverExceeds(t *testing.T) {
 }
 
 func TestLayout_DashboardHeightNeverExceeds(t *testing.T) {
-	m := InitialRootModel(1701, "test", nil, processing.NewLifecycleManager(nil, nil), false)
+	m := InitialRootModel(1701, "test", nil, orchestrator.NewLifecycleManager(nil, nil, nil), nil, false)
 	for _, tc := range termSizes {
 		m.width = tc.width
 		m.height = tc.height
@@ -101,7 +101,7 @@ func TestLayout_DashboardHeightNeverExceeds(t *testing.T) {
 
 func TestLayout_DashboardLongURLWidthNeverExceeds(t *testing.T) {
 	longURL := "https://cdn.example.com/releases/v1.2.3/" + strings.Repeat("a", 300) + "/ubuntu-22.04.iso"
-	m := InitialRootModel(1701, "test", nil, processing.NewLifecycleManager(nil, nil), false)
+	m := InitialRootModel(1701, "test", nil, orchestrator.NewLifecycleManager(nil, nil, nil), nil, false)
 	m.downloads = []*DownloadModel{
 		{
 			ID:          "dl-1",
@@ -146,7 +146,7 @@ func TestLayout_AllModalsWidthNeverExceeds(t *testing.T) {
 	for _, ms := range modalStates {
 		for _, tc := range termSizes {
 			t.Run(fmt.Sprintf("%s_%dx%d", ms.name, tc.width, tc.height), func(t *testing.T) {
-				m := InitialRootModel(1701, "test", nil, processing.NewLifecycleManager(nil, nil), false)
+				m := InitialRootModel(1701, "test", nil, orchestrator.NewLifecycleManager(nil, nil, nil), nil, false)
 				m.width = tc.width
 				m.height = tc.height
 				m.state = ms.state
@@ -178,7 +178,7 @@ func TestLayout_AllModalsHeightNeverExceeds(t *testing.T) {
 	for _, ms := range modalStates {
 		for _, tc := range termSizes {
 			t.Run(fmt.Sprintf("%s_%dx%d", ms.name, tc.width, tc.height), func(t *testing.T) {
-				m := InitialRootModel(1701, "test", nil, processing.NewLifecycleManager(nil, nil), false)
+				m := InitialRootModel(1701, "test", nil, orchestrator.NewLifecycleManager(nil, nil, nil), nil, false)
 				m.width = tc.width
 				m.height = tc.height
 				m.state = ms.state
@@ -207,7 +207,7 @@ func TestLayout_AllModalsHeightNeverExceeds(t *testing.T) {
 // ─────────────────────────────────────────────────────────────
 
 func TestLayout_SettingsWidthNeverExceeds(t *testing.T) {
-	m := InitialRootModel(1701, "test", nil, processing.NewLifecycleManager(nil, nil), false)
+	m := InitialRootModel(1701, "test", nil, orchestrator.NewLifecycleManager(nil, nil, nil), nil, false)
 	m.state = SettingsState
 	for _, tc := range termSizes {
 		m.width = tc.width
@@ -219,36 +219,12 @@ func TestLayout_SettingsWidthNeverExceeds(t *testing.T) {
 }
 
 func TestLayout_SettingsHeightNeverExceeds(t *testing.T) {
-	m := InitialRootModel(1701, "test", nil, processing.NewLifecycleManager(nil, nil), false)
+	m := InitialRootModel(1701, "test", nil, orchestrator.NewLifecycleManager(nil, nil, nil), nil, false)
 	m.state = SettingsState
 	for _, tc := range termSizes {
 		m.width = tc.width
 		m.height = tc.height
 		label := fmt.Sprintf("settings %dx%d", tc.width, tc.height)
-		view := m.View()
-		assertHeightNotExceeded(t, label, view.Content, tc.height)
-	}
-}
-
-func TestLayout_CategoryManagerWidthNeverExceeds(t *testing.T) {
-	m := InitialRootModel(1701, "test", nil, processing.NewLifecycleManager(nil, nil), false)
-	m.state = CategoryManagerState
-	for _, tc := range termSizes {
-		m.width = tc.width
-		m.height = tc.height
-		label := fmt.Sprintf("catmgr %dx%d", tc.width, tc.height)
-		view := m.View()
-		assertNoLineExceedsWidth(t, label, view.Content, tc.width)
-	}
-}
-
-func TestLayout_CategoryManagerHeightNeverExceeds(t *testing.T) {
-	m := InitialRootModel(1701, "test", nil, processing.NewLifecycleManager(nil, nil), false)
-	m.state = CategoryManagerState
-	for _, tc := range termSizes {
-		m.width = tc.width
-		m.height = tc.height
-		label := fmt.Sprintf("catmgr %dx%d", tc.width, tc.height)
 		view := m.View()
 		assertHeightNotExceeded(t, label, view.Content, tc.height)
 	}
@@ -363,16 +339,12 @@ func TestLayout_ExtremeSizesNoPanic(t *testing.T) {
 			name  string
 			state UIState
 		}{"Settings", SettingsState},
-		struct {
-			name  string
-			state UIState
-		}{"CategoryManager", CategoryManagerState},
 	)
 
 	for _, tc := range extremes {
 		for _, ms := range allStates {
 			t.Run(fmt.Sprintf("%s_%dx%d", ms.name, tc.w, tc.h), func(t *testing.T) {
-				m := InitialRootModel(1701, "test", nil, processing.NewLifecycleManager(nil, nil), false)
+				m := InitialRootModel(1701, "test", nil, orchestrator.NewLifecycleManager(nil, nil, nil), nil, false)
 				m.width = tc.w
 				m.height = tc.h
 				m.state = ms.state
@@ -524,7 +496,7 @@ func TestLayout_RightColumnHeightNeverExceedsAvailable(t *testing.T) {
 	for termH := 18; termH <= 60; termH++ {
 		for _, termW := range []int{200, 160, 140} {
 			t.Run(fmt.Sprintf("%dx%d", termW, termH), func(t *testing.T) {
-				m := InitialRootModel(1701, "test", nil, processing.NewLifecycleManager(nil, nil), false)
+				m := InitialRootModel(1701, "test", nil, orchestrator.NewLifecycleManager(nil, nil, nil), nil, false)
 				m.width = termW
 				m.height = termH
 				m.activeTab = TabActive // download has Speed > 0
@@ -551,7 +523,7 @@ func TestLayout_ChunkMapSuppressedWhenDetailsTall(t *testing.T) {
 	// is too tall to fit alongside it.
 	for termH := 18; termH <= 45; termH++ {
 		t.Run(fmt.Sprintf("h%d", termH), func(t *testing.T) {
-			m := InitialRootModel(1701, "test", nil, processing.NewLifecycleManager(nil, nil), false)
+			m := InitialRootModel(1701, "test", nil, orchestrator.NewLifecycleManager(nil, nil, nil), nil, false)
 			m.width = 160
 			m.height = termH
 			m.activeTab = TabActive
@@ -607,7 +579,7 @@ func TestLayout_DetailContentNotClippedByChunkMap(t *testing.T) {
 	// all key sections are visible - none cut off by the chunk map.
 	for termH := 18; termH <= 50; termH++ {
 		t.Run(fmt.Sprintf("h%d", termH), func(t *testing.T) {
-			m := InitialRootModel(1701, "test", nil, processing.NewLifecycleManager(nil, nil), false)
+			m := InitialRootModel(1701, "test", nil, orchestrator.NewLifecycleManager(nil, nil, nil), nil, false)
 			m.width = 160
 			m.height = termH
 			m.activeTab = TabActive
@@ -654,7 +626,7 @@ func TestLayout_DetailContentNotClippedByChunkMap(t *testing.T) {
 				"File:",
 				"Path:",
 				"Speed:",
-				"ETA:",
+				"ETC:",
 			}
 			for _, label := range requiredLabels {
 				if !strings.Contains(rendered, label) {
@@ -677,7 +649,7 @@ func TestLayout_ChunkMapSpaceReclaimedForDetails(t *testing.T) {
 	// budget or was suppressed and its space reclaimed.
 	for termH := 18; termH <= 60; termH++ {
 		t.Run(fmt.Sprintf("h%d", termH), func(t *testing.T) {
-			m := InitialRootModel(1701, "test", nil, processing.NewLifecycleManager(nil, nil), false)
+			m := InitialRootModel(1701, "test", nil, orchestrator.NewLifecycleManager(nil, nil, nil), nil, false)
 			m.width = 160
 			m.height = termH
 			m.activeTab = TabActive
@@ -694,5 +666,15 @@ func TestLayout_ChunkMapSpaceReclaimedForDetails(t *testing.T) {
 			view := m.View()
 			assertHeightNotExceeded(t, fmt.Sprintf("h%d", termH), view.Content, termH)
 		})
+	}
+}
+
+func TestSearchDoesNotMoveRightBorderTitle(t *testing.T) {
+	normal := stripANSI.ReplaceAllString(components.RenderBtopBox("", " Downloads ", "", 120, 8, nil), "")
+	searching := stripANSI.ReplaceAllString(components.RenderBtopBox(" > Type to search... [esc] Exit ", " Downloads ", "", 120, 8, nil), "")
+	normalTop := strings.Split(normal, "\n")[0]
+	searchTop := strings.Split(searching, "\n")[0]
+	if lipgloss.Width(strings.Split(normalTop, "Downloads")[0]) != lipgloss.Width(strings.Split(searchTop, "Downloads")[0]) || !strings.HasSuffix(searchTop, " Downloads ─╮") {
+		t.Fatalf("title moved during search:\n%s\n%s", normalTop, searchTop)
 	}
 }

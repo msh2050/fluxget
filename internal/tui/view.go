@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"path"
 	"strings"
 	"time"
 
@@ -13,10 +14,8 @@ import (
 	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 )
-
-// Viewport layout
-const maxUIDuration = 30 * 24 * time.Hour
 
 // formatDurationForUI formats a duration as a human-readable clock string.
 // Returns "M:SS" for sub-hour durations, "H:MM:SS" for multi-hour, "Xd Yh" for days.
@@ -24,11 +23,7 @@ func formatDurationForUI(d time.Duration) string {
 	if d < 0 {
 		d = 0
 	}
-	if d >= maxUIDuration {
-		return "\u221e"
-	}
-
-	totalSec := int(d.Seconds())
+	totalSec := int64(d / time.Second)
 
 	if totalSec >= 86400 {
 		days := totalSec / 86400
@@ -49,18 +44,27 @@ func formatDurationForUI(d time.Duration) string {
 	return fmt.Sprintf("%d:%02d", mins, secs)
 }
 
-// renderModalWithOverlay renders a modal centered on screen with a dark overlay effect
+// renderModalWithOverlay renders a modal centered on the themed surface.
 func (m RootModel) renderModalWithOverlay(modal string) string {
-	// Place modal centered with dark gray background fill for overlay effect
+	style := lipgloss.NewStyle()
+	if !m.transparentBackground() {
+		style = style.Background(colors.Background())
+	}
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, modal,
-		lipgloss.WithWhitespaceChars(" "), // Changed from "░" to avoid terminal rendering glitches
-		lipgloss.WithWhitespaceStyle(lipgloss.NewStyle().Background(lipgloss.Color("236"))),
-	)
+		lipgloss.WithWhitespaceChars(" "), lipgloss.WithWhitespaceStyle(style))
+}
+
+func (m RootModel) transparentBackground() bool {
+	return m.Settings != nil && m.Settings.General.TransparentBackground != nil && config.Resolve[bool](m.Settings.General.TransparentBackground)
 }
 
 func (m RootModel) wrapView(content string) tea.View {
 	v := tea.NewView(content)
 	v.AltScreen = true
+	if !m.transparentBackground() {
+		v.BackgroundColor = colors.Background()
+	}
+	v.ForegroundColor = colors.Foreground()
 	return v
 }
 
@@ -69,9 +73,13 @@ func (m RootModel) View() tea.View {
 		return m.wrapView("Loading...")
 	}
 
+	if m.state == QuitConfirmState && (m.width < MinTermWidth || m.height < MinTermHeight) {
+		return m.wrapView(m.viewCompactQuitConfirm())
+	}
+
 	// Terminal too small to render any meaningful layout
 	if m.width < MinTermWidth || m.height < MinTermHeight {
-		msg := lipgloss.NewStyle().Foreground(colors.Cyan()).Render(fmt.Sprintf("Terminal too small (min: %d×%d)", MinTermWidth, MinTermHeight))
+		msg := lipgloss.NewStyle().Foreground(colors.Cyan()).Render(fmt.Sprintf("Terminal too small (min: %d\u00D7%d)", MinTermWidth, MinTermHeight))
 		return m.wrapView(lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, msg))
 	}
 
@@ -93,12 +101,37 @@ func (m RootModel) View() tea.View {
 	// These overlays sit on top of the dashboard or replace it
 
 	if m.state == InputState {
+		var activeInputs []textinput.Model
+		var activeLabels []string
+
+		activeInputs = append(activeInputs, m.inputs[0])
+		activeLabels = append(activeLabels, "URL:")
+
+		if !m.hideMirrors {
+			activeInputs = append(activeInputs, m.inputs[1])
+			activeLabels = append(activeLabels, "Mirrors:")
+		}
+
+		activeInputs = append(activeInputs, m.inputs[2], m.inputs[3])
+		activeLabels = append(activeLabels, "Path:", "Filename:")
+
+		mappedFocus := m.focusedInput
+		if m.hideMirrors && m.focusedInput > 0 {
+			mappedFocus = m.focusedInput - 1
+		}
+
+		browseHint := 2
+		if m.hideMirrors {
+			browseHint = 1
+		}
+
 		modal := components.AddDownloadModal{
 			Title:           "Add Download",
-			Inputs:          []textinput.Model{m.inputs[0], m.inputs[1], m.inputs[2], m.inputs[3]},
-			Labels:          []string{"URL:", "Mirrors:", "Path:", "Filename:"},
-			FocusedInput:    m.focusedInput,
-			BrowseHintIndex: 2,
+			Inputs:          activeInputs,
+			Labels:          activeLabels,
+			FocusedInput:    mappedFocus,
+			BrowseHintIndex: browseHint,
+			BrowseHintKey:   m.keys.Input.Tab.Help().Key,
 			Help:            m.help,
 			HelpKeys:        m.keys.Input,
 			BorderColor:     colors.Pink(),
@@ -136,8 +169,16 @@ func (m RootModel) View() tea.View {
 		return m.wrapView(m.viewSettings())
 	}
 
-	if m.state == CategoryManagerState {
-		return m.wrapView(m.viewCategoryManager())
+	if m.state == SpeedLimitsState {
+		return m.wrapView(m.renderModalWithOverlay(m.viewSpeedLimits()))
+	}
+
+	if m.state == CategoryMoveConfirmState {
+		return m.wrapView(m.renderModalWithOverlay(m.viewCategoryMoveConfirm()))
+	}
+
+	if m.state == CategoryPickerState {
+		return m.wrapView(m.renderModalWithOverlay(m.viewCategoryPicker()))
 	}
 
 	if m.state == DuplicateWarningState {
@@ -180,6 +221,7 @@ func (m RootModel) View() tea.View {
 			ShowURL:         true,
 			URL:             m.pendingURL,
 			BrowseHintIndex: 0,
+			BrowseHintKey:   m.keys.Extension.Browse.Help().Key,
 			Help:            m.help,
 			HelpKeys:        m.keys.Extension,
 			BorderColor:     colors.Cyan(),
@@ -214,10 +256,17 @@ func (m RootModel) View() tea.View {
 
 	if m.state == BatchConfirmState {
 		urlCount := len(m.pendingBatchURLs)
+		if len(m.pendingBatchRequests) > 0 {
+			urlCount = len(m.pendingBatchRequests)
+		}
+		batchDetail := fmt.Sprintf("Path: %s", m.inputs[2].View())
+		if m.batchFilePath != "" && m.batchFilePath != strings.TrimSpace(m.inputs[2].Value()) {
+			batchDetail = fmt.Sprintf("Source: %s\nPath: %s", m.batchFilePath, m.inputs[2].View())
+		}
 		modal := components.ConfirmationModal{
 			Title:       "Batch Import",
 			Message:     fmt.Sprintf("Add %d downloads?", urlCount),
-			Detail:      m.batchFilePath,
+			Detail:      batchDetail,
 			Keys:        m.keys.BatchConfirm,
 			Help:        m.help,
 			BorderColor: colors.Cyan(),
@@ -235,14 +284,18 @@ func (m RootModel) View() tea.View {
 	if m.state == BugReportTargetState {
 		w, h := GetDynamicModalDimensions(m.width, m.height, 40, 8, 64, 12)
 		modal := components.ConfirmationModal{
-			Title:       "Bug Report",
-			Message:     "What would you like to report?",
-			Detail:      "1) Surge Core (CLI/TUI/server)\n2) Browser Extension",
-			Keys:        m.keys.BugReport,
-			Help:        m.help,
-			BorderColor: colors.Cyan(),
-			Width:       w,
-			Height:      h,
+			Title:            "Bug Report",
+			Message:          "What would you like to report?",
+			Detail:           "Surge Core includes CLI/TUI/server components.",
+			Keys:             m.keys.BugReport,
+			Help:             m.help,
+			BorderColor:      colors.Cyan(),
+			Width:            w,
+			Height:           h,
+			ShowYesNoButtons: true,
+			YesNoFocused:     m.quitConfirmFocused,
+			YesLabel:         "Surge Core",
+			NoLabel:          "Extension",
 		}
 		box := modal.RenderWithBtopBox(renderBtopBox, PaneTitleStyle)
 		return m.wrapView(m.renderModalWithOverlay(box))
@@ -287,13 +340,20 @@ func (m RootModel) View() tea.View {
 	if m.state == QuitConfirmState {
 		return m.wrapView(m.renderModalWithOverlay(m.viewQuitConfirm()))
 	}
+	if m.state == SettingsConfirmState {
+		return m.wrapView(m.renderModalWithOverlay(m.viewSettingsConfirmation()))
+	}
 
 	if m.state == RestartConfirmState {
 		return m.wrapView(m.renderModalWithOverlay(m.viewRestartConfirm()))
 	}
 
-	if m.state == CategoryResetConfirmState {
-		return m.wrapView(m.renderModalWithOverlay(m.viewCategoryResetConfirm()))
+	if m.state == PurgeConfirmState {
+		return m.wrapView(m.renderModalWithOverlay(m.viewPurgeConfirm()))
+	}
+
+	if m.state == RemoveConfirmState {
+		return m.wrapView(m.renderModalWithOverlay(m.viewRemoveConfirm()))
 	}
 
 	if m.state == UpdateAvailableState && m.UpdateInfo != nil {
@@ -340,6 +400,8 @@ func (m RootModel) View() tea.View {
 		w, h := GetDynamicModalDimensions(m.width, m.height, 40, 10, PopupWidth, 22)
 		modal := components.HelpModal{
 			Title:       "Keyboard Shortcuts",
+			Query:       m.helpSearchQuery,
+			SearchTitle: m.helpSearchTitle(),
 			HelpKeys:    m.keys.Dashboard,
 			Help:        m.help,
 			BorderColor: colors.Cyan(),
@@ -353,24 +415,75 @@ func (m RootModel) View() tea.View {
 	// === MAIN DASHBOARD LAYOUT ===
 	layout := CalculateDashboardLayout(m.width, m.height)
 
-	// Footer - keybindings on left, version on bottom-right
-	helpText := m.help.View(m.keys.Dashboard)
-	versionBlue := colors.ThemeColor("#005cc5", "#58a6ff")
-	versionText := lipgloss.NewStyle().Foreground(versionBlue).Render(fmt.Sprintf("v%s", m.CurrentVersion))
+	// Footer - keybindings on left, speed/limit/version on bottom-right
+	helpText := lipgloss.NewStyle().PaddingLeft(2).Render(m.help.View(m.keys.Dashboard))
 
-	// Hide help text at very narrow widths - version is more important
-	var footerContent string
-	if layout.AvailableWidth < 60 {
-		footerContent = versionText
+	// --- Right-side footer: speed │ limit │ version ---
+	dimSep := lipgloss.NewStyle().Foreground(colors.Gray()).Render(" \u2502 ")
+
+	// Global speed indicator
+	speedBps := m.cachedTotalSpeed
+	speedGlyph := lipgloss.NewStyle().Foreground(colors.Cyan()).Render("\u2B07")
+	var speedVal string
+	if speedBps <= 0 {
+		speedVal = lipgloss.NewStyle().Foreground(colors.Gray()).Render("0 B/s")
 	} else {
-		leftFooterWidth := layout.AvailableWidth - lipgloss.Width(versionText)
+		speedVal = lipgloss.NewStyle().Foreground(colors.LightGray()).Render(utils.FormatSpeed(float64(speedBps)))
+	}
+	speedChunk := lipgloss.JoinHorizontal(lipgloss.Center, speedGlyph, " ", speedVal)
+
+	// Global rate limit indicator
+	limitGlyph := lipgloss.NewStyle().Foreground(colors.Pink()).Render("\u26A1")
+	var limitVal string
+	if m.Settings != nil && m.Settings.Network.GlobalRateLimit != nil {
+		if rate, err := utils.ParseRateLimitValue(m.Settings.Network.GlobalRateLimit.Value); err == nil && rate > 0 {
+			limitVal = lipgloss.NewStyle().Foreground(colors.LightGray()).Render(utils.FormatRateLimitDisplay(rate))
+		}
+	}
+	var limitChunk string
+	if limitVal != "" {
+		limitChunk = lipgloss.JoinHorizontal(lipgloss.Center, limitGlyph, " ", limitVal)
+	} else {
+		limitChunk = lipgloss.JoinHorizontal(lipgloss.Center, limitGlyph, " ", lipgloss.NewStyle().Foreground(colors.Gray()).Render("\u221E"))
+	}
+
+	// Auto-shutdown indicator
+	powerColor := colors.Gray()
+	if m.isAutoShutdownEnabled() {
+		powerColor = colors.Orange()
+	}
+	powerChunk := lipgloss.NewStyle().
+		Foreground(powerColor).
+		Render("\u23fb")
+
+	// Version indicator
+	versionBlue := colors.StateVersion()
+	versionChunk := lipgloss.NewStyle().Foreground(versionBlue).Render(fmt.Sprintf("v%s", m.CurrentVersion))
+
+	rightFooter := lipgloss.NewStyle().PaddingRight(2).Render(lipgloss.JoinHorizontal(lipgloss.Center,
+		speedChunk,
+		dimSep,
+		limitChunk,
+		dimSep,
+		powerChunk,
+		dimSep,
+		versionChunk,
+	))
+
+	// Hide help text at very narrow widths - right footer is more important
+	var footerContent string
+	rightFooterWidth := lipgloss.Width(rightFooter)
+	if layout.AvailableWidth < 60 {
+		footerContent = rightFooter
+	} else {
+		leftFooterWidth := layout.AvailableWidth - rightFooterWidth
 		if leftFooterWidth < 0 {
 			leftFooterWidth = 0
 		}
 		footerContent = lipgloss.JoinHorizontal(
 			lipgloss.Top,
 			lipgloss.NewStyle().Width(leftFooterWidth).Render(helpText),
-			versionText,
+			rightFooter,
 		)
 	}
 	footer := footerContent
@@ -383,17 +496,18 @@ func (m RootModel) View() tea.View {
 	var bitmapWidth int
 	var totalSize, chunkSize int64
 	var chunkProgress []int64
-	if selected != nil && selected.state != nil {
+	if layout.ShowChunkMap && !layout.HideRightColumn && selected != nil && !selected.done && selected.state != nil {
 		bitmap, bitmapWidth, totalSize, chunkSize, chunkProgress = selected.state.GetBitmap()
 	}
 
 	// Pre-compute details content to avoid double-computation and width mismatches
-	var detailContent string
+	var detailContent, detailStatus string
 	detailWidth := layout.RightWidth
 	if layout.HideRightColumn {
 		detailWidth = layout.LeftWidth
 	}
 	if selected != nil {
+		detailStatus = " " + getDownloadStatus(selected, m.spinner.View()) + " "
 		detailContent = renderFocusedDetails(selected, detailWidth-components.BorderFrameWidth, m.spinner.View())
 	} else {
 		detailContent = renderEmptyMessage(detailWidth-components.BorderFrameWidth, layout.DetailHeight-components.BorderFrameHeight, "No download selected")
@@ -434,11 +548,20 @@ func (m RootModel) View() tea.View {
 			layout.DetailHeight += layout.ChunkMapHeight
 		}
 
-		graphBox := m.renderGraphBox(layout.RightWidth, layout.GraphHeight, stats)
-		detailBox := m.renderDetailsBox(layout.RightWidth, layout.DetailHeight, detailContent)
+		var graphBox string
+		showGraph := layout.GraphHeight >= layout.MinGraphHeight
+		if showGraph && m.Settings != nil {
+			showGraph = config.Resolve[bool](m.Settings.General.ShowSpeedGraph)
+		}
+		if showGraph {
+			graphBox = m.renderGraphBox(layout.RightWidth, layout.GraphHeight, stats)
+		} else if layout.GraphHeight > 0 {
+			layout.DetailHeight += layout.GraphHeight
+		}
+		detailBox := renderBtopBox(detailStatus, PaneTitleStyle.Render(" File Details "), detailContent, layout.RightWidth, layout.DetailHeight, colors.Gray())
 
 		var rightParts []string
-		if layout.GraphHeight >= layout.MinGraphHeight {
+		if showGraph {
 			rightParts = append(rightParts, graphBox)
 		}
 		rightParts = append(rightParts, detailBox)
@@ -454,14 +577,12 @@ func (m RootModel) View() tea.View {
 	var body string
 	if layout.HideRightColumn {
 		if layout.VerticalLayout {
-			detailBox := m.renderDetailsBox(layout.LeftWidth, layout.DetailHeight, detailContent)
+			detailBox := renderBtopBox(detailStatus, PaneTitleStyle.Render(" File Details "), detailContent, layout.LeftWidth, layout.DetailHeight, colors.Gray())
 			body = lipgloss.JoinVertical(lipgloss.Left, headerBox, listBox, detailBox)
 		} else {
-
 			body = lipgloss.JoinVertical(lipgloss.Left, headerBox, listBox)
 		}
 	} else {
-
 		leftColumn := lipgloss.JoinVertical(lipgloss.Left, headerBox, listBox)
 		body = lipgloss.JoinHorizontal(lipgloss.Top, leftColumn, rightColumn)
 	}
@@ -478,7 +599,34 @@ func (m RootModel) View() tea.View {
 	return m.wrapView(lipgloss.Place(layout.AvailableWidth, m.height, lipgloss.Center, lipgloss.Top, fullView))
 }
 
-// Helper to render the detailed info pane
+func (m RootModel) viewCompactQuitConfirm() string {
+	message := "Are you sure you want to quit?"
+	if m.width < lipgloss.Width(message) {
+		message = "Quit Surge?"
+	}
+	buttons := components.RenderCompactYesNoButtons("Yep!", "Nope", m.quitConfirmFocused, colors.Pink())
+	content := lipgloss.JoinVertical(lipgloss.Center, message, buttons)
+	if m.height == 1 {
+		content = "Quit? " + buttons
+	}
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, content)
+}
+
+// Download paths belong to the daemon, whose OS can differ from the client's.
+func downloadDirectory(destination string) string {
+	windowsDrive := len(destination) >= 3 && destination[1] == ':' && (destination[2] == '\\' || destination[2] == '/')
+	if windowsDrive || strings.HasPrefix(destination, `\\`) || strings.HasPrefix(destination, "//") {
+		if i := strings.LastIndexAny(destination, `\/`); i >= 0 {
+			if windowsDrive && i == 2 {
+				return destination[:3]
+			}
+			return destination[:i]
+		}
+	}
+	return path.Dir(destination)
+}
+
+// Helper to render the detailed info pane.
 func renderFocusedDetails(d *DownloadModel, w int, spinnerView string) string {
 	pct := 0.0
 	if d.Total > 0 {
@@ -491,6 +639,7 @@ func renderFocusedDetails(d *DownloadModel, w int, spinnerView string) string {
 		contentWidth = 0
 	}
 
+	detailValueStyle := lipgloss.NewStyle().Foreground(colors.White())
 	// Separator Style
 	divider := lipgloss.NewStyle().
 		Foreground(colors.Gray()).
@@ -502,25 +651,15 @@ func renderFocusedDetails(d *DownloadModel, w int, spinnerView string) string {
 		Width(contentWidth).
 		Padding(0, 1)
 
-	// --- 1. Status Section ---
-	statusStr := getDownloadStatus(d, spinnerView)
-	statusStyle := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(colors.Gray()).
-		Width(contentWidth).
-		Align(lipgloss.Center)
-
-	statusBox := statusStyle.Render(statusStr)
-
 	// --- 2. File Information Section ---
 	displayFilename := d.Filename
 	if displayFilename == "" || displayFilename == "Queued" {
 		displayFilename = d.URL
 	}
 
-	displayPath := d.Destination
-	if displayPath == "" {
-		displayPath = d.URL
+	displayPath := "Not available"
+	if d.Destination != "" {
+		displayPath = downloadDirectory(d.Destination)
 	}
 
 	// Calculate inner width accounting for sectionStyle padding (0, 1)
@@ -528,17 +667,24 @@ func renderFocusedDetails(d *DownloadModel, w int, spinnerView string) string {
 	if innerWidth < 0 {
 		innerWidth = 0
 	}
-	valueWidth := innerWidth - 12
+	const labelWidth = 6
+	valueWidth := innerWidth - labelWidth
 	if valueWidth < 5 {
-		valueWidth = 5 // Minimum reasonable width
+		valueWidth = 5
+	}
+	field := func(label, value string, style lipgloss.Style) string {
+		labelText := lipgloss.NewStyle().Foreground(colors.LightGray()).Width(labelWidth).Render(label)
+		valueText := style.Width(valueWidth).MaxWidth(valueWidth).Height(2).Render(utils.TruncateTwoLines(value, valueWidth))
+		return lipgloss.JoinHorizontal(lipgloss.Top, labelText, valueText)
 	}
 
 	fileInfoContent := lipgloss.JoinVertical(lipgloss.Left,
-		lipgloss.JoinHorizontal(lipgloss.Top, StatsLabelStyle.Render("URL: "), StatsValueStyle.Width(valueWidth).MaxWidth(valueWidth).Render(utils.TruncateTwoLines(d.URL, valueWidth))),
-		lipgloss.JoinHorizontal(lipgloss.Top, StatsLabelStyle.Render("File: "), StatsValueStyle.Width(valueWidth).MaxWidth(valueWidth).Render(utils.TruncateTwoLines(displayFilename, valueWidth))),
-		lipgloss.JoinHorizontal(lipgloss.Top, StatsLabelStyle.Render("Path: "), StatsValueStyle.Width(valueWidth).MaxWidth(valueWidth).Render(utils.TruncateTwoLines(displayPath, valueWidth))),
-		lipgloss.JoinHorizontal(lipgloss.Top, StatsLabelStyle.Render("ID:   "), lipgloss.NewStyle().Foreground(colors.LightGray()).Width(valueWidth).MaxWidth(valueWidth).Render(utils.WrapText(d.ID, valueWidth))),
+		field("File:", displayFilename, detailValueStyle.Bold(true)),
+		field("Path:", displayPath, detailValueStyle),
+		field("ID:", d.ID, detailValueStyle),
+		field("URL:", d.URL, detailValueStyle.Hyperlink(d.URL)),
 	)
+
 	fileSection := sectionStyle.Render(fileInfoContent)
 
 	// --- 3. Progress Section ---
@@ -577,6 +723,9 @@ func renderFocusedDetails(d *DownloadModel, w int, spinnerView string) string {
 	}
 
 	progSection := lipgloss.NewStyle().Width(contentWidth).Render(progContent)
+	if d.done && d.err == nil {
+		progSection = ""
+	}
 
 	// --- 4. Stats Grid Section ---
 	var speedStr, etaStr, sizeStr, timeStr string
@@ -593,21 +742,21 @@ func renderFocusedDetails(d *DownloadModel, w int, spinnerView string) string {
 
 	// Size
 	if d.done {
-		sizeStr = utils.ConvertBytesToHumanReadable(d.Total)
+		sizeStr = utils.FormatBytes(d.Downloaded)
 	} else {
-		sizeStr = fmt.Sprintf("%s / %s", utils.ConvertBytesToHumanReadable(d.Downloaded), utils.ConvertBytesToHumanReadable(d.Total))
+		sizeStr = fmt.Sprintf("%s / %s", utils.FormatBytes(d.Downloaded), utils.FormatBytes(d.Total))
 	}
 
 	// Speed & ETA
 	if d.done {
 		if elapsed.Seconds() >= 1 {
 			avgSpeed := float64(d.Total) / float64(int(elapsed.Seconds()))
-			speedStr = fmt.Sprintf("%.2f MB/s (Avg)", avgSpeed/float64(config.MB))
+			speedStr = fmt.Sprintf("%s (Avg)", utils.FormatSpeed(avgSpeed))
 		} else if d.Speed > 0 {
-			speedStr = fmt.Sprintf("%.2f MB/s (Avg)", d.Speed/float64(config.MB))
+			speedStr = fmt.Sprintf("%s (Avg)", utils.FormatSpeed(d.Speed))
 		} else if elapsed.Seconds() > 0 {
 			avgSpeed := float64(d.Total) / elapsed.Seconds()
-			speedStr = fmt.Sprintf("%.2f MB/s (Avg)", avgSpeed/float64(config.MB))
+			speedStr = fmt.Sprintf("%s (Avg)", utils.FormatSpeed(avgSpeed))
 		} else {
 			speedStr = "N/A"
 		}
@@ -615,28 +764,28 @@ func renderFocusedDetails(d *DownloadModel, w int, spinnerView string) string {
 	} else if d.resuming {
 		speedStr = "Resuming..."
 		etaStr = "..."
-	} else if d.paused || d.Speed == 0 {
+	} else if d.rateLimited {
+		speedStr = "Rate limited, retrying..."
+		etaStr = "..."
+	} else if d.phase == "verifying" || d.phase == "finalizing" {
+		speedStr = d.phase
+		etaStr = "--"
+	} else if d.paused {
 		speedStr = "Paused"
+		if d.RateLimitSet && d.RateLimit > 0 {
+			speedStr += fmt.Sprintf(" (Limit: %s)", utils.FormatRateLimitDisplay(d.RateLimit))
+		}
 		etaStr = "\u221e"
+	} else if d.Speed <= 0 {
+		speedStr = "Waiting for transfer"
+		etaStr = "--"
 	} else {
-		speedStr = fmt.Sprintf("%.2f MB/s", d.Speed/float64(config.MB))
-		if d.Total > 0 {
-			remaining := d.Total - d.Downloaded
-			etaSeconds := float64(remaining) / d.Speed
-			// Clamp ETA to 24 hours max to prevent bonkers values
-			const maxETASeconds = 24 * 60 * 60
-			if etaSeconds > maxETASeconds || etaSeconds < 0 {
-				etaStr = "\u221e"
-			} else {
-				etaDuration := time.Duration(etaSeconds) * time.Second
-				// EMA smooth ETA to prevent jitter from speed fluctuations
-				if d.lastETA > 0 {
-					const etaAlpha = 0.3
-					etaDuration = time.Duration(etaAlpha*float64(etaDuration) + (1-etaAlpha)*float64(d.lastETA))
-				}
-				d.lastETA = etaDuration
-				etaStr = formatDurationForUI(etaDuration)
-			}
+		speedStr = utils.FormatSpeed(d.Speed)
+		if d.RateLimitSet && d.RateLimit > 0 {
+			speedStr += fmt.Sprintf(" (Limit: %s)", utils.FormatRateLimitDisplay(d.RateLimit))
+		}
+		if d.Speed > 0 && d.Total > 0 && d.lastETA > 0 {
+			etaStr = formatDurationForUI(d.lastETA)
 		} else {
 			etaStr = "\u221e"
 		}
@@ -647,8 +796,8 @@ func renderFocusedDetails(d *DownloadModel, w int, spinnerView string) string {
 	// Stats Layout
 	colWidth := (contentWidth - (components.BorderFrameWidth * 2)) / 2
 	leftColItems := []string{
-		lipgloss.JoinHorizontal(lipgloss.Left, StatsLabelStyle.Width(7).Render("Size:"), StatsValueStyle.Render(sizeStr)),
-		lipgloss.JoinHorizontal(lipgloss.Left, StatsLabelStyle.Width(7).Render("Speed:"), StatsValueStyle.Render(speedStr)),
+		lipgloss.JoinHorizontal(lipgloss.Left, StatsLabelStyle.Width(7).Render("Size:"), detailValueStyle.Render(sizeStr)),
+		lipgloss.JoinHorizontal(lipgloss.Left, StatsLabelStyle.Width(7).Render("Speed:"), detailValueStyle.Render(speedStr)),
 	}
 	isActive := !d.done && !d.paused && !d.pausing && d.Speed > 0
 	if isActive {
@@ -657,12 +806,12 @@ func renderFocusedDetails(d *DownloadModel, w int, spinnerView string) string {
 			conns = 1 // Single-connection download (range requests not supported)
 		}
 		connStr := fmt.Sprintf("%d", conns)
-		leftColItems = append(leftColItems, lipgloss.JoinHorizontal(lipgloss.Left, StatsLabelStyle.Width(7).Render("Conns:"), StatsValueStyle.Render(connStr)))
+		leftColItems = append(leftColItems, lipgloss.JoinHorizontal(lipgloss.Left, StatsLabelStyle.Width(7).Render("Conns:"), detailValueStyle.Render(connStr)))
 	}
 	leftCol := lipgloss.JoinVertical(lipgloss.Left, leftColItems...)
 	rightCol := lipgloss.JoinVertical(lipgloss.Left,
-		lipgloss.JoinHorizontal(lipgloss.Left, StatsLabelStyle.Width(7).Render("Time:"), StatsValueStyle.Render(timeStr)),
-		lipgloss.JoinHorizontal(lipgloss.Left, StatsLabelStyle.Width(7).Render("ETA:"), StatsValueStyle.Render(etaStr)),
+		lipgloss.JoinHorizontal(lipgloss.Left, StatsLabelStyle.Width(7).Render("Time:"), detailValueStyle.Render(timeStr)),
+		lipgloss.JoinHorizontal(lipgloss.Left, StatsLabelStyle.Width(7).Render("ETC:"), detailValueStyle.Render(etaStr)),
 	)
 
 	statsContent := lipgloss.JoinHorizontal(lipgloss.Top,
@@ -703,11 +852,12 @@ func renderFocusedDetails(d *DownloadModel, w int, spinnerView string) string {
 	// Use explicit calls to insert divider only where needed
 	var parts []string
 
-	parts = append(parts, statusBox)
 	parts = append(parts, fileSection)
 	parts = append(parts, divider)
-	parts = append(parts, progSection)
-	parts = append(parts, divider)
+	if progSection != "" {
+		parts = append(parts, progSection)
+		parts = append(parts, divider)
+	}
 	parts = append(parts, statsSection)
 
 	if mirrorSection != "" {
@@ -728,26 +878,36 @@ func renderFocusedDetails(d *DownloadModel, w int, spinnerView string) string {
 }
 
 func getDownloadStatus(d *DownloadModel, spinnerView string) string {
+	// The spinner's own ANSI reset must not terminate the surrounding status
+	// color before the label is rendered.
+	spinnerView = ansi.Strip(spinnerView)
+	if d.moving {
+		return lipgloss.NewStyle().Foreground(colors.Cyan()).Render(spinnerView + " Moving")
+	}
 	if d.pausing {
 		return lipgloss.NewStyle().Foreground(colors.StatePaused()).Render(spinnerView + " Pausing...")
 	}
-	if d.resuming {
+	if d.resuming && d.started {
 		return lipgloss.NewStyle().Foreground(colors.StateDownloading()).Render(spinnerView + " Resuming...")
 	}
-	status := components.DetermineStatus(d.done, d.paused, d.err != nil, d.Speed, d.Downloaded)
+	if d.done && d.err == nil && d.fileMissing {
+		return components.StatusMissing.Render()
+	}
+	status := components.DetermineStatus(d.done, d.paused, d.err != nil, d.started, d.resuming)
 	return status.RenderWithSpinner(spinnerView)
 }
 
-func (m RootModel) calcTotalSpeed() float64 {
-	total := 0.0
+// calcTotalSpeedBps calculates the sum of all active downloads' speed in bytes per second.
+func (m RootModel) calcTotalSpeedBps() int64 {
+	total := int64(0)
 	for _, d := range m.downloads {
 		// Skip completed downloads
-		if d.done {
+		if d.done || d.paused || d.pausing || d.err != nil || d.phase == "verifying" || d.phase == "finalizing" {
 			continue
 		}
-		total += d.Speed
+		total += int64(d.Speed)
 	}
-	return total / float64(config.MB)
+	return total
 }
 
 func (m RootModel) ComputeViewStats() ViewStats {
@@ -755,7 +915,7 @@ func (m RootModel) ComputeViewStats() ViewStats {
 	for _, d := range m.downloads {
 		if d.done {
 			stats.DownloadedCount++
-		} else if !d.paused && !d.pausing && (d.Speed > 0 || d.Connections > 0 || d.resuming) {
+		} else if !d.paused && !d.pausing && (d.Speed > 0 || d.Connections > 0 || d.started) {
 			stats.ActiveCount++
 		} else {
 			stats.QueuedCount++
@@ -767,236 +927,137 @@ func (m RootModel) ComputeViewStats() ViewStats {
 
 func (m RootModel) renderTabs(activeTab, activeCount, queuedCount, doneCount int) string {
 	tabs := []components.Tab{
+		{Label: "All", Count: activeCount + queuedCount + doneCount, Pinned: m.pinnedTab == TabAll},
 		{Label: "Queued", Count: queuedCount, Pinned: m.pinnedTab == TabQueued},
 		{Label: "Active", Count: activeCount, Pinned: m.pinnedTab == TabActive},
 		{Label: "Done", Count: doneCount, Pinned: m.pinnedTab == TabDone},
 	}
-	return components.RenderTabBar(tabs, activeTab, ActiveTabStyle, TabStyle)
+	// Keep the existing tab IDs and keybindings while displaying All first.
+	selected := (activeTab + 1) % dashboardTabCount
+	return components.RenderTabBar(tabs, selected, ActiveTabStyle, TabStyle)
 }
 
 func (m RootModel) viewQuitConfirm() string {
-	w, h := GetDynamicModalDimensions(m.width, m.height, 40, 8, 60, 10)
-	innerWidth := w - (components.BorderFrameWidth * 2)
-
-	messageStyle := lipgloss.NewStyle().
-		Foreground(colors.White()).
-		Width(innerWidth).
-		Align(lipgloss.Center)
-
-	detailStyle := lipgloss.NewStyle().
-		Foreground(colors.Magenta()).
-		Bold(true).
-		Width(innerWidth).
-		Align(lipgloss.Center)
-
-	pad := "   "
-
-	activeFirst := lipgloss.NewStyle().Foreground(colors.White()).Background(colors.Pink()).Bold(true).Underline(true)
-	activeRest := lipgloss.NewStyle().Foreground(colors.White()).Background(colors.Pink()).Bold(true)
-	activePad := lipgloss.NewStyle().Background(colors.Pink())
-
-	inactiveFirst := lipgloss.NewStyle().Foreground(colors.LightGray()).Background(lipgloss.Color("236")).Underline(true)
-	inactiveRest := lipgloss.NewStyle().Foreground(colors.LightGray()).Background(lipgloss.Color("236"))
-	inactivePad := lipgloss.NewStyle().Background(lipgloss.Color("236"))
-
-	renderBtn := func(padStyle, firstStyle, restStyle lipgloss.Style, first, rest string) string {
-		return padStyle.Render(pad) + firstStyle.Render(first) + restStyle.Render(rest) + padStyle.Render(pad)
-	}
-
-	yesFirst, yesRest, yesPad := activeFirst, activeRest, activePad
-	noFirst, noRest, noPad := inactiveFirst, inactiveRest, inactivePad
-	if m.quitConfirmFocused == 1 {
-		yesFirst, yesRest, yesPad = inactiveFirst, inactiveRest, inactivePad
-		noFirst, noRest, noPad = activeFirst, activeRest, activePad
-	}
-
-	yesBtn := renderBtn(yesPad, yesFirst, yesRest, "Y", "ep!")
-	noBtn := renderBtn(noPad, noFirst, noRest, "N", "ope")
-
-	buttons := lipgloss.JoinHorizontal(lipgloss.Center, yesBtn, "     ", noBtn)
-	centeredButtons := lipgloss.NewStyle().Width(innerWidth).Align(lipgloss.Center).Render(buttons)
-
 	stats := m.ComputeViewStats()
 	detail := ""
 	if stats.ActiveCount > 0 {
 		detail = fmt.Sprintf("%d active download(s) will be paused", stats.ActiveCount)
 	}
-
-	helpStyle := lipgloss.NewStyle().Foreground(colors.Gray()).Width(innerWidth).Align(lipgloss.Center)
-	helpText := helpStyle.Render(m.help.View(m.keys.QuitConfirm))
-
-	var lines []string
-	lines = append(lines, messageStyle.Render("Are you sure you want to quit?"))
-	if detail != "" {
-		lines = append(lines, detailStyle.Render(detail))
+	w, h := GetDynamicModalDimensions(m.width, m.height, 40, 8, 60, 10)
+	modal := components.ConfirmationModal{
+		Title:            "Quit Surge",
+		Message:          "Are you sure you want to quit?",
+		Detail:           detail,
+		Keys:             m.keys.QuitConfirm,
+		Help:             m.help,
+		BorderColor:      colors.Pink(),
+		ButtonColor:      colors.Pink(),
+		Width:            w,
+		Height:           h,
+		ShowYesNoButtons: true,
+		YesNoFocused:     m.quitConfirmFocused,
+		YesLabel:         "Yep!",
+		NoLabel:          "Nope",
 	}
-	lines = append(lines, "")
-	lines = append(lines, "")
-	lines = append(lines, centeredButtons)
-
-	innerHeight := h - components.BorderFrameHeight
-	contentHeight := lipgloss.Height(lipgloss.JoinVertical(lipgloss.Left, lines...))
-	helpHeight := lipgloss.Height(helpText)
-	spacing := innerHeight - contentHeight - helpHeight
-	if spacing < 0 {
-		spacing = 0
-	}
-	for i := 0; i < spacing; i++ {
-		lines = append(lines, "")
-	}
-	// Replace last line with help text if there was space, otherwise just append
-	if len(lines) > 0 && spacing > 0 {
-		lines[len(lines)-1] = helpText
-	} else {
-		lines = append(lines, helpText)
-	}
-
-	content := lipgloss.JoinVertical(lipgloss.Left, lines...)
-	return renderBtopBox(PaneTitleStyle.Render(" Quit Surge "), "", content, w, h, colors.Pink())
+	return modal.RenderWithBtopBox(renderBtopBox, PaneTitleStyle)
 }
 
 func (m RootModel) viewRestartConfirm() string {
 	w, h := GetDynamicModalDimensions(m.width, m.height, 40, 8, 60, 10)
-	innerWidth := w - (components.BorderFrameWidth * 2)
-
-	messageStyle := lipgloss.NewStyle().
-		Foreground(colors.White()).
-		Width(innerWidth).
-		Align(lipgloss.Center)
-
-	detailStyle := lipgloss.NewStyle().
-		Foreground(colors.Orange()).
-		Bold(true).
-		Width(innerWidth).
-		Align(lipgloss.Center)
-
-	pad := "   "
-
-	activeFirst := lipgloss.NewStyle().Foreground(colors.White()).Background(colors.Orange()).Bold(true).Underline(true)
-	activeRest := lipgloss.NewStyle().Foreground(colors.White()).Background(colors.Orange()).Bold(true)
-	activePad := lipgloss.NewStyle().Background(colors.Orange())
-
-	inactiveFirst := lipgloss.NewStyle().Foreground(colors.LightGray()).Background(lipgloss.Color("236")).Underline(true)
-	inactiveRest := lipgloss.NewStyle().Foreground(colors.LightGray()).Background(lipgloss.Color("236"))
-	inactivePad := lipgloss.NewStyle().Background(lipgloss.Color("236"))
-
-	renderBtn := func(padStyle, firstStyle, restStyle lipgloss.Style, first, rest string) string {
-		return padStyle.Render(pad) + firstStyle.Render(first) + restStyle.Render(rest) + padStyle.Render(pad)
+	modal := components.ConfirmationModal{
+		Title:            "Restart Required",
+		Message:          "Settings saved!",
+		Detail:           "Restart now to take effect?",
+		Keys:             m.keys.QuitConfirm,
+		Help:             m.help,
+		BorderColor:      colors.Orange(),
+		ButtonColor:      colors.Orange(),
+		Width:            w,
+		Height:           h,
+		ShowYesNoButtons: true,
+		YesNoFocused:     m.quitConfirmFocused,
+		YesLabel:         "Yes",
+		NoLabel:          "No",
 	}
-
-	yesFirst, yesRest, yesPad := activeFirst, activeRest, activePad
-	noFirst, noRest, noPad := inactiveFirst, inactiveRest, inactivePad
-	if m.quitConfirmFocused == 1 {
-		yesFirst, yesRest, yesPad = inactiveFirst, inactiveRest, inactivePad
-		noFirst, noRest, noPad = activeFirst, activeRest, activePad
-	}
-
-	yesBtn := renderBtn(yesPad, yesFirst, yesRest, "Y", "es")
-	noBtn := renderBtn(noPad, noFirst, noRest, "N", "o")
-
-	buttons := lipgloss.JoinHorizontal(lipgloss.Center, yesBtn, "     ", noBtn)
-	centeredButtons := lipgloss.NewStyle().Width(innerWidth).Align(lipgloss.Center).Render(buttons)
-
-	helpStyle := lipgloss.NewStyle().Foreground(colors.Gray()).Width(innerWidth).Align(lipgloss.Center)
-	helpText := helpStyle.Render(m.help.View(m.keys.QuitConfirm))
-
-	var lines []string
-	lines = append(lines, messageStyle.Render("Settings saved!"))
-	lines = append(lines, detailStyle.Render("Restart now to take effect?"))
-	lines = append(lines, "")
-	lines = append(lines, "")
-	lines = append(lines, centeredButtons)
-
-	innerHeight := h - components.BorderFrameHeight
-	contentHeight := lipgloss.Height(lipgloss.JoinVertical(lipgloss.Left, lines...))
-	helpHeight := lipgloss.Height(helpText)
-	spacing := innerHeight - contentHeight - helpHeight
-	if spacing < 0 {
-		spacing = 0
-	}
-	for i := 0; i < spacing; i++ {
-		lines = append(lines, "")
-	}
-	if len(lines) > 0 && spacing > 0 {
-		lines[len(lines)-1] = helpText
-	} else {
-		lines = append(lines, helpText)
-	}
-
-	content := lipgloss.JoinVertical(lipgloss.Left, lines...)
-	return renderBtopBox(PaneTitleStyle.Render(" Restart Required "), "", content, w, h, colors.Orange())
+	return modal.RenderWithBtopBox(renderBtopBox, PaneTitleStyle)
 }
 
-func (m RootModel) viewCategoryResetConfirm() string {
-	w, h := GetDynamicModalDimensions(m.width, m.height, 40, 8, 60, 10)
-	innerWidth := w - (components.BorderFrameWidth * 2)
-
-	messageStyle := lipgloss.NewStyle().
-		Foreground(colors.White()).
-		Width(innerWidth).
-		Align(lipgloss.Center)
-
-	detailStyle := lipgloss.NewStyle().
-		Foreground(colors.Orange()).
-		Bold(true).
-		Width(innerWidth).
-		Align(lipgloss.Center)
-
-	pad := "   "
-
-	activeFirst := lipgloss.NewStyle().Foreground(colors.White()).Background(colors.Orange()).Bold(true).Underline(true)
-	activeRest := lipgloss.NewStyle().Foreground(colors.White()).Background(colors.Orange()).Bold(true)
-	activePad := lipgloss.NewStyle().Background(colors.Orange())
-
-	inactiveFirst := lipgloss.NewStyle().Foreground(colors.LightGray()).Background(lipgloss.Color("236")).Underline(true)
-	inactiveRest := lipgloss.NewStyle().Foreground(colors.LightGray()).Background(lipgloss.Color("236"))
-	inactivePad := lipgloss.NewStyle().Background(lipgloss.Color("236"))
-
-	renderBtn := func(padStyle, firstStyle, restStyle lipgloss.Style, first, rest string) string {
-		return padStyle.Render(pad) + firstStyle.Render(first) + restStyle.Render(rest) + padStyle.Render(pad)
+func (m RootModel) viewPurgeConfirm() string {
+	filename := ""
+	if d := m.FindDownloadByID(m.purgeTargetID); d != nil {
+		filename = d.Filename
 	}
 
-	yesFirst, yesRest, yesPad := activeFirst, activeRest, activePad
-	noFirst, noRest, noPad := inactiveFirst, inactiveRest, inactivePad
-	if m.quitConfirmFocused == 1 {
-		yesFirst, yesRest, yesPad = inactiveFirst, inactiveRest, inactivePad
-		noFirst, noRest, noPad = activeFirst, activeRest, activePad
-	}
-
-	yesBtn := renderBtn(yesPad, yesFirst, yesRest, "Y", "es")
-	noBtn := renderBtn(noPad, noFirst, noRest, "N", "o")
-
-	buttons := lipgloss.JoinHorizontal(lipgloss.Center, yesBtn, "     ", noBtn)
-	centeredButtons := lipgloss.NewStyle().Width(innerWidth).Align(lipgloss.Center).Render(buttons)
-
-	helpStyle := lipgloss.NewStyle().Foreground(colors.Gray()).Width(innerWidth).Align(lipgloss.Center)
-	helpText := helpStyle.Render(m.help.View(m.keys.QuitConfirm))
-
-	var lines []string
-	lines = append(lines, messageStyle.Render("Reset all categories to defaults?"))
-	lines = append(lines, detailStyle.Render("This will overwrite your custom rules."))
-	lines = append(lines, "")
-	lines = append(lines, "")
-	lines = append(lines, centeredButtons)
-
-	innerHeight := h - components.BorderFrameHeight
-	contentHeight := lipgloss.Height(lipgloss.JoinVertical(lipgloss.Left, lines...))
-	helpHeight := lipgloss.Height(helpText)
-	spacing := innerHeight - contentHeight - helpHeight
-	if spacing < 0 {
-		spacing = 0
-	}
-	for i := 0; i < spacing; i++ {
-		lines = append(lines, "")
-	}
-	if len(lines) > 0 && spacing > 0 {
-		lines[len(lines)-1] = helpText
+	if filename == "" {
+		filename = "this download"
 	} else {
-		lines = append(lines, helpText)
+		filename = utils.Truncate(filename, 30)
 	}
 
-	content := lipgloss.JoinVertical(lipgloss.Left, lines...)
-	return renderBtopBox(PaneTitleStyle.Render(" Category Reset "), "", content, w, h, colors.Orange())
+	filenameStyled := lipgloss.NewStyle().Foreground(colors.White()).Bold(true).Render(filename)
+	detailStyle := lipgloss.NewStyle().Foreground(colors.Magenta()).Bold(true)
+	warnStyle := lipgloss.NewStyle().Foreground(colors.Red()).Bold(true)
+	detailStr := detailStyle.Render("File: ") + filenameStyled + "\n" + warnStyle.Render("This will also remove the downloaded file(s) from disk.")
+
+	modal := components.ConfirmationModal{
+		Title:            "Purge Download",
+		Message:          "Permanently delete this download?",
+		Detail:           detailStr,
+		Keys:             m.keys.QuitConfirm, // QuitConfirm works as a general yes/no
+		Help:             m.help,
+		BorderColor:      colors.Red(),
+		ShowYesNoButtons: true,
+		YesNoFocused:     m.quitConfirmFocused,
+		YesLabel:         "Yes",
+		NoLabel:          "No",
+	}
+
+	w, h := GetDynamicModalDimensions(m.width, m.height, 46, 8, 70, 12)
+	modal.Width = w
+	modal.Height = h
+
+	return modal.RenderWithBtopBox(renderBtopBox, PaneTitleStyle)
+}
+
+func (m RootModel) viewRemoveConfirm() string {
+	filename := ""
+	if d := m.FindDownloadByID(m.removeTargetID); d != nil {
+		filename = d.Filename
+		if filename == "" || filename == "Queued" {
+			filename = d.URL
+		}
+	}
+
+	if filename == "" {
+		filename = "this download"
+	} else {
+		filename = utils.Truncate(filename, 30)
+	}
+
+	filenameStyled := lipgloss.NewStyle().Foreground(colors.White()).Bold(true).Render(filename)
+	detailStyle := lipgloss.NewStyle().Foreground(colors.Magenta()).Bold(true)
+	warnStyle := lipgloss.NewStyle().Foreground(colors.Red()).Bold(true)
+	detailStr := detailStyle.Render("File: ") + filenameStyled + "\n" + warnStyle.Render("This paused or active download may lose progress data.")
+
+	modal := components.ConfirmationModal{
+		Title:            "Remove Download",
+		Message:          "Remove this download?",
+		Detail:           detailStr,
+		Keys:             m.keys.QuitConfirm, // QuitConfirm works as a general yes/no
+		Help:             m.help,
+		BorderColor:      colors.Orange(),
+		ButtonColor:      colors.Orange(),
+		ShowYesNoButtons: true,
+		YesNoFocused:     m.quitConfirmFocused,
+		YesLabel:         "Yes",
+		NoLabel:          "No",
+	}
+
+	w, h := GetDynamicModalDimensions(m.width, m.height, 46, 8, 70, 12)
+	modal.Width = w
+	modal.Height = h
+
+	return modal.RenderWithBtopBox(renderBtopBox, PaneTitleStyle)
 }
 
 // renderBtopBox creates a btop-style box with title embedded in the top border

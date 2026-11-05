@@ -4,8 +4,8 @@ import (
 	"strings"
 
 	"charm.land/lipgloss/v2"
-	"github.com/msh2050/fluxget/internal/engine/types"
 	"github.com/msh2050/fluxget/internal/tui/colors"
+	"github.com/msh2050/fluxget/internal/types"
 )
 
 // ChunkMapModel visualizes download chunks as a grid using a bitmap

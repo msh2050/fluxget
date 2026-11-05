@@ -19,8 +19,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/msh2050/fluxget/internal/engine/events"
 	"github.com/google/uuid"
+	"github.com/msh2050/fluxget/internal/types"
 )
 
 var debugLog *log.Logger
@@ -57,7 +57,7 @@ func keepTempForDebug(tmp, id, reason string) {
 		return
 	}
 	_ = os.RemoveAll(tmp)
-	debugLog.Printf("debug-keep: segments saved → %s (auto-delete in 24h)", dest)
+	debugLog.Printf("debug-keep: segments saved \u2192 %s (auto-delete in 24h)", dest)
 }
 
 // copyDir recursively copies src directory to dst.
@@ -164,7 +164,7 @@ func (e errRateLimit) Error() string { return fmt.Sprintf("429 rate limited (ret
 // Publisher is the interface stream.Downloader uses to emit SSE events.
 // Satisfied by core.DownloadService.
 type Publisher interface {
-	Publish(msg interface{}) error
+	Publish(msg types.DownloadEvent) error
 }
 
 // Format is one quality option sent by the browser extension.
@@ -209,7 +209,7 @@ func Start(ctx context.Context, pub Publisher, req Request) (string, error) {
 		title = filenameFromURL(req.URL)
 	}
 
-	_ = pub.Publish(events.DownloadQueuedMsg{
+	_ = pub.Publish(types.DownloadEvent{Type: types.EventQueued,
 		DownloadID: id,
 		Filename:   title,
 		URL:        req.URL,
@@ -218,7 +218,7 @@ func Start(ctx context.Context, pub Publisher, req Request) (string, error) {
 
 	go func() {
 		if err := run(ctx, pub, id, title, destDir, req); err != nil {
-			_ = pub.Publish(events.DownloadErrorMsg{
+			_ = pub.Publish(types.DownloadEvent{Type: types.EventError,
 				DownloadID: id,
 				Filename:   title,
 				DestPath:   destDir,
@@ -235,7 +235,7 @@ func Start(ctx context.Context, pub Publisher, req Request) (string, error) {
 func run(ctx context.Context, pub Publisher, id, title, destDir string, req Request) error {
 	start := time.Now()
 
-	_ = pub.Publish(events.DownloadStartedMsg{
+	_ = pub.Publish(types.DownloadEvent{Type: types.EventStarted,
 		DownloadID: id,
 		URL:        req.URL,
 		Filename:   title,
@@ -348,7 +348,7 @@ func runHLS(ctx context.Context, pub Publisher, id, title, destDir string, req R
 		}
 		best := HLSBestVariant(variants)
 		mediaURL = best.URL
-		debugLog.Printf("[%s] HLS best variant: %dx%d %d kbps → %s", id[:8], best.Width, best.Height, best.Bandwidth/1000, mediaURL)
+		debugLog.Printf("[%s] HLS best variant: %dx%d %d kbps \u2192 %s", id[:8], best.Width, best.Height, best.Bandwidth/1000, mediaURL)
 		body, err = fetchText(ctx, mediaURL, req.Headers)
 		if err != nil {
 			return fmt.Errorf("stream: fetch HLS media playlist: %w", err)
@@ -449,7 +449,7 @@ func runHLS(ctx context.Context, pub Publisher, id, title, destDir string, req R
 			keepOnce("concat-error")
 			return fmt.Errorf("stream: concat fMP4 segments: %w", err)
 		}
-		debugLog.Printf("[%s] fMP4: byte-concat %d files (init=%t) → remux %s", id[:8], len(allFiles), initURL != "", outFile)
+		debugLog.Printf("[%s] fMP4: byte-concat %d files (init=%t) \u2192 remux %s", id[:8], len(allFiles), initURL != "", outFile)
 		if err := mux(ctx, pub, id, title, []string{combined}, outFile, start); err != nil {
 			if fi, statErr := os.Stat(outFile); statErr != nil || fi.Size() == 0 {
 				_ = os.Remove(outFile)
@@ -458,7 +458,7 @@ func runHLS(ctx context.Context, pub Publisher, id, title, destDir string, req R
 			return err
 		}
 	} else {
-		debugLog.Printf("[%s] muxing %d segs (concat demuxer) → %s", id[:8], len(segFiles), outFile)
+		debugLog.Printf("[%s] muxing %d segs (concat demuxer) \u2192 %s", id[:8], len(segFiles), outFile)
 		if err := muxConcat(ctx, pub, id, title, segFiles, outFile, start); err != nil {
 			if fi, statErr := os.Stat(outFile); statErr != nil || fi.Size() == 0 {
 				_ = os.Remove(outFile)
@@ -539,7 +539,7 @@ func assembleHLSWithSubtitles(ctx context.Context, pub Publisher, id, title, des
 				debugLog.Printf("[%s] srt sidecar (%s) failed: %v\n%s", id[:8], t.lang, err, out)
 				_ = copyFile(t.path, base+suffix+".vtt", 0o644)
 			} else {
-				debugLog.Printf("[%s] subtitle sidecar → %s", id[:8], side)
+				debugLog.Printf("[%s] subtitle sidecar \u2192 %s", id[:8], side)
 			}
 		} else {
 			_ = copyFile(t.path, base+suffix+".vtt", 0o644)
@@ -551,7 +551,7 @@ func assembleHLSWithSubtitles(ctx context.Context, pub Publisher, id, title, des
 		if err := os.Rename(videoSrc, outFile); err != nil {
 			return err
 		}
-		debugLog.Printf("[%s] no ffmpeg — saved video + %d sidecar(s) → %s", id[:8], len(tracks), outFile)
+		debugLog.Printf("[%s] no ffmpeg \u2014 saved video + %d sidecar(s) \u2192 %s", id[:8], len(tracks), outFile)
 		return publishComplete(pub, id, title, outFile, start)
 	}
 
@@ -575,7 +575,7 @@ func assembleHLSWithSubtitles(ctx context.Context, pub Publisher, id, title, des
 	}
 	args = append(args, outFile)
 
-	debugLog.Printf("[%s] embedding %d subtitle track(s) → %s", id[:8], len(tracks), outFile)
+	debugLog.Printf("[%s] embedding %d subtitle track(s) \u2192 %s", id[:8], len(tracks), outFile)
 	if out, err := exec.CommandContext(ctx, ffmpeg, args...).CombinedOutput(); err != nil {
 		debugLog.Printf("[%s] ffmpeg subtitle mux error: %v\n%s", id[:8], err, out)
 		if fi, statErr := os.Stat(outFile); statErr != nil || fi.Size() == 0 {
@@ -672,7 +672,7 @@ func runSubtitlesOnly(ctx context.Context, pub Publisher, id, title, destDir str
 		if len(segs) > 0 && isVTTURL(segs[0].URL) {
 			subs = []HLSSubtitle{{URI: req.URL}}
 		} else {
-			return fmt.Errorf("stream: %q is a video playlist with no subtitles — the page's master playlist is required", req.URL)
+			return fmt.Errorf("stream: %q is a video playlist with no subtitles \u2014 the page's master playlist is required", req.URL)
 		}
 	default:
 		// Assume a direct subtitle file (e.g. .srt without a WEBVTT header).
@@ -707,7 +707,7 @@ func runSubtitlesOnly(ctx context.Context, pub Publisher, id, title, destDir str
 		outFile := filepath.Join(destDir, nameBase+suffix+".srt")
 		if ffErr == nil {
 			if out, cerr := exec.CommandContext(ctx, ffmpeg, "-y", "-i", vtt, outFile).CombinedOutput(); cerr != nil {
-				debugLog.Printf("[%s] vtt→srt failed (%s): %v\n%s", id[:8], lang, cerr, out)
+				debugLog.Printf("[%s] vtt\u2192srt failed (%s): %v\n%s", id[:8], lang, cerr, out)
 				outFile = filepath.Join(destDir, nameBase+suffix+".vtt")
 				if copyFile(vtt, outFile, 0o644) != nil {
 					continue
@@ -721,7 +721,7 @@ func runSubtitlesOnly(ctx context.Context, pub Publisher, id, title, destDir str
 		}
 		saved++
 		lastFile = outFile
-		debugLog.Printf("[%s] subtitle saved → %s", id[:8], outFile)
+		debugLog.Printf("[%s] subtitle saved \u2192 %s", id[:8], outFile)
 	}
 
 	if saved == 0 {
@@ -800,7 +800,7 @@ func runDASH(ctx context.Context, pub Publisher, id, title, destDir string, req 
 	}
 
 	outFile := outputPath(destDir, sanitizeFilename(title), ".mp4")
-	debugLog.Printf("[%s] muxing → %s", id[:8], outFile)
+	debugLog.Printf("[%s] muxing \u2192 %s", id[:8], outFile)
 	if err := mux(ctx, pub, id, title, inputs, outFile, start); err != nil {
 		if fi, statErr := os.Stat(outFile); statErr != nil || fi.Size() == 0 {
 			_ = os.Remove(outFile)
@@ -835,7 +835,7 @@ func runDirect(ctx context.Context, pub Publisher, id, title, destDir string, re
 	if elapsed.Seconds() > 0 && total > 0 {
 		avgSpeed = float64(total) / elapsed.Seconds()
 	}
-	_ = pub.Publish(events.DownloadCompleteMsg{
+	_ = pub.Publish(types.DownloadEvent{Type: types.EventComplete,
 		DownloadID: id,
 		Filename:   filepath.Base(outFile),
 		Elapsed:    elapsed,
@@ -1042,19 +1042,19 @@ func downloadSegments(ctx context.Context, pub Publisher, id string, urls []stri
 						// of real video data.
 						if job.idx == 0 {
 							if verr := validateVideoSegment(files[0]); verr != nil {
-								debugLog.Printf("[%s] seg0 invalid — aborting all workers: %v", id[:8], verr)
+								debugLog.Printf("[%s] seg0 invalid \u2014 aborting all workers: %v", id[:8], verr)
 								cancel()
 								errs <- verr
 								return
 							}
 						}
-						_ = pub.Publish(events.ProgressMsg{
-							DownloadID:        id,
-							Downloaded:        db,
-							Total:             db * total / max64(d, 1),
-							Speed:             float64(db) / max1(time.Since(start).Seconds()),
-							Elapsed:           time.Since(start),
-							ActiveConnections: workers,
+						_ = pub.Publish(types.DownloadEvent{Type: types.EventProgress,
+							DownloadID:  id,
+							Downloaded:  db,
+							Total:       db * total / max64(d, 1),
+							Speed:       float64(db) / max1(time.Since(start).Seconds()),
+							Elapsed:     time.Since(start),
+							Connections: workers,
 						})
 						backoff = retryDelay // reset on success
 						lastErr = nil
@@ -1067,7 +1067,7 @@ func downloadSegments(ctx context.Context, pub Publisher, id string, urls []stri
 						if backoff > wait {
 							wait = backoff
 						}
-						debugLog.Printf("[%s] 429 on seg %d — waiting %v (attempt %d)", id[:8], job.idx, wait, attempt+1)
+						debugLog.Printf("[%s] 429 on seg %d \u2014 waiting %v (attempt %d)", id[:8], job.idx, wait, attempt+1)
 						select {
 						case <-dCtx.Done():
 							return
@@ -1264,9 +1264,9 @@ func findMediaStart(data []byte) int {
 // isYouTubeCDNFragment detects YouTube adaptive fragmented media segments that
 // should be skipped during segment enumeration. Mirrors IDMNetMon.dll lines 54504-54519.
 //
-//   M4S extension + (/avf/ or /sep/ in path) + filename begins "segment-" → adaptive fragment
-//   MP4 extension + (/avf/ or /parcel/ in path)                           → fragmented MP4 chunk
-//   /api/manifest/init_segment                                             → DASH init segment URL
+//	M4S extension + (/avf/ or /sep/ in path) + filename begins "segment-" → adaptive fragment
+//	MP4 extension + (/avf/ or /parcel/ in path)                           → fragmented MP4 chunk
+//	/api/manifest/init_segment                                             → DASH init segment URL
 func isYouTubeCDNFragment(u string) bool {
 	lower := strings.ToLower(u)
 	path := strings.SplitN(lower, "?", 2)[0]
@@ -1332,13 +1332,13 @@ func downloadFileDirect(ctx context.Context, pub Publisher, id, u, dest string, 
 			}
 			downloaded += int64(n)
 			if time.Since(lastReport) > 250*time.Millisecond {
-				_ = pub.Publish(events.ProgressMsg{
-					DownloadID:        id,
-					Downloaded:        downloaded,
-					Total:             total,
-					Speed:             float64(downloaded) / max1(time.Since(start).Seconds()),
-					Elapsed:           time.Since(start),
-					ActiveConnections: 1,
+				_ = pub.Publish(types.DownloadEvent{Type: types.EventProgress,
+					DownloadID:  id,
+					Downloaded:  downloaded,
+					Total:       total,
+					Speed:       float64(downloaded) / max1(time.Since(start).Seconds()),
+					Elapsed:     time.Since(start),
+					Connections: 1,
 				})
 				lastReport = time.Now()
 			}
@@ -1367,7 +1367,7 @@ func mux(ctx context.Context, pub Publisher, id, title string, inputs []string, 
 		if len(inputs) == 1 {
 			return os.Rename(inputs[0], outFile)
 		}
-		return fmt.Errorf("stream: ffmpeg not found — install ffmpeg to mux video+audio: %w", err)
+		return fmt.Errorf("stream: ffmpeg not found \u2014 install ffmpeg to mux video+audio: %w", err)
 	}
 
 	args := []string{"-y"}
@@ -1381,7 +1381,7 @@ func mux(ctx context.Context, pub Publisher, id, title string, inputs []string, 
 		debugLog.Printf("[%s] ffmpeg mux error: %v\n%s", id[:8], err, out)
 		return fmt.Errorf("stream: ffmpeg: %w\n%s", err, out)
 	}
-	debugLog.Printf("[%s] ffmpeg mux OK → %s", id[:8], outFile)
+	debugLog.Printf("[%s] ffmpeg mux OK \u2192 %s", id[:8], outFile)
 
 	return publishComplete(pub, id, title, outFile, start)
 }
@@ -1424,7 +1424,7 @@ func muxConcat(ctx context.Context, pub Publisher, id, title string, segFiles []
 		return fmt.Errorf("stream: ffmpeg concat: %w\n%s", err, out)
 	}
 	if fi, e := os.Stat(outFile); e == nil {
-		debugLog.Printf("[%s] ffmpeg concat OK → %s (%s)", id[:8], outFile, formatBytes(fi.Size()))
+		debugLog.Printf("[%s] ffmpeg concat OK \u2192 %s (%s)", id[:8], outFile, formatBytes(fi.Size()))
 	} else {
 		debugLog.Printf("[%s] ffmpeg concat OK but output missing: %v", id[:8], e)
 	}
@@ -1472,7 +1472,7 @@ func fetchText(ctx context.Context, u string, headers map[string]string) (string
 	if cookie == "" {
 		cookie = "(none)"
 	} else if len(cookie) > 120 {
-		cookie = cookie[:120] + "…"
+		cookie = cookie[:120] + "\u2026"
 	}
 	debugLog.Printf("fetchText %s | Cookie: %s | Referer: %s", u, cookie, req.Header.Get("Referer"))
 	resp, err := (&http.Client{Timeout: 120 * time.Second}).Do(req)
@@ -1505,7 +1505,7 @@ func publishComplete(pub Publisher, id, title, outFile string, start time.Time) 
 	if elapsed.Seconds() > 0 && total > 0 {
 		avgSpeed = float64(total) / elapsed.Seconds()
 	}
-	return pub.Publish(events.DownloadCompleteMsg{
+	return pub.Publish(types.DownloadEvent{Type: types.EventComplete,
 		DownloadID: id,
 		Filename:   filepath.Base(outFile),
 		Elapsed:    elapsed,
@@ -1617,7 +1617,7 @@ func validateVideoSegment(path string) error {
 	hdr := make([]byte, 8)
 	n, _ := f.Read(hdr)
 	if n < 4 {
-		return fmt.Errorf("stream: segment too small (%d bytes) — not valid video", n)
+		return fmt.Errorf("stream: segment too small (%d bytes) \u2014 not valid video", n)
 	}
 
 	// MPEG-TS sync byte
@@ -1637,18 +1637,18 @@ func validateVideoSegment(path string) error {
 	// prefix should already have been stripped (see stripFakeImagePrefix); a PNG
 	// still present means no real media payload was found behind it.
 	if hdr[0] == 0x89 && hdr[1] == 0x50 && hdr[2] == 0x4E && hdr[3] == 0x47 {
-		return fmt.Errorf("stream: segment is a PNG image with no recoverable video payload — the stream URL may require authentication (missing cookies or signed token)")
+		return fmt.Errorf("stream: segment is a PNG image with no recoverable video payload \u2014 the stream URL may require authentication (missing cookies or signed token)")
 	}
 	// JPEG magic: FF D8
 	if hdr[0] == 0xFF && hdr[1] == 0xD8 {
-		return fmt.Errorf("stream: segment is a JPEG image with no recoverable video payload — the stream URL may require authentication")
+		return fmt.Errorf("stream: segment is a JPEG image with no recoverable video payload \u2014 the stream URL may require authentication")
 	}
 	// HTML error page
 	if strings.HasPrefix(string(hdr[:n]), "<!") || strings.HasPrefix(string(hdr[:n]), "<ht") {
-		return fmt.Errorf("stream: CDN returned an HTML error page instead of video — the stream URL requires authentication")
+		return fmt.Errorf("stream: CDN returned an HTML error page instead of video \u2014 the stream URL requires authentication")
 	}
 	// Unknown but not obviously video — warn but allow (could be a codec we don't recognise)
-	debugLog.Printf("validateVideoSegment: unknown segment header %x — continuing", hdr[:n])
+	debugLog.Printf("validateVideoSegment: unknown segment header %x \u2014 continuing", hdr[:n])
 	return nil
 }
 

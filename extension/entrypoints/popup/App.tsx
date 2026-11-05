@@ -1,5 +1,12 @@
 import { createSignal, onMount, onCleanup } from 'solid-js';
-import { readStoredBoolean, readStoredString, STORAGE_KEYS } from '../../lib/storage';
+import {
+  readStoredBoolean,
+  readStoredString,
+  readStoredNumber,
+  STORAGE_KEYS,
+  migrateServerProfiles,
+  resolveActiveServerUrl,
+} from '../../lib/storage';
 import {
   serverConnected,
   setServerConnected,
@@ -10,9 +17,14 @@ import {
   setCurrentView,
   setInterceptEnabled,
   setNotificationsEnabled,
+  setFallbackToBrowser,
+  setMinFileSize,
+  setWarnOnDuplicate,
   handleSseEvent,
   setServerUrl,
   setServerUrlLocked,
+  setServerProfiles,
+  setActiveProfileId,
   setAuthToken,
   setAuthTokenLocked,
   authValid,
@@ -58,24 +70,43 @@ export default function App() {
     try {
       const storedValues = await browser.storage.local.get([
         STORAGE_KEYS.SERVER_URL,
+        STORAGE_KEYS.PROFILES,
+        STORAGE_KEYS.ACTIVE_PROFILE_ID,
         STORAGE_KEYS.TOKEN,
         STORAGE_KEYS.VERIFIED,
         STORAGE_KEYS.INTERCEPT,
         STORAGE_KEYS.NOTIFICATIONS,
+        STORAGE_KEYS.FALLBACK_TO_BROWSER,
+        STORAGE_KEYS.MIN_FILE_SIZE,
+        STORAGE_KEYS.WARN_ON_DUPLICATE,
       ]);
 
-      const storedServerUrl = readStoredString(storedValues, STORAGE_KEYS.SERVER_URL);
+      // Migrate the legacy single SERVER_URL into a default profile when needed.
+      const migration = migrateServerProfiles(storedValues);
+      if (migration.migrated) {
+        await browser.storage.local.set({
+          [STORAGE_KEYS.PROFILES]: migration.profiles,
+          [STORAGE_KEYS.ACTIVE_PROFILE_ID]: migration.activeId,
+        });
+      }
+
+      setServerProfiles(migration.profiles);
+      setActiveProfileId(migration.activeId);
+
+      const activeServerUrl = resolveActiveServerUrl(migration.profiles, migration.activeId);
+      setServerUrl(activeServerUrl);
+      setServerUrlLocked(activeServerUrl.trim().length > 0);
+
       const storedToken = readStoredString(storedValues, STORAGE_KEYS.TOKEN);
-
-      setServerUrl(storedServerUrl);
-      setServerUrlLocked(storedServerUrl.trim().length > 0);
-
       setAuthToken(storedToken);
       setAuthTokenLocked(storedToken.trim().length > 0);
       setAuthValid(readStoredBoolean(storedValues, STORAGE_KEYS.VERIFIED, false));
 
       setInterceptEnabled(readStoredBoolean(storedValues, STORAGE_KEYS.INTERCEPT, true));
       setNotificationsEnabled(readStoredBoolean(storedValues, STORAGE_KEYS.NOTIFICATIONS, true));
+      setFallbackToBrowser(readStoredBoolean(storedValues, STORAGE_KEYS.FALLBACK_TO_BROWSER, true));
+      setMinFileSize(readStoredNumber(storedValues, STORAGE_KEYS.MIN_FILE_SIZE, 10));
+      setWarnOnDuplicate(readStoredBoolean(storedValues, STORAGE_KEYS.WARN_ON_DUPLICATE, true));
     } catch { /* ignore */ }
   }
 

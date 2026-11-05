@@ -1,18 +1,17 @@
 package tui
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/msh2050/fluxget/internal/config"
-	"github.com/msh2050/fluxget/internal/core"
-	"github.com/msh2050/fluxget/internal/download"
-	"github.com/msh2050/fluxget/internal/engine/state"
-	"github.com/msh2050/fluxget/internal/engine/types"
-	"github.com/msh2050/fluxget/internal/processing"
+	"github.com/msh2050/fluxget/internal/orchestrator"
+	"github.com/msh2050/fluxget/internal/service"
+	"github.com/msh2050/fluxget/internal/store"
+	"github.com/msh2050/fluxget/internal/testutil"
+	"github.com/msh2050/fluxget/internal/types"
 )
 
 func TestAutoResume_Enabled(t *testing.T) {
@@ -27,32 +26,24 @@ func TestAutoResume_Enabled(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 2. Create settings file with AutoResume = true
-	settingsPath := filepath.Join(surgeDir, "settings.json")
 	settings := config.DefaultSettings()
 	settings.General.AutoResume.Value = true
 	settings.General.DefaultDownloadDir.Value = tmpDir
 
-	data, _ := json.Marshal(settings)
-	if err := os.WriteFile(settingsPath, data, 0o644); err != nil {
+	if err := config.SaveSettings(settings); err != nil {
 		t.Fatal(err)
 	}
 
 	// 3. Configure State DB
-	state.CloseDB() // Ensure clean state
-	t.Cleanup(state.CloseDB)
-	dbPath := filepath.Join(surgeDir, "state", "surge.db")
-	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	state.Configure(dbPath)
+	// 3. Configure State DB
+	_ = testutil.SetupStateDB(t)
 
 	// 4. Seed DB with a paused download
 	testID := "resume-id-1"
 	testURL := "http://example.com/resume.zip"
 	testDest := filepath.Join(tmpDir, "resume.zip")
 
-	manualState := &types.DownloadState{
+	manualState := &types.DownloadRecord{
 		ID:         testID,
 		URL:        testURL,
 		Filename:   "resume.zip",
@@ -62,15 +53,27 @@ func TestAutoResume_Enabled(t *testing.T) {
 		PausedAt:   time.Now().Unix(),
 		CreatedAt:  time.Now().Unix(),
 	}
-	if err := state.SaveState(testURL, testDest, manualState); err != nil {
+	if err := store.AddToMasterList(types.DownloadRecord{
+		ID:         testID,
+		URL:        testURL,
+		DestPath:   testDest,
+		Filename:   "resume.zip",
+		Status:     "paused",
+		TotalSize:  1000,
+		Downloaded: 500,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveState(testURL, testDest, manualState); err != nil {
 		t.Fatal(err)
 	}
 
 	// 5. Initialize Model
-	ch := make(chan any, 10)
-	pool := download.NewWorkerPool(ch, 1)
+	bus := orchestrator.NewEventBus()
+	mgr := orchestrator.NewLifecycleManager(nil, bus, nil)
+	svc := service.NewLocalDownloadService(mgr)
 
-	m := InitialRootModel(1700, "test-version", core.NewLocalDownloadServiceWithInput(pool, ch), processing.NewLifecycleManager(nil, nil), false)
+	m := InitialRootModel(1700, "test-version", svc, mgr, settings, false)
 
 	// 6. Verify Download is Resumed
 	found := false
@@ -100,31 +103,23 @@ func TestAutoResume_Disabled(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 2. Settings with AutoResume = false
-	settingsPath := filepath.Join(surgeDir, "settings.json")
 	settings := config.DefaultSettings()
 	settings.General.AutoResume.Value = false
 
-	data, _ := json.Marshal(settings)
-	if err := os.WriteFile(settingsPath, data, 0o644); err != nil {
+	if err := config.SaveSettings(settings); err != nil {
 		t.Fatal(err)
 	}
 
 	// 3. Configure State DB
-	state.CloseDB() // Ensure clean state
-	t.Cleanup(state.CloseDB)
-	dbPath := filepath.Join(surgeDir, "state", "surge.db")
-	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	state.Configure(dbPath)
+	// 3. Configure State DB
+	_ = testutil.SetupStateDB(t)
 
 	// 4. Seed DB with a paused download
 	testID := "resume-id-2"
 	testURL := "http://example.com/resume2.zip"
 	testDest := filepath.Join(tmpDir, "resume2.zip")
 
-	manualState := &types.DownloadState{
+	manualState := &types.DownloadRecord{
 		ID:         testID,
 		URL:        testURL,
 		Filename:   "resume2.zip",
@@ -134,23 +129,35 @@ func TestAutoResume_Disabled(t *testing.T) {
 		PausedAt:   time.Now().Unix(),
 		CreatedAt:  time.Now().Unix(),
 	}
-	if err := state.SaveState(testURL, testDest, manualState); err != nil {
+	if err := store.AddToMasterList(types.DownloadRecord{
+		ID:         testID,
+		URL:        testURL,
+		DestPath:   testDest,
+		Filename:   "resume2.zip",
+		Status:     "paused",
+		TotalSize:  1000,
+		Downloaded: 500,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveState(testURL, testDest, manualState); err != nil {
 		t.Fatal(err)
 	}
 
 	// 5. Initialize Model
-	ch := make(chan any, 10)
-	pool := download.NewWorkerPool(ch, 1)
+	bus := orchestrator.NewEventBus()
+	mgr := orchestrator.NewLifecycleManager(nil, bus, nil)
+	svc := service.NewLocalDownloadService(mgr)
 
-	m := InitialRootModel(1700, "test-version", core.NewLocalDownloadServiceWithInput(pool, ch), processing.NewLifecycleManager(nil, nil), false)
+	m := InitialRootModel(1700, "test-version", svc, mgr, settings, false)
 
 	// 6. Verify Download is Resumed
 	found := false
 	for _, d := range m.downloads {
 		if d.ID == testID {
 			found = true
-			if !d.paused {
-				t.Error("Download SHOULD be paused when AutoResume is disabled")
+			if d.resuming {
+				t.Error("Download should NOT have resuming=true when AutoResume is disabled")
 			}
 		}
 	}

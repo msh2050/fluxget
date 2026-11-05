@@ -6,7 +6,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/msh2050/fluxget/internal/engine/types"
+	"github.com/msh2050/fluxget/internal/types"
 )
 
 func TestExecuteGlobalShutdown_Once(t *testing.T) {
@@ -39,8 +39,8 @@ type fakeShutdownService struct {
 	onShutdown func()
 }
 
-func (f *fakeShutdownService) StreamEvents(context.Context) (<-chan interface{}, func(), error) {
-	ch := make(chan interface{})
+func (f *fakeShutdownService) StreamEvents(context.Context) (<-chan types.DownloadEvent, func(), error) {
+	ch := make(chan types.DownloadEvent)
 	return ch, func() { close(ch) }, nil
 }
 
@@ -62,9 +62,9 @@ func TestDefaultGlobalShutdown_ShutdownBeforeCleanup(t *testing.T) {
 			order = append(order, "shutdown")
 		},
 	}
-	GlobalLifecycleCleanup = func() {
+	setLifecycleCleanupForTest(func() {
 		order = append(order, "cleanup")
-	}
+	})
 	t.Cleanup(func() {
 		GlobalService = nil
 		GlobalLifecycle = nil

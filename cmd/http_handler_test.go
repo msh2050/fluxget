@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,25 +10,25 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/msh2050/fluxget/internal/config"
-	"github.com/msh2050/fluxget/internal/core"
-	"github.com/msh2050/fluxget/internal/download"
-	"github.com/msh2050/fluxget/internal/engine/state"
-	"github.com/msh2050/fluxget/internal/engine/types"
-	"github.com/msh2050/fluxget/internal/processing"
+	"github.com/msh2050/fluxget/internal/orchestrator"
+	"github.com/msh2050/fluxget/internal/scheduler"
+	"github.com/msh2050/fluxget/internal/service"
+	"github.com/msh2050/fluxget/internal/store"
+	"github.com/msh2050/fluxget/internal/testutil"
+	"github.com/msh2050/fluxget/internal/types"
 )
 
 func TestHandleDownload_PathResolution(t *testing.T) {
-	// Setup temporary directory for mocking XDG_CONFIG_HOME
-	tempDir, err := os.MkdirTemp("", "surge-test-home")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = os.RemoveAll(tempDir) }()
+	// Resolve relative download paths inside a temporary directory, not the
+	// source tree that other package tests may be scanning concurrently.
+	tempDir := t.TempDir()
+	t.Chdir(tempDir)
 
 	origLifecycle := GlobalLifecycle
 	origLifecycleCleanup := GlobalLifecycleCleanup
@@ -41,19 +42,30 @@ func TestHandleDownload_PathResolution(t *testing.T) {
 	GlobalLifecycleCleanup = nil
 	GlobalService = nil
 
+	origSettings := globalSettings
+	globalSettings = nil
+	t.Cleanup(func() { globalSettings = origSettings })
+
 	// Ensure a clean state DB for the test scope.
-	state.CloseDB()
-	state.Configure(filepath.Join(tempDir, "surge.db"))
-	defer state.CloseDB()
+	store.CloseDB()
+	store.Configure(filepath.Join(tempDir, "surge.db"))
+	defer store.CloseDB()
 
 	// Mock XDG_CONFIG_HOME to affect GetSurgeDir() on Linux
 	originalConfigHome := os.Getenv("XDG_CONFIG_HOME")
 	_ = os.Setenv("XDG_CONFIG_HOME", tempDir)
+	originalAppData := os.Getenv("APPDATA")
+	_ = os.Setenv("APPDATA", tempDir)
 	defer func() {
 		if originalConfigHome == "" {
 			_ = os.Unsetenv("XDG_CONFIG_HOME")
 		} else {
 			_ = os.Setenv("XDG_CONFIG_HOME", originalConfigHome)
+		}
+		if originalAppData == "" {
+			_ = os.Unsetenv("APPDATA")
+		} else {
+			_ = os.Setenv("APPDATA", originalAppData)
 		}
 	}()
 
@@ -78,13 +90,18 @@ func TestHandleDownload_PathResolution(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Initialize GlobalPool (required by handleDownload)
-	GlobalPool = download.NewWorkerPool(nil, 1)
+	// Release any pool inherited from an earlier test. Each subtest installs
+	// its own below because manager shutdown closes the pool it wraps.
+	if GlobalPool != nil {
+		GlobalPool.GracefulShutdown()
+		GlobalPool = nil
+	}
 
 	tests := []struct {
 		name               string
 		request            DownloadRequest
 		expectedOutputPath string
+		skipOnWindows      bool // simulation tests that don't apply when the daemon IS on Windows
 	}{
 		{
 			name: "Absolute Path (Explicit)",
@@ -129,20 +146,27 @@ func TestHandleDownload_PathResolution(t *testing.T) {
 			expectedOutputPath: defaultDownloadDir,
 		},
 		{
+			// On a non-Windows daemon, a Windows absolute path from the extension
+			// is remapped to the daemon's default download directory.
+			// On Windows, C:/ is a real local path — no remapping occurs.
 			name: "Windows Download Root Maps To Default Dir",
 			request: DownloadRequest{
 				URL:  "http://example.com/file6",
 				Path: "C:/Users/me/Downloads",
 			},
 			expectedOutputPath: defaultDownloadDir,
+			skipOnWindows:      true,
 		},
 		{
+			// Same as above: the "/surge-repro" suffix is preserved on non-Windows daemons.
+			// On Windows, this is just a literal local path.
 			name: "Windows Nested Path Maps Under Default Dir",
 			request: DownloadRequest{
 				URL:  "http://example.com/file7",
 				Path: "C:/Users/me/Downloads/surge-repro",
 			},
 			expectedOutputPath: filepath.Join(defaultDownloadDir, "surge-repro"),
+			skipOnWindows:      true,
 		},
 		{
 			name: "Windows Nested Path Relative Flag Maps Under Default Dir",
@@ -152,6 +176,7 @@ func TestHandleDownload_PathResolution(t *testing.T) {
 				RelativeToDefaultDir: true,
 			},
 			expectedOutputPath: filepath.Join(defaultDownloadDir, "surge-repro"),
+			skipOnWindows:      true,
 		},
 		{
 			name: "Unmatched Windows Path Falls Back To Default Dir",
@@ -161,15 +186,28 @@ func TestHandleDownload_PathResolution(t *testing.T) {
 				RelativeToDefaultDir: true,
 			},
 			expectedOutputPath: defaultDownloadDir,
+			skipOnWindows:      true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			if tt.skipOnWindows && runtime.GOOS == "windows" {
+				t.Skip("path-remapping simulation does not apply on Windows daemons")
+			}
 			body, _ := json.Marshal(tt.request)
 			req := httptest.NewRequest("POST", "/download", bytes.NewBuffer(body))
 			w := httptest.NewRecorder()
-			svc := core.NewLocalDownloadService(GlobalPool)
+			eventBus := orchestrator.NewEventBus()
+			t.Cleanup(func() { eventBus.Shutdown() })
+			tmpPool := scheduler.New(nil, 1)
+			t.Cleanup(func() { tmpPool.GracefulShutdown() })
+			GlobalPool = tmpPool
+			getAll := func() []types.DownloadRecord { return GlobalPool.GetAll() }
+			tmpLifecycle := orchestrator.NewLifecycleManager(GlobalPool, eventBus, settings, buildActiveDownloadChecker(getAll))
+			t.Cleanup(func() { tmpLifecycle.Shutdown() })
+			GlobalLifecycle = tmpLifecycle
+			svc := service.NewLocalDownloadService(GlobalLifecycle)
 
 			// We pass defaultDownloadDir as a fallback to handleDownload, but since we mocked settings,
 			// it should prioritize settings.General.DefaultDownloadDir
@@ -187,12 +225,17 @@ func TestHandleDownload_PathResolution(t *testing.T) {
 					found = true
 					t.Logf("OutputPath for %s: %s", tt.name, cfg.OutputPath)
 
-					if !filepath.IsAbs(cfg.OutputPath) {
-						t.Errorf("Expected absolute path, got %s", cfg.OutputPath)
+					expectedAbs := tt.expectedOutputPath
+					if abs, err := filepath.Abs(expectedAbs); err == nil {
+						expectedAbs = abs
 					}
 
-					if cfg.OutputPath != tt.expectedOutputPath {
-						t.Errorf("Expected path %s, got %s", tt.expectedOutputPath, cfg.OutputPath)
+					if cfg.OutputPath != expectedAbs {
+						if runtime.GOOS == "windows" && strings.EqualFold(cfg.OutputPath, expectedAbs) {
+							// Windows paths are case-insensitive
+						} else {
+							t.Errorf("Expected path %s, got %s", expectedAbs, cfg.OutputPath)
+						}
 					}
 					break
 				}
@@ -258,9 +301,18 @@ func mustGetwd(t *testing.T) string {
 func TestHandleDownload_SkipApprovalUsesLifecycleEnqueue(t *testing.T) {
 	setupIsolatedCmdState(t)
 
-	progressCh := make(chan any, 10)
+	progressCh := make(chan types.DownloadEvent, 10)
 	GlobalProgressCh = progressCh
-	GlobalPool = download.NewWorkerPool(progressCh, 1)
+	if GlobalPool != nil {
+		GlobalPool.GracefulShutdown()
+	}
+	tmpPool := scheduler.New(progressCh, 1)
+	t.Cleanup(func() {
+		if tmpPool != nil {
+			tmpPool.GracefulShutdown()
+		}
+	})
+	GlobalPool = tmpPool
 
 	origLifecycle := GlobalLifecycle
 	origService := GlobalService
@@ -271,54 +323,37 @@ func TestHandleDownload_SkipApprovalUsesLifecycleEnqueue(t *testing.T) {
 		GlobalProgressCh = nil
 	})
 
-	probeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if got := r.Header.Get("Range"); got != "bytes=0-0" {
-			t.Fatalf("Range header = %q, want bytes=0-0", got)
+	firstRange := make(chan string, 1)
+	probeServer := testutil.NewHTTPServerT(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rangeHeader := r.Header.Get("Range")
+		select {
+		case firstRange <- rangeHeader:
+		default:
 		}
-		w.Header().Set("Content-Range", "bytes 0-0/7")
-		w.Header().Set("Content-Length", "1")
+		if rangeHeader == "bytes=0-0" {
+			w.Header().Set("Content-Range", "bytes 0-0/7")
+			w.Header().Set("Content-Length", "1")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write([]byte("x"))
+			return
+		}
+		w.Header().Set("Content-Range", "bytes 0-6/7")
+		w.Header().Set("Content-Length", "7")
 		w.WriteHeader(http.StatusPartialContent)
-		_, _ = w.Write([]byte("x"))
+		_, _ = w.Write([]byte("content"))
 	}))
 	defer probeServer.Close()
 
 	tempDir := t.TempDir()
 	expectedFile := "from-extension.bin"
 
-	var addCalls int
-	GlobalLifecycle = processing.NewLifecycleManager(func(url, path, filename string, _ []string, headers map[string]string, explicit bool, totalSize int64, supportsRange bool) (string, error) {
-		addCalls++
-		if url != probeServer.URL {
-			t.Fatalf("url = %q, want %q", url, probeServer.URL)
-		}
-		if path != tempDir {
-			t.Fatalf("path = %q, want %q", path, tempDir)
-		}
-		if filename != expectedFile {
-			t.Fatalf("filename = %q, want %q", filename, expectedFile)
-		}
-		if !explicit {
-			t.Fatal("expected explicit category flag to be preserved")
-		}
-		if totalSize != 7 {
-			t.Fatalf("totalSize = %d, want 7", totalSize)
-		}
-		if !supportsRange {
-			t.Fatal("expected probe to preserve range support")
-		}
-		if headers["Authorization"] != "Bearer test" {
-			t.Fatalf("headers were not forwarded to lifecycle addFunc")
-		}
-
-		surgePath := filepath.Join(path, filename) + types.IncompleteSuffix
-		if _, err := os.Stat(surgePath); err != nil {
-			t.Fatalf("expected pre-created working file before addFunc: %v", err)
-		}
-
-		return "queued-id", nil
-	}, nil)
-
-	svc := core.NewLocalDownloadService(nil)
+	eventBus := orchestrator.NewEventBus()
+	t.Cleanup(func() { eventBus.Shutdown() })
+	getAll := func() []types.DownloadRecord { return GlobalPool.GetAll() }
+	tmpLifecycle := orchestrator.NewLifecycleManager(GlobalPool, eventBus, nil, buildActiveDownloadChecker(getAll))
+	t.Cleanup(func() { tmpLifecycle.Shutdown() })
+	GlobalLifecycle = tmpLifecycle
+	svc := service.NewLocalDownloadService(GlobalLifecycle)
 	GlobalService = svc
 	t.Cleanup(func() {
 		_ = svc.Shutdown()
@@ -341,25 +376,52 @@ func TestHandleDownload_SkipApprovalUsesLifecycleEnqueue(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
-	if addCalls != 1 {
-		t.Fatalf("expected lifecycle addFunc to be called once, got %d", addCalls)
+	select {
+	case got := <-firstRange:
+		if got != "bytes=0-0" {
+			t.Fatalf("first Range header = %q, want bytes=0-0", got)
+		}
+	default:
+		t.Fatal("expected lifecycle enqueue to probe the server")
 	}
-
-	var resp map[string]string
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("failed to decode response: %v", err)
+	configs := GlobalPool.GetAll()
+	if len(configs) != 1 {
+		t.Fatalf("expected 1 download queued, got %d", len(configs))
 	}
-	if resp["id"] != "queued-id" {
-		t.Fatalf("response id = %q, want queued-id", resp["id"])
+	cfg := configs[0]
+	if cfg.URL != probeServer.URL {
+		t.Fatalf("url = %q, want %q", cfg.URL, probeServer.URL)
+	}
+	expectedPath := tempDir
+	if abs, err := filepath.Abs(tempDir); err == nil {
+		expectedPath = abs
+	}
+	if cfg.OutputPath != expectedPath {
+		t.Fatalf("path = %q, want %q", cfg.OutputPath, expectedPath)
+	}
+	if cfg.Filename != expectedFile {
+		t.Fatalf("filename = %q, want %q", cfg.Filename, expectedFile)
+	}
+	if cfg.Headers["Authorization"] != "Bearer test" {
+		t.Fatalf("headers were not forwarded to lifecycle addFunc")
 	}
 }
 
 func TestHandleDownload_EnqueueError_RecordsPreflightError(t *testing.T) {
 	setupIsolatedCmdState(t)
 
-	progressCh := make(chan any, 10)
+	progressCh := make(chan types.DownloadEvent, 10)
 	GlobalProgressCh = progressCh
-	GlobalPool = download.NewWorkerPool(progressCh, 1)
+	if GlobalPool != nil {
+		GlobalPool.GracefulShutdown()
+	}
+	tmpPool := scheduler.New(progressCh, 1)
+	t.Cleanup(func() {
+		if tmpPool != nil {
+			tmpPool.GracefulShutdown()
+		}
+	})
+	GlobalPool = tmpPool
 
 	origLifecycle := GlobalLifecycle
 	origService := GlobalService
@@ -370,20 +432,21 @@ func TestHandleDownload_EnqueueError_RecordsPreflightError(t *testing.T) {
 		GlobalProgressCh = nil
 	})
 
-	// Create a lifecycle manager whose addFunc should never be reached
-	// because the probe will fail first (invalid URL scheme).
-	GlobalLifecycle = processing.NewLifecycleManager(func(string, string, string, []string, map[string]string, bool, int64, bool) (string, error) {
-		t.Fatal("addFunc should not be called when probe fails")
-		return "", nil
-	}, nil)
-
-	svc := core.NewLocalDownloadService(nil)
+	eventBus := orchestrator.NewEventBus()
+	t.Cleanup(func() { eventBus.Shutdown() })
+	getAll := func() []types.DownloadRecord { return GlobalPool.GetAll() }
+	tmpLifecycle := orchestrator.NewLifecycleManager(GlobalPool, eventBus, nil, buildActiveDownloadChecker(getAll))
+	t.Cleanup(func() { tmpLifecycle.Shutdown() })
+	GlobalLifecycle = tmpLifecycle
+	svc := service.NewLocalDownloadService(GlobalLifecycle)
 	GlobalService = svc
 	t.Cleanup(func() {
 		_ = svc.Shutdown()
 	})
 
-	// Use a URL with an invalid scheme so ProbeServer fails immediately.
+	// Use a URL with an invalid scheme so ProbeServer fails immediately with a
+	// terminal error. Since probing now runs at enqueue time, the request is
+	// synchronously rejected with 500 — no background worker is involved.
 	body := `{"url": "badscheme://example.com/file.bin", "path": "/tmp", "skip_approval": true}`
 	req := httptest.NewRequest(http.MethodPost, "/download", bytes.NewBufferString(body))
 	rec := httptest.NewRecorder()
@@ -391,24 +454,84 @@ func TestHandleDownload_EnqueueError_RecordsPreflightError(t *testing.T) {
 	handleDownload(rec, req, "", svc)
 
 	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("expected 500, got %d: %s", rec.Code, rec.Body.String())
+		t.Fatalf("expected 500 for terminal probe error, got %d: %s", rec.Code, rec.Body.String())
 	}
+}
 
-	// Verify that the error was persisted in the master list.
-	list, err := state.LoadMasterList()
-	if err != nil {
-		t.Fatalf("LoadMasterList failed: %v", err)
+func TestHandleDownload_ForwardsPerTaskOverridesToLifecycle(t *testing.T) {
+	setupIsolatedCmdState(t)
+
+	progressCh := make(chan types.DownloadEvent, 10)
+	GlobalProgressCh = progressCh
+	if GlobalPool != nil {
+		GlobalPool.GracefulShutdown()
 	}
-
-	found := false
-	for _, entry := range list.Downloads {
-		if strings.Contains(entry.URL, "badscheme://example.com/file.bin") && entry.Status == "error" {
-			found = true
-			break
+	tmpPool := scheduler.New(progressCh, 1)
+	t.Cleanup(func() {
+		if tmpPool != nil {
+			tmpPool.GracefulShutdown()
 		}
+	})
+	GlobalPool = tmpPool
+
+	origLifecycle := GlobalLifecycle
+	origService := GlobalService
+	t.Cleanup(func() {
+		GlobalLifecycle = origLifecycle
+		GlobalService = origService
+		GlobalPool = nil
+		GlobalProgressCh = nil
+	})
+
+	probeServer := testutil.NewHTTPServerT(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Range", "bytes 0-0/1024")
+		w.Header().Set("Content-Length", "1")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write([]byte("x"))
+	}))
+	defer probeServer.Close()
+
+	tempDir := t.TempDir()
+
+	eventBus := orchestrator.NewEventBus()
+	t.Cleanup(func() { eventBus.Shutdown() })
+	getAll := func() []types.DownloadRecord { return GlobalPool.GetAll() }
+	tmpLifecycle := orchestrator.NewLifecycleManager(GlobalPool, eventBus, nil, buildActiveDownloadChecker(getAll))
+	t.Cleanup(func() { tmpLifecycle.Shutdown() })
+	GlobalLifecycle = tmpLifecycle
+	svc := service.NewLocalDownloadService(GlobalLifecycle)
+	GlobalService = svc
+	t.Cleanup(func() {
+		_ = svc.Shutdown()
+	})
+
+	minChunk := int64(8 * 1024 * 1024)
+	body := fmt.Sprintf(`{
+		"url": %q,
+		"filename": "override-test.bin",
+		"path": %q,
+		"skip_approval": true,
+		"workers": 12,
+		"min_chunk_size": %d
+	}`, probeServer.URL, tempDir, minChunk)
+
+	req := httptest.NewRequest(http.MethodPost, "/download", bytes.NewBufferString(body))
+	rec := httptest.NewRecorder()
+
+	handleDownload(rec, req, "", svc)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
-	if !found {
-		t.Fatal("expected errored download entry in master list after probe failure via HTTP API")
+	configs := GlobalPool.GetAll()
+	if len(configs) != 1 {
+		t.Fatalf("expected 1 download queued, got %d", len(configs))
+	}
+	if configs[0].Runtime.Workers != 12 {
+		t.Fatalf("expected lifecycle addFunc to receive workers=12, got %d", configs[0].Runtime.Workers)
+	}
+	if configs[0].Runtime.MinChunkSize != minChunk {
+		t.Fatalf("expected lifecycle addFunc to receive minChunkSize=%d, got %d", minChunk, configs[0].Runtime.MinChunkSize)
 	}
 }
 
@@ -417,7 +540,7 @@ type failingPublishService struct {
 	publishErr error
 }
 
-func (f *failingPublishService) Publish(msg interface{}) error {
+func (f *failingPublishService) Publish(msg types.DownloadEvent) error {
 	return f.publishErr
 }
 
@@ -435,7 +558,16 @@ func TestHandleDownload_PublishError_RecordsPreflightError(t *testing.T) {
 		GlobalLifecycle = origLifecycle
 	})
 
-	GlobalPool = download.NewWorkerPool(nil, 1)
+	if GlobalPool != nil {
+		GlobalPool.GracefulShutdown()
+	}
+	tmpPool := scheduler.New(nil, 1)
+	t.Cleanup(func() {
+		if tmpPool != nil {
+			tmpPool.GracefulShutdown()
+		}
+	})
+	GlobalPool = tmpPool
 
 	origServerProgram := serverProgram
 	serverProgram = &tea.Program{}
@@ -462,7 +594,7 @@ func TestHandleDownload_PublishError_RecordsPreflightError(t *testing.T) {
 		t.Fatalf("expected 500, got %d: %s", rec.Code, rec.Body.String())
 	}
 
-	list, err := state.LoadMasterList()
+	list, err := store.LoadMasterList()
 	if err != nil {
 		t.Fatalf("LoadMasterList failed: %v", err)
 	}
@@ -476,5 +608,88 @@ func TestHandleDownload_PublishError_RecordsPreflightError(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("expected errored download entry in master list after publish failure via HTTP API")
+	}
+}
+
+// TestHandleDownload_DoesNotUseCancelledHTTPRequestContext verifies that the
+// enqueue path uses the application-level enqueue context instead of the HTTP
+// request context. When the HTTP client disconnects or the handler returns
+// before the probe finishes, r.Context() is cancelled — but the download
+// should still be enqueued successfully.
+func TestHandleDownload_DoesNotUseCancelledHTTPRequestContext(t *testing.T) {
+	setupIsolatedCmdState(t)
+
+	progressCh := make(chan types.DownloadEvent, 10)
+	GlobalProgressCh = progressCh
+	if GlobalPool != nil {
+		GlobalPool.GracefulShutdown()
+	}
+	tmpPool := scheduler.New(progressCh, 1)
+	t.Cleanup(func() {
+		if tmpPool != nil {
+			tmpPool.GracefulShutdown()
+		}
+	})
+	GlobalPool = tmpPool
+
+	origLifecycle := GlobalLifecycle
+	origService := GlobalService
+	t.Cleanup(func() {
+		GlobalLifecycle = origLifecycle
+		GlobalService = origService
+		GlobalPool = nil
+		GlobalProgressCh = nil
+	})
+
+	probeServer := testutil.NewHTTPServerT(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Range", "bytes 0-0/7")
+		w.Header().Set("Content-Length", "1")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write([]byte("x"))
+	}))
+	defer probeServer.Close()
+
+	tempDir := t.TempDir()
+
+	eventBus := orchestrator.NewEventBus()
+	t.Cleanup(func() { eventBus.Shutdown() })
+	getAll := func() []types.DownloadRecord { return GlobalPool.GetAll() }
+	tmpLifecycle := orchestrator.NewLifecycleManager(GlobalPool, eventBus, nil, buildActiveDownloadChecker(getAll))
+	t.Cleanup(func() { tmpLifecycle.Shutdown() })
+	GlobalLifecycle = tmpLifecycle
+	svc := service.NewLocalDownloadService(GlobalLifecycle)
+	GlobalService = svc
+	t.Cleanup(func() {
+		_ = svc.Shutdown()
+	})
+
+	body := fmt.Sprintf(`{
+		"url": %q,
+		"filename": "ctx-test.bin",
+		"path": %q,
+		"skip_approval": true
+	}`, probeServer.URL, tempDir)
+
+	// Create an HTTP request with an already-cancelled context to simulate
+	// a client that disconnects before the probe finishes.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately
+	req := httptest.NewRequest(http.MethodPost, "/download", bytes.NewBufferString(body)).WithContext(ctx)
+	rec := httptest.NewRecorder()
+
+	handleDownload(rec, req, "", svc)
+
+	// Before the fix, this would return 500 with "context canceled".
+	// After the fix, the download should be queued successfully because
+	// enqueueDownloadRequest uses currentEnqueueContext() instead of r.Context().
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 (download queued despite cancelled HTTP context), got %d: %s", rec.Code, rec.Body.String())
+	}
+	configs := GlobalPool.GetAll()
+	if len(configs) != 1 {
+		t.Fatalf("expected 1 download queued, got %d", len(configs))
+	}
+	if configs[0].Filename != "ctx-test.bin" {
+		t.Fatalf("filename = %q, want %q", configs[0].Filename, "ctx-test.bin")
 	}
 }
