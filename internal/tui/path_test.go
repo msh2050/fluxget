@@ -6,8 +6,6 @@ import (
 	"testing"
 
 	"github.com/msh2050/fluxget/internal/config"
-	"github.com/msh2050/fluxget/internal/core"
-	"github.com/msh2050/fluxget/internal/download"
 	"github.com/msh2050/fluxget/internal/utils"
 )
 
@@ -17,12 +15,9 @@ func TestStartDownload_EnforcesAbsolutePath(t *testing.T) {
 	tmpDir, _ := os.MkdirTemp("", "surge-test")
 	defer func() { _ = os.RemoveAll(tmpDir) }()
 
-	ch := make(chan any, 10)
-	pool := download.NewWorkerPool(ch, 1)
-
 	m := RootModel{
 		Settings:  config.DefaultSettings(),
-		Service:   core.NewLocalDownloadServiceWithInput(pool, ch),
+		Service:   &mockService{},
 		downloads: []*DownloadModel{},
 		list:      NewDownloadList(80, 20), // Initialize list
 	}
@@ -31,7 +26,7 @@ func TestStartDownload_EnforcesAbsolutePath(t *testing.T) {
 	relPath := "subdir"
 	url := "http://example.com/file.zip"
 
-	m, _ = m.startDownload(url, nil, nil, relPath, false, "file.zip", "test-id-1")
+	m, _ = m.startDownload(url, nil, nil, relPath, false, "file.zip", "test-id-1", 0, 0)
 
 	// We expect the new download to be appended
 	if len(m.downloads) != 1 {

@@ -3,6 +3,7 @@ package colors
 import (
 	"fmt"
 	"image/color"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -10,7 +11,7 @@ import (
 	"sync"
 
 	"charm.land/lipgloss/v2"
-	"github.com/BurntSushi/toml"
+	"github.com/pelletier/go-toml/v2"
 )
 
 type Palette struct {
@@ -32,14 +33,16 @@ type Palette struct {
 	} `toml:"normal"`
 	Bright struct {
 		Black   string `toml:"black"`   // unused by accessors (reserved for future use)
-		Red     string `toml:"red"`     // → Pink(), ProgressStart()
+		Red     string `toml:"red"`     // \u2192 Pink(), ProgressStart()
 		Green   string `toml:"green"`   // unused by accessors (reserved for future use)
 		Yellow  string `toml:"yellow"`  // unused by accessors (reserved for future use)
 		Blue    string `toml:"blue"`    // unused by accessors (reserved for future use)
-		Magenta string `toml:"magenta"` // → ProgressEnd()
+		Magenta string `toml:"magenta"` // \u2192 ProgressEnd()
 		Cyan    string `toml:"cyan"`    // unused by accessors (reserved for future use)
 		White   string `toml:"white"`   // unused by accessors (reserved for future use)
 	} `toml:"bright"`
+
+	Graph []string `toml:"graph,omitempty"`
 
 	Dark  *Palette `toml:"dark"`
 	Light *Palette `toml:"light"`
@@ -59,6 +62,7 @@ var (
 )
 
 var defaultDark = Palette{
+	Graph: []string{"#700070", "#9800c0", "#c000e8", "#ff55ff"},
 	Primary: struct {
 		Background string `toml:"background"`
 		Foreground string `toml:"foreground"`
@@ -89,6 +93,7 @@ var defaultDark = Palette{
 }
 
 var defaultLight = Palette{
+	Graph: []string{"#5b259d", "#9934b5", "#b658c7", "#d99ce3"},
 	Primary: struct {
 		Background string `toml:"background"`
 		Foreground string `toml:"foreground"`
@@ -240,8 +245,11 @@ func Foreground() color.Color { return lipgloss.Color(palette().Primary.Foregrou
 
 // Semantic Mappings
 func White() color.Color { return lipgloss.Color(palette().Normal.White) }
-func Gray() color.Color  { return lipgloss.Color(palette().Normal.Black) }
-func Red() color.Color   { return lipgloss.Color(palette().Normal.Red) }
+func Gray() color.Color {
+	p := palette()
+	return lipgloss.Color(blendHex(p.Primary.Foreground, p.Primary.Background, 0.35))
+}
+func Red() color.Color { return lipgloss.Color(palette().Normal.Red) }
 func Pink() color.Color {
 	acc := palette().Primary.Accent
 	if acc != "" {
@@ -284,7 +292,48 @@ func LightGray() color.Color {
 	return lipgloss.Color(blendHex(palette().Primary.Foreground, palette().Primary.Background, 0.55))
 }
 
+// SelectionBackground blends the accent into the theme background for a subtle highlight.
+func SelectionBackground() color.Color {
+	p := palette()
+	accent := p.Primary.Accent
+	if accent == "" {
+		accent = p.Bright.Red
+	}
+	return lipgloss.Color(blendHex(accent, p.Primary.Background, 0.18))
+}
+
+// SettingsSelectionBackground matches the cyan settings selector.
+func SettingsSelectionBackground() color.Color {
+	p := palette()
+	return lipgloss.Color(blendHex(p.Normal.Cyan, p.Primary.Background, 0.18))
+}
+
 func DarkGray() color.Color { return lipgloss.Color(palette().Primary.Background) }
+
+// ContrastForeground chooses the theme's text or background color, whichever
+// is more readable on a filled control.
+func ContrastForeground(background color.Color) color.Color {
+	luminance := func(c color.Color) float64 {
+		r, g, b, _ := c.RGBA()
+		linear := func(v uint32) float64 {
+			s := float64(v) / 65535
+			if s <= 0.04045 {
+				return s / 12.92
+			}
+			return math.Pow((s+0.055)/1.055, 2.4)
+		}
+		return 0.2126*linear(r) + 0.7152*linear(g) + 0.0722*linear(b)
+	}
+	contrast := func(a, b color.Color) float64 {
+		l1, l2 := luminance(a), luminance(b)
+		return (math.Max(l1, l2) + 0.05) / (math.Min(l1, l2) + 0.05)
+	}
+	fg, bg := Foreground(), Background()
+	if contrast(bg, background) > contrast(fg, background) {
+		return bg
+	}
+	return fg
+}
 
 // State Mappings
 func StateError() color.Color       { return Red() }
@@ -302,6 +351,25 @@ func ProgressStart() color.Color {
 	return lipgloss.Color(palette().Bright.Red) // Neon Pink
 }
 func ProgressEnd() color.Color { return lipgloss.Color(palette().Bright.Magenta) }
+
+func GraphColors() []color.Color {
+	p := palette()
+	if len(p.Graph) > 0 {
+		g := make([]color.Color, 0, len(p.Graph))
+		for _, c := range p.Graph {
+			g = append(g, lipgloss.Color(c))
+		}
+		return g
+	}
+
+	// Derive the fallback from the active palette, including custom light variants.
+	return []color.Color{
+		Blue(),
+		Cyan(),
+		Pink(),
+		Magenta(),
+	}
+}
 
 type themeColor struct {
 	light string
@@ -345,7 +413,7 @@ func SetDarkMode(isDark bool) {
 		return
 	}
 
-	// Re-load the active theme (custom or empty → built-in default) with the new mode.
+	// Re-load the active theme (custom or empty \u2192 built-in default) with the new mode.
 	LoadTheme(path, isDark)
 }
 

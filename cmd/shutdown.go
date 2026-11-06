@@ -11,7 +11,16 @@ var (
 	globalShutdownOnce sync.Once
 	globalShutdownErr  error
 	globalShutdownFn   = defaultGlobalShutdown
+	shutDownRequested  = make(chan string, 1)
 )
+
+
+func requestGlobalShutdown(reason string) {
+	select {
+	case shutDownRequested <- reason:
+	default:
+	}
+}
 
 func defaultGlobalShutdown() error {
 	cancelGlobalEnqueue()
@@ -23,8 +32,20 @@ func defaultGlobalShutdown() error {
 	var err error
 	if GlobalService != nil {
 		err = GlobalService.Shutdown()
-	} else if GlobalPool != nil {
+		globalLifecycleMu.Lock()
+		GlobalService = nil
+		GlobalLifecycle = nil
+		globalLifecycleMu.Unlock()
+	}
+	if GlobalPool != nil {
 		GlobalPool.GracefulShutdown()
+	}
+
+	globalHTTPServerMu.Lock()
+	srv := globalHTTPServer
+	globalHTTPServerMu.Unlock()
+	if srv != nil {
+		_ = srv.Close()
 	}
 
 	if cleanup := takeLifecycleCleanup(); cleanup != nil {

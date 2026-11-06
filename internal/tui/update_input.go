@@ -40,18 +40,30 @@ func (m RootModel) updateInput(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	}
 
 	if key.Matches(msg, m.keys.Input.Up) && m.focusedInput > 0 {
-		m.focusInput(m.focusedInput - 1)
+		next := m.focusedInput - 1
+		if m.hideMirrors && next == 1 {
+			next = 0
+		}
+		m.focusInput(next)
 		return m, nil
 	}
 
 	if key.Matches(msg, m.keys.Input.Down) && m.focusedInput < 3 {
-		m.focusInput(m.focusedInput + 1)
+		next := m.focusedInput + 1
+		if m.hideMirrors && next == 1 {
+			next = 2
+		}
+		m.focusInput(next)
 		return m, nil
 	}
 
 	if key.Matches(msg, m.keys.Input.Enter) {
 		if m.focusedInput < 3 {
-			m.focusInput(m.focusedInput + 1)
+			next := m.focusedInput + 1
+			if m.hideMirrors && next == 1 {
+				next = 2
+			}
+			m.focusInput(next)
 			return m, nil
 		}
 		return m.submitInputForm()
@@ -97,13 +109,19 @@ func (m RootModel) submitInputForm() (tea.Model, tea.Cmd) {
 	}
 	filename := m.inputs[3].Value()
 
+	// Check if pending headers were populated from cURL parser
+	headers := m.pendingHeaders
+
 	if d := m.checkForDuplicate(url); d != nil {
+		m.pendingDownloadID = ""
 		m.pendingURL = url
 		m.pendingMirrors = mirrors
-		m.pendingHeaders = nil
+		m.pendingHeaders = headers
 		m.pendingPath = path
 		m.pendingIsDefaultPath = isDefaultPath
 		m.pendingFilename = filename
+		m.pendingWorkers = 0
+		m.pendingMinChunkSize = 0
 		m.duplicateInfo = d.Filename
 		m.state = DuplicateWarningState
 		return m, nil
@@ -114,8 +132,9 @@ func (m RootModel) submitInputForm() (tea.Model, tea.Cmd) {
 	m.inputs[1].SetValue("")
 	m.inputs[2].SetValue(path) // Keep path for next download
 	m.inputs[3].SetValue("")
+	m.pendingHeaders = nil // Reset
 
-	return m.startDownload(url, mirrors, nil, path, isDefaultPath, filename, "")
+	return m.startDownload(url, mirrors, headers, path, isDefaultPath, filename, "", 0, 0)
 }
 
 // parseURLInput splits a comma-separated URL string into a primary URL and mirrors.
@@ -164,22 +183,26 @@ func (m RootModel) updateExtensionConfirmation(msg tea.KeyPressMsg) (tea.Model, 
 			m.pendingPath = m.defaultDownloadPath()
 		}
 
-		if d := m.checkForDuplicate(m.pendingURL); d != nil {
-			utils.Debug("Duplicate download detected after confirmation: %s", m.pendingURL)
-			m.duplicateInfo = d.Filename
-			m.state = DuplicateWarningState
-			return m, nil
+		if !m.pendingSkipDuplicateWarning {
+			if d := m.checkForDuplicate(m.pendingURL); d != nil {
+				utils.Debug("Duplicate download detected after confirmation for host %s", utils.URLHostForLog(m.pendingURL))
+				m.duplicateInfo = d.Filename
+				m.state = DuplicateWarningState
+				return m, nil
+			}
 		}
 
 		m.state = DashboardState
-		return m.startDownload(m.pendingURL, m.pendingMirrors, m.pendingHeaders, m.pendingPath, m.pendingIsDefaultPath, m.pendingFilename, "")
+		updated, cmd := m.startDownload(m.pendingURL, m.pendingMirrors, m.pendingHeaders, m.pendingPath, m.pendingIsDefaultPath, m.pendingFilename, m.pendingDownloadID, m.pendingWorkers, m.pendingMinChunkSize)
+		nextModel, nextCmd := updated.showNextPendingRequest()
+		return nextModel, tea.Batch(cmd, nextCmd)
 	}
 
 	if key.Matches(msg, m.keys.Extension.Cancel) {
 		m.filepickerOrigin = FilePickerOriginNone
 		m.blurAllInputs()
 		m.state = DashboardState
-		return m, nil
+		return m.showNextPendingRequest()
 	}
 
 	var cmd tea.Cmd

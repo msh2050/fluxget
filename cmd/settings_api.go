@@ -39,9 +39,9 @@ type flatSettings struct {
 	Subtitles    bool   `json:"subtitles"`
 
 	// yt-dlp engine
-	YtdlpPath     string `json:"ytdlpPath"`
-	YtdlpQuality  string `json:"ytdlpQuality"`
-	YtdlpFormat   string `json:"ytdlpFormat"`
+	YtdlpPath    string `json:"ytdlpPath"`
+	YtdlpQuality string `json:"ytdlpQuality"`
+	YtdlpFormat  string `json:"ytdlpFormat"`
 
 	// Browser extension
 	Port     int  `json:"port"`

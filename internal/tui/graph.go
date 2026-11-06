@@ -1,113 +1,188 @@
 package tui
 
 import (
-	"fmt"
 	"image/color"
 	"strings"
 
 	"github.com/msh2050/fluxget/internal/tui/colors"
-	"github.com/msh2050/fluxget/internal/utils"
 
 	"charm.land/lipgloss/v2"
 )
 
-// GraphStats contains the statistics to overlay on the graph
-type GraphStats struct {
-	DownloadSpeed float64 // Current download speed in MB/s
-	DownloadTop   float64 // Top download speed in MB/s
-	DownloadTotal int64   // Total downloaded bytes
+func graphColors() []color.Color {
+	return colors.GraphColors()
 }
 
-// graphColors returns the gradient slice for the graph from the current palette.
-// Called per-render so it always reflects the active theme.
-func graphColors() []color.Color {
-	return []color.Color{
-		colors.ProgressStart(), // Bottom
-		colors.Magenta(),
-		colors.Pink(),
-		colors.ProgressEnd(), // Top
+var graphBlocks = []string{" ", "\u2581", "\u2582", "\u2583", "\u2584", "\u2585", "\u2586", "\u2588"}
+
+// GraphRenderer is a stateful, highly optimized component for rendering the network activity graph.
+// It caches the background grid and style objects, and uses run-length encoding to minimize ANSI escape sequences.
+// NOTE: This component is NOT safe for concurrent use.
+type GraphRenderer struct {
+	width, height int
+
+	// Caches
+	gridStyle lipgloss.Style
+	rowStyles []lipgloss.Style
+
+	// Base pristine grid (raw characters)
+	baseGrid [][]string
+
+	// Reusable buffers per frame
+	charBuf  [][]string
+	styleBuf [][]bool // false = grid style, true = block style (row color)
+
+	lastRender string
+}
+
+func NewGraphRenderer() *GraphRenderer {
+	return &GraphRenderer{
+		gridStyle: lipgloss.NewStyle().Foreground(colors.Gray()),
 	}
 }
 
-// renderMultiLineGraph creates a multi-line bar graph with grid lines.
-// The graph scales data to fill the full width.
-// data: speed history data points
-// width, height: dimensions of the graph
-// maxVal: maximum value for scaling
-// stats: stats to display in overlay box (pass nil to skip)
-func renderMultiLineGraph(data []float64, width, height int, maxVal float64, stats *GraphStats) string {
+func (g *GraphRenderer) InvalidateCache() {
+	g.baseGrid = nil
+	g.lastRender = ""
+	g.gridStyle = lipgloss.NewStyle().Foreground(colors.Gray())
+}
+
+func (g *GraphRenderer) resize(width, height int) {
+	if g.width == width && g.height == height && g.baseGrid != nil {
+		return
+	}
+
+	g.width = width
+	g.height = height
+
+	// 1. Build row styles
+	gradient := graphColors()
+	g.rowStyles = make([]lipgloss.Style, height)
+	for y := 0; y < height; y++ {
+		// Calculate how far up this row is as a percentage (0.0 to 1.0)
+		// y=0 is the bottom row.
+		pct := float64(y) / float64(height)
+		if height > 1 {
+			pct = float64(y) / float64(height-1)
+		}
+
+		// Apply the non-linear thresholds:
+		// 0% - 10%:  index 0
+		// 10% - 30%: index 1
+		// 30% - 60%: index 2
+		// 60% - 100%: index 3
+		var colorIdx int
+		if pct <= 0.10 {
+			colorIdx = 0
+		} else if pct <= 0.30 {
+			colorIdx = 1
+		} else if pct <= 0.60 {
+			colorIdx = 2
+		} else {
+			colorIdx = 3
+		}
+		if colorIdx >= len(gradient) {
+			colorIdx = len(gradient) - 1
+		}
+		g.rowStyles[y] = lipgloss.NewStyle().Foreground(gradient[colorIdx])
+	}
+
+	// 2. Build base grid
+	g.baseGrid = make([][]string, height)
+	for i := range g.baseGrid {
+		g.baseGrid[i] = make([]string, width)
+		for j := range g.baseGrid[i] {
+			if i == height-1 {
+				g.baseGrid[i][j] = "\u2500"
+			} else if i%2 == 0 {
+				g.baseGrid[i][j] = "\u254c"
+			} else {
+				g.baseGrid[i][j] = " "
+			}
+		}
+	}
+
+	// 3. Allocate buffers (old buffers will be garbage collected)
+	g.charBuf = make([][]string, height)
+	g.styleBuf = make([][]bool, height)
+	for i := 0; i < height; i++ {
+		g.charBuf[i] = make([]string, width)
+		g.styleBuf[i] = make([]bool, width)
+	}
+}
+
+// Render creates a multi-line bar graph with grid lines.
+func (g *GraphRenderer) Render(data []float64, width, height int, maxVal float64, isResizing bool) string {
 	if width < 1 || height < 1 {
 		return ""
 	}
 
-	// Styles
-	gridStyle := lipgloss.NewStyle().Foreground(colors.Gray())
+	if isResizing && g.lastRender != "" {
+		return g.lastRender
+	}
 
-	// 1. Prepare the canvas with a Grid
-	rows := make([][]string, height)
-	for i := range rows {
-		rows[i] = make([]string, width)
-		for j := range rows[i] {
-			if i == height-1 {
-				// Bottom row: solid baseline
-				rows[i][j] = gridStyle.Render("\u2500")
-			} else if i%2 == 0 {
-				rows[i][j] = gridStyle.Render("\u254c")
-			} else {
-				rows[i][j] = " "
-			}
+	g.resize(width, height)
+
+	// 1. Deep copy pristine grid and zero style buffer
+	for i := 0; i < height; i++ {
+		copy(g.charBuf[i], g.baseGrid[i])
+		// Zeroing styleBuf (false = grid style)
+		for j := 0; j < width; j++ {
+			g.styleBuf[i][j] = false
 		}
 	}
 
-	// Block characters for partial fills
-	blocks := []string{" ", "\u2581", "\u2582", "\u2583", "\u2584", "\u2585", "\u2586", "\u2588"}
-
-	// Snapshot current palette colors once per render so the gradient is consistent
-	// across all rows and doesn't allocate on every iteration.
-	gradient := graphColors()
-
-	// Pre-calculate styles for every row to avoid re-creating them in the loop
-	// Optimization: Pre-render all possible block characters for each row style
-	// This avoids calling style.Render() width*height times
-	rowChars := make([][]string, height)
-	for y := 0; y < height; y++ {
-		// Map height 'y' to an index in gradient
-		colorIdx := (y * len(gradient)) / height
-		if colorIdx >= len(gradient) {
-			colorIdx = len(gradient) - 1
-		}
-		style := lipgloss.NewStyle().Foreground(gradient[colorIdx])
-
-		rowChars[y] = make([]string, len(blocks))
-		for k, b := range blocks {
-			rowChars[y][k] = style.Render(b)
-		}
-	}
-
-	// 2. Scale data to fill full width
-	// Each data point spans multiple columns to fill the graph
+	// 2. Map data
 	if len(data) > 0 {
-		colsPerPoint := float64(width) / float64(len(data))
+		// Bug fix: maxVal <= 0 causes NaN
+		if maxVal <= 0 {
+			maxVal = 1
+		}
 
-		for i, val := range data {
+		// Bug fix: Downsample if data > width to prevent column loss
+		var plotData []float64
+		if len(data) > width {
+			plotData = make([]float64, width)
+			chunkSize := float64(len(data)) / float64(width)
+			for i := 0; i < width; i++ {
+				start := int(float64(i) * chunkSize)
+				end := int(float64(i+1) * chunkSize)
+				if i == width-1 {
+					end = len(data) // Ensure tail data point is never dropped
+				}
+				if end > len(data) {
+					end = len(data)
+				}
+				maxInChunk := 0.0
+				for j := start; j < end; j++ {
+					if data[j] > maxInChunk {
+						maxInChunk = data[j]
+					}
+				}
+				plotData[i] = maxInChunk
+			}
+		} else {
+			plotData = data
+		}
+
+		colsPerPoint := float64(width) / float64(len(plotData))
+
+		for i, val := range plotData {
 			if val < 0 {
 				val = 0
 			}
-
 			pct := val / maxVal
 			if pct > 1.0 {
 				pct = 1.0
 			}
 			totalSubBlocks := pct * float64(height) * 8.0
 
-			// Calculate column range for this data point
 			startCol := int(float64(i) * colsPerPoint)
 			endCol := int(float64(i+1) * colsPerPoint)
 			if endCol > width {
 				endCol = width
 			}
 
-			// Draw the bar across all columns for this data point
 			for col := startCol; col < endCol; col++ {
 				for y := 0; y < height; y++ {
 					rowIndex := height - 1 - y
@@ -115,101 +190,64 @@ func renderMultiLineGraph(data []float64, width, height int, maxVal float64, sta
 
 					var charIndex int
 					if rowValue <= 0 {
-						charIndex = 0 // Space
+						continue // Leave grid as is
 					} else if rowValue >= 8 {
-						charIndex = 7 // Full block (█)
+						charIndex = 7 // Full block
 					} else {
-						charIndex = int(rowValue) // Partial block
+						charIndex = int(rowValue)
 					}
 
-					// USE PRE-RENDERED CACHE
-					if charIndex > 0 { // Only render if not empty space (optimization)
-						rows[rowIndex][col] = rowChars[y][charIndex]
+					if charIndex > 0 {
+						g.charBuf[rowIndex][col] = graphBlocks[charIndex]
+						g.styleBuf[rowIndex][col] = true // Mark as block style
 					}
 				}
 			}
 		}
 	}
 
-	// 3. Join rows to create the graph
+	// 3. RLE & String Building
+	// Estimate 15 bytes per styled run (ansi code + char + ansi clear)
 	var graphBuilder strings.Builder
-	for i, row := range rows {
-		graphBuilder.WriteString(strings.Join(row, ""))
+	graphBuilder.Grow(width * height * 15)
+
+	for i := 0; i < height; i++ {
+		rowChars := g.charBuf[i]
+		rowStyles := g.styleBuf[i]
+
+		currentStr := rowChars[0]
+		currentStyleBlock := rowStyles[0]
+		runLen := 1
+
+		for j := 1; j < width; j++ {
+			if rowChars[j] == currentStr && rowStyles[j] == currentStyleBlock {
+				runLen++
+			} else {
+				// Emit previous run
+				if currentStyleBlock {
+					graphBuilder.WriteString(g.rowStyles[height-1-i].Render(strings.Repeat(currentStr, runLen)))
+				} else {
+					graphBuilder.WriteString(g.gridStyle.Render(strings.Repeat(currentStr, runLen)))
+				}
+
+				currentStr = rowChars[j]
+				currentStyleBlock = rowStyles[j]
+				runLen = 1
+			}
+		}
+
+		// Emit final run for this row
+		if currentStyleBlock {
+			graphBuilder.WriteString(g.rowStyles[height-1-i].Render(strings.Repeat(currentStr, runLen)))
+		} else {
+			graphBuilder.WriteString(g.gridStyle.Render(strings.Repeat(currentStr, runLen)))
+		}
+
 		if i < height-1 {
 			graphBuilder.WriteRune('\n')
 		}
 	}
-	graphStr := graphBuilder.String()
 
-	// 4. If stats provided, overlay them on the right side
-	if stats != nil {
-		graphStr = overlayStatsBox(graphStr, stats, width, height)
-	}
-
-	return graphStr
-}
-
-// overlayStatsBox renders stats on top of the graph in the top-right area
-func overlayStatsBox(graph string, stats *GraphStats, width, height int) string {
-	// Create the stats box content - btop style
-	valueStyle := lipgloss.NewStyle().Foreground(colors.Cyan()).Bold(true)
-	labelStyle := lipgloss.NewStyle().Foreground(colors.LightGray())
-	headerStyle := lipgloss.NewStyle().Foreground(colors.Pink()).Bold(true)
-	dimStyle := lipgloss.NewStyle().Foreground(colors.Gray())
-
-	speedMbps := stats.DownloadSpeed * 8
-	topMbps := stats.DownloadTop * 8
-
-	// Compact stats box like btop
-	statsLines := []string{
-		headerStyle.Render("download"),
-		fmt.Sprintf("%s %s  %s",
-			valueStyle.Render("\u25bc"),
-			valueStyle.Render(fmt.Sprintf("%.2f MB/s", stats.DownloadSpeed)),
-			dimStyle.Render(fmt.Sprintf("(%.0f Mbps)", speedMbps)),
-		),
-		fmt.Sprintf("%s %s %s  %s",
-			labelStyle.Render("\u25bc"),
-			labelStyle.Render("Top:"),
-			valueStyle.Render(fmt.Sprintf("%.2f MB/s", stats.DownloadTop)),
-			dimStyle.Render(fmt.Sprintf("(%.0f Mbps)", topMbps)),
-		),
-		fmt.Sprintf("%s %s %s",
-			labelStyle.Render("\u25bc"),
-			labelStyle.Render("Total:"),
-			valueStyle.Render(utils.ConvertBytesToHumanReadable(stats.DownloadTotal)),
-		),
-	}
-
-	statsBox := lipgloss.JoinVertical(lipgloss.Right, statsLines...)
-	statsWidth := lipgloss.Width(statsBox)
-	statsHeight := lipgloss.Height(statsBox)
-
-	if statsWidth >= width || statsHeight >= height {
-		return graph
-	}
-
-	// Overlay by merging graph lines with stats lines on the right
-	graphLines := strings.Split(graph, "\n")
-	statsBoxLines := strings.Split(statsBox, "\n")
-
-	for i := 0; i < len(statsBoxLines) && i < len(graphLines); i++ {
-		graphLineWidth := lipgloss.Width(graphLines[i])
-		statsLineWidth := lipgloss.Width(statsBoxLines[i])
-
-		keepWidth := graphLineWidth - statsLineWidth - DividerHeight
-		if keepWidth < 0 {
-			keepWidth = 0
-		}
-
-		graphRunes := []rune(graphLines[i])
-		if keepWidth < len(graphRunes) {
-			graphLines[i] = string(graphRunes[:keepWidth]) + " " + statsBoxLines[i]
-		} else {
-			padding := keepWidth - len(graphRunes)
-			graphLines[i] = graphLines[i] + strings.Repeat(" ", padding) + " " + statsBoxLines[i]
-		}
-	}
-
-	return strings.Join(graphLines, "\n")
+	g.lastRender = graphBuilder.String()
+	return g.lastRender
 }

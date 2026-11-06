@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"github.com/msh2050/fluxget/internal/types"
+
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -10,19 +12,20 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
-	"time"
 
 	"github.com/msh2050/fluxget/internal/config"
-	"github.com/msh2050/fluxget/internal/core"
-	"github.com/msh2050/fluxget/internal/download"
+	"github.com/msh2050/fluxget/internal/scheduler"
+	"github.com/msh2050/fluxget/internal/service"
 	"github.com/msh2050/fluxget/internal/testutil"
+	"github.com/spf13/cobra"
 )
 
 func init() {
 	// Initialize GlobalPool for tests
-	GlobalProgressCh = make(chan any, 100)
-	GlobalPool = download.NewWorkerPool(GlobalProgressCh, 4)
+	GlobalProgressCh = make(chan types.DownloadEvent, 100)
+	GlobalPool = scheduler.New(GlobalProgressCh, 4)
 }
 
 // =============================================================================
@@ -101,11 +104,12 @@ func TestFindAvailablePort_AllPortsOccupied(t *testing.T) {
 // =============================================================================
 
 func TestSaveAndRemoveActivePort(t *testing.T) {
-	// Setup temp dir
 	tmpDir := t.TempDir()
 	t.Setenv("XDG_RUNTIME_DIR", tmpDir)
-	t.Setenv("XDG_CONFIG_HOME", tmpDir) // For EnsureDirs to work happily
-	// Ensure config dirs exist
+	t.Setenv("XDG_CONFIG_HOME", tmpDir)
+	t.Setenv("APPDATA", tmpDir)
+	t.Setenv("XDG_STATE_HOME", tmpDir)
+
 	if err := config.EnsureDirs(); err != nil {
 		t.Fatalf("Failed to ensure dirs: %v", err)
 	}
@@ -204,6 +208,7 @@ func TestConnectCmd_AutoDetectsLocalServer(t *testing.T) {
 	tmpDir := t.TempDir()
 	t.Setenv("XDG_RUNTIME_DIR", tmpDir)
 	t.Setenv("XDG_CONFIG_HOME", tmpDir)
+	t.Setenv("APPDATA", tmpDir)
 	if err := config.EnsureDirs(); err != nil {
 		t.Fatalf("Failed to ensure dirs: %v", err)
 	}
@@ -233,6 +238,7 @@ func TestConnectCmd_NoServerRunning(t *testing.T) {
 	tmpDir := t.TempDir()
 	t.Setenv("XDG_RUNTIME_DIR", tmpDir)
 	t.Setenv("XDG_CONFIG_HOME", tmpDir)
+	t.Setenv("APPDATA", tmpDir)
 	if err := config.EnsureDirs(); err != nil {
 		t.Fatalf("Failed to ensure dirs: %v", err)
 	}
@@ -263,8 +269,12 @@ func TestParseConnectTarget_BaseURL(t *testing.T) {
 		{name: "https URL allowed", target: "https://example.com:1700", want: "https://example.com:1700"},
 		{name: "https URL loopback stays https", target: "https://127.0.0.1:1700", want: "https://127.0.0.1:1700"},
 		{name: "http URL loopback allowed", target: "http://127.0.0.1:1700", want: "http://127.0.0.1:1700"},
-		{name: "private ip host:port defaults http", target: "192.168.1.10:1700", want: "http://192.168.1.10:1700"},
-		{name: "http URL private IP allowed", target: "http://10.0.0.15:1700", want: "http://10.0.0.15:1700"},
+		{name: "private ip host:port defaults https", target: "192.168.1.10:1700", want: "https://192.168.1.10:1700"},
+		{name: "http URL private IP rejected", target: "http://10.0.0.15:1700", wantErr: true},
+		{name: "http URL private IP allowed with flag", target: "http://10.0.0.15:1700", insecureHTTP: true, want: "http://10.0.0.15:1700"},
+		{name: "base path preserved", target: "https://example.com:1700/surge/", want: "https://example.com:1700/surge"},
+		{name: "query rejected", target: "https://example.com:1700?debug=1", wantErr: true},
+		{name: "fragment rejected", target: "https://example.com:1700#status", wantErr: true},
 		{name: "http URL remote rejected", target: "http://example.com:1700", wantErr: true},
 		{name: "http URL remote allowed with flag", target: "http://example.com:1700", insecureHTTP: true, want: "http://example.com:1700"},
 		{name: "invalid scheme rejected", target: "ftp://example.com:1700", wantErr: true},
@@ -293,28 +303,59 @@ func TestResolveTokenForConnectTarget_IPv6LoopbackUsesLocalToken(t *testing.T) {
 	tmpDir := t.TempDir()
 	t.Setenv("XDG_RUNTIME_DIR", tmpDir)
 	t.Setenv("XDG_CONFIG_HOME", tmpDir)
+	t.Setenv("XDG_STATE_HOME", tmpDir)
+	t.Setenv("APPDATA", tmpDir)
 	if err := config.EnsureDirs(); err != nil {
 		t.Fatalf("Failed to ensure dirs: %v", err)
 	}
 
 	origToken := globalToken
 	globalToken = ""
+	origCheck := checkUserServiceRunning
+	checkUserServiceRunning = func() bool { return false }
 	t.Setenv("SURGE_TOKEN", "")
 	t.Cleanup(func() {
 		globalToken = origToken
+		checkUserServiceRunning = origCheck
 	})
+	removeActivePort()
 
 	target, err := parseConnectTarget("[::1]:1700", false)
 	if err != nil {
 		t.Fatalf("parseConnectTarget returned error: %v", err)
 	}
 
-	token, err := resolveTokenForConnectTarget(target)
-	if err != nil {
-		t.Fatalf("resolveTokenForConnectTarget returned error: %v", err)
+	if _, err := resolveTokenForConnectTarget(target); err == nil {
+		t.Fatal("expected unmatched local target to require an explicit token")
 	}
-	if token == "" {
-		t.Fatal("expected non-empty local token for IPv6 loopback target")
+}
+
+func TestResolveTokenForConnectTarget_DoesNotExposeTokenToUnmatchedLocalPort(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", tmpDir)
+	t.Setenv("XDG_CONFIG_HOME", tmpDir)
+	t.Setenv("XDG_STATE_HOME", tmpDir)
+	t.Setenv("APPDATA", tmpDir)
+	t.Setenv("SURGE_TOKEN", "")
+	if err := config.EnsureDirs(); err != nil {
+		t.Fatalf("Failed to ensure dirs: %v", err)
+	}
+
+	origToken := globalToken
+	globalToken = ""
+	t.Cleanup(func() { globalToken = origToken })
+	if err := writeTokenToFile(filepath.Join(config.GetStateDir(), "token"), "secret-token"); err != nil {
+		t.Fatalf("write token failed: %v", err)
+	}
+	saveActivePort(1888)
+	defer removeActivePort()
+
+	target, err := parseConnectTarget("127.0.0.1:1889", false)
+	if err != nil {
+		t.Fatalf("parseConnectTarget returned error: %v", err)
+	}
+	if _, err := resolveTokenForConnectTarget(target); err == nil {
+		t.Fatal("expected unmatched local port to require an explicit token")
 	}
 }
 
@@ -322,18 +363,22 @@ func TestResolveTokenForConnectTarget_UsesActiveTokenForMatchingLocalPort(t *tes
 	tmpDir := t.TempDir()
 	t.Setenv("XDG_RUNTIME_DIR", tmpDir)
 	t.Setenv("XDG_CONFIG_HOME", tmpDir)
+	t.Setenv("APPDATA", tmpDir)
 	t.Setenv("XDG_STATE_HOME", tmpDir)
 	t.Setenv("SURGE_TOKEN", "")
-
-	origToken := globalToken
-	globalToken = ""
-	t.Cleanup(func() {
-		globalToken = origToken
-	})
 
 	if err := config.EnsureDirs(); err != nil {
 		t.Fatalf("Failed to ensure dirs: %v", err)
 	}
+
+	origToken := globalToken
+	globalToken = ""
+	origCheck := checkUserServiceRunning
+	checkUserServiceRunning = func() bool { return false }
+	t.Cleanup(func() {
+		globalToken = origToken
+		checkUserServiceRunning = origCheck
+	})
 	if err := writeTokenToFile(filepath.Join(config.GetStateDir(), "token"), "connect-token"); err != nil {
 		t.Fatalf("write token failed: %v", err)
 	}
@@ -354,28 +399,7 @@ func TestResolveTokenForConnectTarget_UsesActiveTokenForMatchingLocalPort(t *tes
 	}
 }
 
-func TestIsPrivateIPHost(t *testing.T) {
-	tests := []struct {
-		host string
-		want bool
-	}{
-		{host: "10.1.2.3", want: true},
-		{host: "172.16.5.9", want: true},
-		{host: "192.168.50.7", want: true},
-		{host: "8.8.8.8", want: false},
-		{host: "localhost", want: false},
-		{host: "example.com", want: false},
-		{host: "", want: false},
-	}
-
-	for _, tt := range tests {
-		if got := isPrivateIPHost(tt.host); got != tt.want {
-			t.Fatalf("isPrivateIPHost(%q) = %v, want %v", tt.host, got, tt.want)
-		}
-	}
-}
-
-func TestIsLocalHost(t *testing.T) {
+func TestIsLoopbackHost(t *testing.T) {
 	tests := []struct {
 		host string
 		want bool
@@ -389,8 +413,8 @@ func TestIsLocalHost(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		if got := isLocalHost(tt.host); got != tt.want {
-			t.Fatalf("isLocalHost(%q) = %v, want %v", tt.host, got, tt.want)
+		if got := isLoopbackHost(tt.host); got != tt.want {
+			t.Fatalf("isLoopbackHost(%q) = %v, want %v", tt.host, got, tt.want)
 		}
 	}
 }
@@ -410,7 +434,7 @@ func TestHandleDownload_MethodNotAllowed(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPut, "/download", nil)
 	rec := httptest.NewRecorder()
 
-	svc := core.NewLocalDownloadService(nil)
+	svc := service.NewLocalDownloadService(nil)
 	handleDownload(rec, req, "", svc)
 
 	if rec.Code != http.StatusMethodNotAllowed {
@@ -422,7 +446,7 @@ func TestHandleDownload_InvalidJSON(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/download", bytes.NewBufferString("not json"))
 	rec := httptest.NewRecorder()
 
-	svc := core.NewLocalDownloadService(nil)
+	svc := service.NewLocalDownloadService(nil)
 	handleDownload(rec, req, "", svc)
 
 	if rec.Code != http.StatusBadRequest {
@@ -438,7 +462,7 @@ func TestHandleDownload_MissingURL(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/download", bytes.NewBufferString(body))
 	rec := httptest.NewRecorder()
 
-	svc := core.NewLocalDownloadService(nil)
+	svc := service.NewLocalDownloadService(nil)
 	handleDownload(rec, req, "", svc)
 
 	if rec.Code != http.StatusBadRequest {
@@ -454,7 +478,7 @@ func TestHandleDownload_EmptyURL(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/download", bytes.NewBufferString(body))
 	rec := httptest.NewRecorder()
 
-	svc := core.NewLocalDownloadService(nil)
+	svc := service.NewLocalDownloadService(nil)
 	handleDownload(rec, req, "", svc)
 
 	if rec.Code != http.StatusBadRequest {
@@ -478,7 +502,7 @@ func TestHandleDownload_PathTraversal(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, "/download", bytes.NewBufferString(tt.body))
 			rec := httptest.NewRecorder()
-			svc := core.NewLocalDownloadService(nil)
+			svc := service.NewLocalDownloadService(nil)
 			handleDownload(rec, req, "", svc)
 
 			if rec.Code != http.StatusBadRequest {
@@ -491,9 +515,9 @@ func TestHandleDownload_PathTraversal(t *testing.T) {
 // func TestHandleDownload_StatusQuery(t *testing.T) {
 // 	// Setup mock download
 // 	id := "test-status-id"
-// 	state := types.NewProgressState(id, 2000)
+// 	state := progress.New(id, 2000)
 // 	state.Downloaded.Store(1000)
-// 	GlobalPool.Add(types.DownloadConfig{
+// 	GlobalPool.Add(types.DownloadRecord{
 // 		ID:    id,
 // 		URL:   "http://example.com/test",
 // 		State: state,
@@ -530,7 +554,7 @@ func TestHandleDownload_StatusQuery_NotFound(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/download?id=missing-id", nil)
 	rec := httptest.NewRecorder()
 
-	svc := core.NewLocalDownloadService(nil)
+	svc := service.NewLocalDownloadService(nil)
 	handleDownload(rec, req, "", svc)
 
 	if rec.Code != http.StatusNotFound {
@@ -653,6 +677,69 @@ func TestRootCmd_Use(t *testing.T) {
 	}
 }
 
+func TestRootCmd_InvalidURL(t *testing.T) {
+	setupIsolatedCmdState(t)
+	buf := new(bytes.Buffer)
+	rootCmd.SetOut(buf)
+	rootCmd.SetErr(buf)
+	rootCmd.SetArgs([]string{"asjidaida"})
+
+	err := rootCmd.Execute()
+	if err == nil {
+		t.Fatal("expected error for invalid URL argument, got nil")
+	}
+
+	if !strings.Contains(err.Error(), "no valid URLs") {
+		t.Errorf("expected error to mention 'no valid URLs', got %q", err.Error())
+	}
+}
+
+func TestRootCmd_FailsIfUserServiceRunning(t *testing.T) {
+	setupIsolatedCmdState(t)
+
+	// Simulate user service running
+	origCheck := checkUserServiceRunning
+	checkUserServiceRunning = func() bool { return true }
+	t.Cleanup(func() { checkUserServiceRunning = origCheck })
+
+	buf := new(bytes.Buffer)
+	rootCmd.SetOut(buf)
+	rootCmd.SetErr(buf)
+	rootCmd.SetArgs([]string{"https://example.com/test"})
+
+	err := rootCmd.Execute()
+	if err == nil {
+		t.Fatal("expected error when user service is running, got nil")
+	}
+
+	if !strings.Contains(err.Error(), "user service is already running") {
+		t.Errorf("expected error to mention user service, got %v", err)
+	}
+}
+
+func TestServerStartCmd_FailsIfUserServiceRunning(t *testing.T) {
+	setupIsolatedCmdState(t)
+
+	// Simulate user service running
+	origCheck := checkUserServiceRunning
+	checkUserServiceRunning = func() bool { return true }
+	t.Cleanup(func() { checkUserServiceRunning = origCheck })
+
+	buf := new(bytes.Buffer)
+	rootCmd.SetOut(buf)
+	rootCmd.SetErr(buf)
+	rootCmd.SetArgs([]string{"server", "start"})
+
+	err := rootCmd.Execute()
+	if err == nil {
+		t.Fatal("expected error when user service is running, got nil")
+	}
+
+	if !strings.Contains(err.Error(), "user service is already running") {
+		t.Errorf("expected error to mention user service, got %v", err)
+	}
+}
+
 func TestRootCmd_Version(t *testing.T) {
 	if rootCmd.Version == "" {
 		t.Error("rootCmd.Version should not be empty")
@@ -662,6 +749,100 @@ func TestRootCmd_Version(t *testing.T) {
 func TestRootCmd_VersionMatchesPackageVar(t *testing.T) {
 	if rootCmd.Version != Version {
 		t.Errorf("rootCmd.Version %q does not match Version %q \u2014 init() must sync them", rootCmd.Version, Version)
+	}
+}
+
+func TestRootCmd_NoServerFlagRegistered(t *testing.T) {
+	if rootCmd.Flags().Lookup("no-server") == nil {
+		t.Fatal("expected --no-server flag on root command")
+	}
+}
+
+func TestReadRootRunOptions_ReadsNoServerFlag(t *testing.T) {
+	cmd := &cobra.Command{Use: "test"}
+	cmd.Flags().Int("port", 0, "")
+	cmd.Flags().String("batch", "", "")
+	cmd.Flags().String("output", "", "")
+	cmd.Flags().Bool("no-resume", false, "")
+	cmd.Flags().Bool("exit-when-done", false, "")
+	cmd.Flags().Bool("no-server", false, "")
+	if err := cmd.Flags().Set("no-server", "true"); err != nil {
+		t.Fatalf("failed to set no-server flag: %v", err)
+	}
+
+	opts := readRootRunOptions(cmd)
+	if !opts.noServer {
+		t.Fatal("expected readRootRunOptions to capture --no-server")
+	}
+}
+
+func TestReadRootRunOptions_TracksExplicitPort(t *testing.T) {
+	cmd := &cobra.Command{Use: "test"}
+	cmd.Flags().Int("port", 0, "")
+	cmd.Flags().String("batch", "", "")
+	cmd.Flags().String("output", "", "")
+	cmd.Flags().Bool("no-resume", false, "")
+	cmd.Flags().Bool("exit-when-done", false, "")
+	cmd.Flags().Bool("no-server", false, "")
+	if err := cmd.Flags().Set("port", "8080"); err != nil {
+		t.Fatalf("failed to set port flag: %v", err)
+	}
+
+	opts := readRootRunOptions(cmd)
+	if !opts.portSet {
+		t.Fatal("expected readRootRunOptions to track explicit --port")
+	}
+	if opts.portFlag != 8080 {
+		t.Fatalf("portFlag = %d, want 8080", opts.portFlag)
+	}
+}
+
+func TestMaybeStartRootHTTPServer_NoServerSkipsPortFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", tmpDir)
+	t.Setenv("XDG_CONFIG_HOME", tmpDir)
+	t.Setenv("APPDATA", tmpDir)
+	if err := config.EnsureDirs(); err != nil {
+		t.Fatalf("failed to ensure dirs: %v", err)
+	}
+	removeActivePort()
+
+	port, cleanup, err := maybeStartRootHTTPServer(rootRunOptions{noServer: true})
+	if err != nil {
+		t.Fatalf("maybeStartRootHTTPServer returned error: %v", err)
+	}
+	if cleanup == nil {
+		t.Fatal("expected non-nil cleanup")
+	}
+	defer cleanup()
+
+	if port != 0 {
+		t.Fatalf("port = %d, want 0 when --no-server is enabled", port)
+	}
+
+	portFile := filepath.Join(config.GetRuntimeDir(), "port")
+	if _, err := os.Stat(portFile); !os.IsNotExist(err) {
+		t.Fatalf("expected no port file when server startup is skipped, stat err=%v", err)
+	}
+}
+
+func TestMaybeStartRootHTTPServer_NoServerRejectsExplicitPort(t *testing.T) {
+	port, cleanup, err := maybeStartRootHTTPServer(rootRunOptions{
+		noServer: true,
+		portFlag: 8080,
+		portSet:  true,
+	})
+	if err == nil {
+		t.Fatal("expected error when --port is combined with --no-server")
+	}
+	if !strings.Contains(err.Error(), "--port cannot be used with --no-server") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if port != 0 {
+		t.Fatalf("port = %d, want 0 on validation error", port)
+	}
+	if cleanup != nil {
+		t.Fatal("expected nil cleanup on validation error")
 	}
 }
 
@@ -798,6 +979,8 @@ func TestAddCmd_HasGetAlias(t *testing.T) {
 // startHTTPServer Integration Tests
 // =============================================================================
 
+const testHTTPServerToken = "cmd-test-http-token"
+
 func TestStartHTTPServer_HealthEndpoint(t *testing.T) {
 	requireTCPListener(t)
 	// Create listener
@@ -808,11 +991,13 @@ func TestStartHTTPServer_HealthEndpoint(t *testing.T) {
 	port := ln.Addr().(*net.TCPAddr).Port
 
 	// Start server in background
-	svc := core.NewLocalDownloadService(nil) // Mock service with nil pool/chan for health check
-	go startHTTPServer(ln, port, "", svc, "")
-
-	// Give server time to start
-	time.Sleep(50 * time.Millisecond)
+	svc := service.NewLocalDownloadService(nil) // Mock service with nil pool/chan for health check
+	go startHTTPServer(ln, port, "", svc, testHTTPServerToken)
+	t.Cleanup(func() {
+		if globalHTTPServer != nil {
+			_ = globalHTTPServer.Close()
+		}
+	})
 
 	// Test health endpoint
 	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/health", port))
@@ -836,6 +1021,9 @@ func TestStartHTTPServer_HealthEndpoint(t *testing.T) {
 	if int(result["port"].(float64)) != port {
 		t.Errorf("Expected port %d, got %v", port, result["port"])
 	}
+	if result["mode"] != "local" && result["mode"] != "service" {
+		t.Errorf("Expected mode 'local' or 'service', got %v", result["mode"])
+	}
 }
 
 func TestStartHTTPServer_HasCORSHeaders(t *testing.T) {
@@ -846,10 +1034,13 @@ func TestStartHTTPServer_HasCORSHeaders(t *testing.T) {
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
 
-	svc := core.NewLocalDownloadService(nil)
-	go startHTTPServer(ln, port, "", svc, "")
-	time.Sleep(50 * time.Millisecond)
-
+	svc := service.NewLocalDownloadService(nil)
+	go startHTTPServer(ln, port, "", svc, testHTTPServerToken)
+	t.Cleanup(func() {
+		if globalHTTPServer != nil {
+			_ = globalHTTPServer.Close()
+		}
+	})
 	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/health", port))
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
@@ -869,10 +1060,13 @@ func TestStartHTTPServer_OptionsRequest(t *testing.T) {
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
 
-	svc := core.NewLocalDownloadService(nil)
-	go startHTTPServer(ln, port, "", svc, "")
-	time.Sleep(50 * time.Millisecond)
-
+	svc := service.NewLocalDownloadService(nil)
+	go startHTTPServer(ln, port, "", svc, testHTTPServerToken)
+	t.Cleanup(func() {
+		if globalHTTPServer != nil {
+			_ = globalHTTPServer.Close()
+		}
+	})
 	req, _ := http.NewRequest(http.MethodOptions, fmt.Sprintf("http://127.0.0.1:%d/download", port), nil)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -894,14 +1088,15 @@ func TestStartHTTPServer_DownloadEndpoint_MethodNotAllowed(t *testing.T) {
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
 
-	svc := core.NewLocalDownloadService(nil)
-	go startHTTPServer(ln, port, "", svc, "")
-	time.Sleep(50 * time.Millisecond)
-
-	token := ensureAuthToken()
-
+	svc := service.NewLocalDownloadService(nil)
+	go startHTTPServer(ln, port, "", svc, testHTTPServerToken)
+	t.Cleanup(func() {
+		if globalHTTPServer != nil {
+			_ = globalHTTPServer.Close()
+		}
+	})
 	req, _ := http.NewRequest(http.MethodPut, fmt.Sprintf("http://127.0.0.1:%d/download", port), nil)
-	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Authorization", "Bearer "+testHTTPServerToken)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -922,13 +1117,16 @@ func TestStartHTTPServer_DownloadEndpoint_BadRequest(t *testing.T) {
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
 
-	svc := core.NewLocalDownloadService(nil)
-	go startHTTPServer(ln, port, "", svc, "")
-	time.Sleep(50 * time.Millisecond)
-
+	svc := service.NewLocalDownloadService(nil)
+	go startHTTPServer(ln, port, "", svc, testHTTPServerToken)
+	t.Cleanup(func() {
+		if globalHTTPServer != nil {
+			_ = globalHTTPServer.Close()
+		}
+	})
 	// POST with invalid JSON
 	req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("http://127.0.0.1:%d/download", port), bytes.NewBufferString("not json"))
-	req.Header.Set("Authorization", "Bearer "+ensureAuthToken())
+	req.Header.Set("Authorization", "Bearer "+testHTTPServerToken)
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := http.DefaultClient.Do(req)
@@ -950,13 +1148,16 @@ func TestStartHTTPServer_DownloadEndpoint_MissingURL(t *testing.T) {
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
 
-	svc := core.NewLocalDownloadService(nil)
-	go startHTTPServer(ln, port, "", svc, "")
-	time.Sleep(50 * time.Millisecond)
-
+	svc := service.NewLocalDownloadService(nil)
+	go startHTTPServer(ln, port, "", svc, testHTTPServerToken)
+	t.Cleanup(func() {
+		if globalHTTPServer != nil {
+			_ = globalHTTPServer.Close()
+		}
+	})
 	// POST with missing URL
 	req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("http://127.0.0.1:%d/download", port), bytes.NewBufferString(`{"path": "/downloads"}`))
-	req.Header.Set("Authorization", "Bearer "+ensureAuthToken())
+	req.Header.Set("Authorization", "Bearer "+testHTTPServerToken)
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := http.DefaultClient.Do(req)
@@ -978,12 +1179,15 @@ func TestStartHTTPServer_NotFoundEndpoint(t *testing.T) {
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
 
-	svc := core.NewLocalDownloadService(nil)
-	go startHTTPServer(ln, port, "", svc, "")
-	time.Sleep(50 * time.Millisecond)
-
+	svc := service.NewLocalDownloadService(nil)
+	go startHTTPServer(ln, port, "", svc, testHTTPServerToken)
+	t.Cleanup(func() {
+		if globalHTTPServer != nil {
+			_ = globalHTTPServer.Close()
+		}
+	})
 	req, _ := http.NewRequest(http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/nonexistent", port), nil)
-	req.Header.Set("Authorization", "Bearer "+ensureAuthToken())
+	req.Header.Set("Authorization", "Bearer "+testHTTPServerToken)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
@@ -1019,7 +1223,7 @@ func TestHandleDownload_ValidRequest_NoServerProgram(t *testing.T) {
 		}
 	}()
 
-	svc := core.NewLocalDownloadService(nil)
+	svc := service.NewLocalDownloadService(nil)
 	handleDownload(rec, req, "", svc)
 }
 
@@ -1027,7 +1231,7 @@ func TestHandleDownload_EmptyBody(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/download", bytes.NewBufferString(""))
 	rec := httptest.NewRecorder()
 
-	svc := core.NewLocalDownloadService(nil)
+	svc := service.NewLocalDownloadService(nil)
 	handleDownload(rec, req, "", svc)
 
 	// Empty body causes EOF error on decode
@@ -1044,7 +1248,7 @@ func TestHandleDownload_LargeURL(t *testing.T) {
 	rec := httptest.NewRecorder()
 
 	// This should handle large URLs gracefully (validation issues)
-	svc := core.NewLocalDownloadService(nil)
+	svc := service.NewLocalDownloadService(nil)
 	handleDownload(rec, req, "", svc)
 
 	// Should fail on URL validation or JSON parsing
@@ -1062,7 +1266,7 @@ func TestHandleDownload_SpecialCharactersInPath(t *testing.T) {
 		}
 	}()
 
-	svc := core.NewLocalDownloadService(nil)
+	svc := service.NewLocalDownloadService(nil)
 	handleDownload(rec, req, "", svc)
 }
 
@@ -1103,10 +1307,11 @@ func TestCorsMiddleware_AllMethods(t *testing.T) {
 // =============================================================================
 
 func TestPortFileLifecycle(t *testing.T) {
-	// Setup temp dir
 	tmpDir := t.TempDir()
 	t.Setenv("XDG_RUNTIME_DIR", tmpDir)
 	t.Setenv("XDG_CONFIG_HOME", tmpDir)
+	t.Setenv("APPDATA", tmpDir)
+	t.Setenv("XDG_STATE_HOME", tmpDir)
 
 	if err := config.EnsureDirs(); err != nil {
 		t.Fatalf("Failed to ensure dirs: %v", err)
@@ -1197,8 +1402,8 @@ func TestFindAvailablePort_HighPort(t *testing.T) {
 // =============================================================================
 
 func TestPauseCmd_Use(t *testing.T) {
-	if pauseCmd.Use != "pause <ID>" {
-		t.Errorf("Expected Use='pause <ID>', got %q", pauseCmd.Use)
+	if pauseCmd.Use != "pause <ID> | --all" {
+		t.Errorf("Expected Use='pause <ID> | --all', got %q", pauseCmd.Use)
 	}
 }
 
@@ -1209,13 +1414,25 @@ func TestPauseCmd_Flags(t *testing.T) {
 	}
 }
 
+func TestPauseCmdRejectsAllWithID(t *testing.T) {
+	if err := pauseCmd.Flags().Set("all", "true"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = pauseCmd.Flags().Set("all", "false") })
+
+	err := pauseCmd.RunE(pauseCmd, []string{"download-id"})
+	if err == nil || err.Error() != "--all cannot be used with a download ID" {
+		t.Fatalf("pause --all download-id error = %v", err)
+	}
+}
+
 // =============================================================================
 // resumeCmd Tests
 // =============================================================================
 
 func TestResumeCmd_Use(t *testing.T) {
-	if resumeCmd.Use != "resume <ID>" {
-		t.Errorf("Expected Use='resume <ID>', got %q", resumeCmd.Use)
+	if resumeCmd.Use != "resume <ID> | --all" {
+		t.Errorf("Expected Use='resume <ID> | --all', got %q", resumeCmd.Use)
 	}
 }
 
@@ -1223,6 +1440,18 @@ func TestResumeCmd_Flags(t *testing.T) {
 	allFlag := resumeCmd.Flags().Lookup("all")
 	if allFlag == nil {
 		t.Error("Missing 'all' flag")
+	}
+}
+
+func TestResumeCmdRejectsAllWithID(t *testing.T) {
+	if err := resumeCmd.Flags().Set("all", "true"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = resumeCmd.Flags().Set("all", "false") })
+
+	err := resumeCmd.RunE(resumeCmd, []string{"download-id"})
+	if err == nil || err.Error() != "--all cannot be used with a download ID" {
+		t.Fatalf("resume --all download-id error = %v", err)
 	}
 }
 

@@ -1,18 +1,29 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
+	"strconv"
+
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/msh2050/fluxget/internal/engine/types"
+	"github.com/msh2050/fluxget/internal/types"
 	"github.com/msh2050/fluxget/internal/utils"
+	"github.com/pelletier/go-toml/v2"
 )
+
+var ErrCategoryExists = errors.New("category already exists")
 
 type Settings struct {
 	General     GeneralSettings     `json:"general"`
@@ -31,6 +42,7 @@ type GeneralSettings struct {
 	DefaultDownloadDir           *Setting `json:"default_download_dir"`
 	WarnOnDuplicate              *Setting `json:"warn_on_duplicate"`
 	DownloadCompleteNotification *Setting `json:"download_complete_notification"`
+	AutoShutdownAfterDownloads   *Setting `json:"auto_shutdown_after_downloads"`
 	AllowRemoteOpenActions       *Setting `json:"allow_remote_open_actions"`
 	AutoResume                   *Setting `json:"auto_resume"`
 	AutoStart                    *Setting `json:"auto_start"`
@@ -39,8 +51,10 @@ type GeneralSettings struct {
 	ClipboardMonitor             *Setting `json:"clipboard_monitor"`
 	Theme                        *Setting `json:"theme"`
 	ThemePath                    *Setting `json:"theme_path"`
+	TransparentBackground        *Setting `json:"transparent_background"`
 	LogRetentionCount            *Setting `json:"log_retention_count"`
 	LiveSpeedGraph               *Setting `json:"live_speed_graph"`
+	ShowSpeedGraph               *Setting `json:"show_speed_graph"`
 }
 
 type NetworkSettings struct {
@@ -54,20 +68,44 @@ type NetworkSettings struct {
 	SequentialDownload        *Setting `json:"sequential_download"`
 	MinChunkSize              *Setting `json:"min_chunk_size"`
 	WorkerBufferSize          *Setting `json:"worker_buffer_size"`
-	DialHedgeCount            *Setting `json:"dial_hedge_count"`
+	// Deprecated: retained so existing configuration files continue to load.
+	DialHedgeCount           *Setting `json:"dial_hedge_count"`
+	GlobalRateLimit          *Setting `json:"global_rate_limit"`
+	DefaultDownloadRateLimit *Setting `json:"default_download_rate_limit"`
 }
 
 type PerformanceSettings struct {
-	MaxTaskRetries        *Setting `json:"max_task_retries"`
-	SlowWorkerThreshold   *Setting `json:"slow_worker_threshold"`
-	SlowWorkerGracePeriod *Setting `json:"slow_worker_grace_period"`
-	StallTimeout          *Setting `json:"stall_timeout"`
-	SpeedEmaAlpha         *Setting `json:"speed_ema_alpha"`
+	MaxTaskRetries              *Setting `json:"max_task_retries"`
+	SlowWorkerThreshold         *Setting `json:"slow_worker_threshold"`
+	SlowWorkerGracePeriod       *Setting `json:"slow_worker_grace_period"`
+	StallTimeout                *Setting `json:"stall_timeout"`
+	SpeedEmaAlpha               *Setting `json:"speed_ema_alpha"`
+	AdaptiveConcurrencyInterval *Setting `json:"adaptive_concurrency_interval"`
 }
 
 type CategorySettings struct {
 	CategoryEnabled *Setting   `json:"category_enabled"`
 	Categories      []Category `json:"categories"`
+}
+
+// UnmarshalJSON handles both the new struct format and the old array format for Categories
+// to prevent config wipes when upgrading from older versions.
+func (c *CategorySettings) UnmarshalJSON(data []byte) error {
+	data = bytes.TrimSpace(data)
+	if len(data) > 0 && data[0] == '[' {
+		// Old format: direct array of categories
+		var oldCats []Category
+		if err := json.Unmarshal(data, &oldCats); err != nil {
+			return err
+		}
+		c.Categories = oldCats
+		return nil
+	}
+
+	// New format: CategorySettings object
+	type alias CategorySettings
+	aux := (*alias)(c)
+	return json.Unmarshal(data, aux)
 }
 
 type ExtensionSettings struct {
@@ -204,17 +242,17 @@ func (s *Setting) Resolve() any {
 		return nil
 	}
 	switch s.Type {
-	case "bool":
+	case TypeBool:
 		return Resolve[bool](s)
-	case "int":
+	case TypeInt:
 		return Resolve[int](s)
-	case "int64":
+	case TypeInt64:
 		return Resolve[int64](s)
-	case "float64":
+	case TypeFloat64:
 		return Resolve[float64](s)
-	case "string", "auth_token", "link":
+	case TypeString, TypeAuthToken, TypeLink:
 		return Resolve[string](s)
-	case "duration":
+	case TypeDuration:
 		return Resolve[time.Duration](s)
 	}
 	return s.Value
@@ -222,94 +260,198 @@ func (s *Setting) Resolve() any {
 
 func (s *Settings) initializeCategoriesList() {
 	s.CategoriesList = []*SettingsCategory{
-		{
-			Name: "General",
-			Settings: []*Setting{
-				s.General.DefaultDownloadDir,
-				s.General.WarnOnDuplicate,
-				s.General.DownloadCompleteNotification,
-				s.General.AllowRemoteOpenActions,
-				s.General.AutoResume,
-				s.General.AutoStart,
-				s.General.DownloadSubtitles,
-				s.General.SkipUpdateCheck,
-				s.General.ClipboardMonitor,
-				s.General.Theme,
-				s.General.ThemePath,
-				s.General.LogRetentionCount,
-				s.General.LiveSpeedGraph,
-			},
-		},
-		{
-			Name: "Network",
-			Settings: []*Setting{
-				s.Network.MaxConnectionsPerDownload,
-				s.Network.StreamSegmentWorkers,
-				s.Network.MaxConcurrentDownloads,
-				s.Network.MaxConcurrentProbes,
-				s.Network.UserAgent,
-				s.Network.ProxyURL,
-				s.Network.CustomDNS,
-				s.Network.SequentialDownload,
-				s.Network.MinChunkSize,
-				s.Network.WorkerBufferSize,
-				s.Network.DialHedgeCount,
-			},
-		},
-		{
-			Name: "Performance",
-			Settings: []*Setting{
-				s.Performance.MaxTaskRetries,
-				s.Performance.SlowWorkerThreshold,
-				s.Performance.SlowWorkerGracePeriod,
-				s.Performance.StallTimeout,
-				s.Performance.SpeedEmaAlpha,
-			},
-		},
-		{
-			Name: "Categories",
-			Settings: []*Setting{
-				s.Categories.CategoryEnabled,
-			},
-		},
-		{
-			Name: "Extension",
-			Settings: []*Setting{
-				s.Extension.ExtensionPrompt,
-				s.Extension.ChromeExtensionURL,
-				s.Extension.FirefoxExtensionURL,
-				s.Extension.AuthToken,
-				s.Extension.InstructionsURL,
-			},
-		},
+		{Name: "General", Settings: []*Setting{
+			s.General.DefaultDownloadDir,
+			s.General.WarnOnDuplicate,
+			s.General.DownloadCompleteNotification,
+			s.General.AutoShutdownAfterDownloads,
+			s.General.AllowRemoteOpenActions,
+			s.General.AutoResume,
+			s.General.AutoStart,
+			s.General.DownloadSubtitles,
+			s.General.SkipUpdateCheck,
+			s.General.ClipboardMonitor,
+			s.General.Theme,
+			s.General.ThemePath,
+			s.General.TransparentBackground,
+			s.General.LogRetentionCount,
+			s.General.LiveSpeedGraph,
+			s.General.ShowSpeedGraph,
+		}},
+		{Name: "Network", Settings: []*Setting{
+			s.Network.MaxConnectionsPerDownload,
+			s.Network.StreamSegmentWorkers,
+			s.Network.MaxConcurrentDownloads,
+			s.Network.MaxConcurrentProbes,
+			s.Network.UserAgent,
+			s.Network.ProxyURL,
+			s.Network.CustomDNS,
+			s.Network.SequentialDownload,
+			s.Network.MinChunkSize,
+			s.Network.WorkerBufferSize,
+			s.Network.DialHedgeCount,
+			s.Network.GlobalRateLimit,
+			s.Network.DefaultDownloadRateLimit,
+		}},
+		{Name: "Performance", Settings: []*Setting{
+			s.Performance.MaxTaskRetries,
+			s.Performance.SlowWorkerThreshold,
+			s.Performance.SlowWorkerGracePeriod,
+			s.Performance.StallTimeout,
+			s.Performance.SpeedEmaAlpha,
+			s.Performance.AdaptiveConcurrencyInterval,
+		}},
+		{Name: "Categories", Settings: []*Setting{
+			s.Categories.CategoryEnabled,
+		}},
+		{Name: "Extension", Settings: []*Setting{
+			s.Extension.ExtensionPrompt,
+			s.Extension.ChromeExtensionURL,
+			s.Extension.FirefoxExtensionURL,
+			s.Extension.AuthToken,
+			s.Extension.InstructionsURL,
+			s.Extension.HFToken,
+		}},
 	}
 }
 
-// GetSettingsPath returns the path to the settings JSON file.
+// settingsDisplayGroups is independent of the stable config and API sections.
+var settingsDisplayGroups = map[string][]string{
+	"General":    {"auto_start", "auto_resume", "auto_shutdown_after_downloads", "clipboard_monitor", "download_complete_notification", "skip_update_check"},
+	"Downloads":  {"default_download_dir", "warn_on_duplicate", "max_concurrent_downloads", "max_connections_per_host", "global_rate_limit", "default_download_rate_limit", "sequential_download", "hls_segment_workers", "download_subtitles"},
+	"Appearance": {"theme", "theme_path", "transparent_background", "show_speed_graph", "live_speed_graph"},
+	"Network":    {"proxy_url", "custom_dns", "user_agent", "allow_remote_open_actions"},
+	"Categories": {"category_enabled"},
+	"Extension":  {"extension_prompt", "auth_token", "chrome_extension_url", "firefox_extension_url", "instructions_url", "hf_token"},
+	"Advanced":   {"max_concurrent_probes", "min_chunk_size", "worker_buffer_size", "max_task_retries", "slow_worker_threshold", "slow_worker_grace_period", "stall_timeout", "speed_ema_alpha", "adaptive_concurrency_interval", "log_retention_count"},
+}
+
+// FindSetting returns a setting by its category and JSON key without using reflection.
+func (s *Settings) FindSetting(categoryName, key string) *Setting {
+	// A display category can contain settings from several storage sections.
+	if keys, ok := settingsDisplayGroups[categoryName]; ok && slices.Contains(keys, key) {
+		for _, cat := range s.CategoriesList {
+			for _, set := range cat.Settings {
+				if set != nil && set.Key == key {
+					return set
+				}
+			}
+		}
+	}
+	// Preserve direct lookups using existing config and API section names.
+	for _, cat := range s.CategoriesList {
+		if cat.Name == categoryName {
+			for _, set := range cat.Settings {
+				if set != nil && set.Key == key {
+					return set
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (s *Settings) FindSettingsCategory(name string) *SettingsCategory {
+	for _, cat := range s.CategoriesList {
+		if cat.Name == name {
+			return cat
+		}
+	}
+	return nil
+}
+
+// GetSettingsPath returns the path to the settings TOML file.
 func GetSettingsPath() string {
-	return filepath.Join(GetSurgeDir(), "settings.json")
+	return filepath.Join(GetSurgeDir(), "settings.toml")
 }
 
 // LoadSettings loads settings from disk. Returns defaults if file doesn't exist
-// or if the JSON is corrupt, so the application can always start.
+// or if the file is corrupt, so the application can always start.
 func LoadSettings() (*Settings, error) {
 	path := GetSettingsPath()
 
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return DefaultSettings(), nil
+			settings := DefaultSettings()
+			// Check if old settings.json exists
+			jsonPath := filepath.Join(GetSurgeDir(), "settings.json")
+			if _, statErr := os.Stat(jsonPath); statErr == nil {
+				settings.StartupWarnings = append(settings.StartupWarnings,
+					"Config: 'settings.json' is no longer supported. Settings have been reset to defaults. Please re-configure your options via 'surge config' or by editing 'settings.toml'.")
+			}
+			return settings, nil
 		}
 		return nil, err
 	}
 
 	settings := DefaultSettings() // Start with defaults to fill any missing fields
-	if err := json.Unmarshal(data, settings); err != nil {
+
+	var raw map[string]any
+	if err := toml.Unmarshal(data, &raw); err != nil {
 		utils.Debug("Warning: corrupt settings file %s: %v - using defaults", path, err)
-		defaults := DefaultSettings()
-		defaults.StartupWarnings = append(defaults.StartupWarnings,
+		settings.StartupWarnings = append(settings.StartupWarnings,
 			fmt.Sprintf("Config: settings file is corrupt (%v) - all settings reset to defaults", err))
-		return defaults, nil
+		return settings, nil
+	}
+
+	// Assign mapped values to settings
+	for catName, catRaw := range raw {
+		if strings.EqualFold(catName, "categories") {
+			if catMap, ok := catRaw.(map[string]any); ok {
+				if enabled, ok := catMap["category_enabled"]; ok {
+					if set := settings.FindSetting("Categories", "category_enabled"); set != nil {
+						set.Value = enabled
+					}
+				}
+				if catsRaw, ok := catMap["categories"]; ok {
+					if catsList, ok := catsRaw.([]any); ok {
+						var parsedCats []Category
+						for _, cAny := range catsList {
+							if cMap, ok := cAny.(map[string]any); ok {
+								parsed := Category{}
+								if n, ok := cMap["name"].(string); ok {
+									parsed.Name = n
+								}
+								if d, ok := cMap["description"].(string); ok {
+									parsed.Description = d
+								}
+								if pt, ok := cMap["pattern"].(string); ok {
+									parsed.Pattern = pt
+								}
+								if p, ok := cMap["path"].(string); ok {
+									parsed.Path = p
+								}
+								parsedCats = append(parsedCats, parsed)
+							}
+						}
+						settings.Categories.Categories = parsedCats
+					}
+				}
+			}
+			continue
+		}
+
+		if catMap, ok := catRaw.(map[string]any); ok {
+			for _, cat := range settings.CategoriesList {
+				if strings.EqualFold(cat.Name, catName) {
+					for key, val := range catMap {
+						if set := settings.FindSetting(cat.Name, key); set != nil {
+							set.Value = val
+						}
+					}
+					break
+				}
+			}
+		}
+	}
+
+	// Normalize loaded values to their proper types (handles TOML type coercion
+	// such as durations stored as strings, ints stored as int64, etc.)
+	for _, cat := range settings.CategoriesList {
+		for _, set := range cat.Settings {
+			set.Value = set.Resolve()
+		}
 	}
 
 	// Validate settings and roll back individual invalid fields to defaults
@@ -320,48 +462,61 @@ func LoadSettings() (*Settings, error) {
 
 // SettingMeta provides metadata for a single setting (for UI rendering).
 type SettingMeta struct {
-	Key             string // JSON key name
-	Label           string // Human-readable label
-	Description     string // Help text displayed in right pane
-	Type            string // "string", "int", "int64", "bool", "duration", "float64", "auth_token", "link"
-	RequiresRestart bool   // Whether changing this setting requires an application restart
+	Key             string      // JSON key name
+	Label           string      // Human-readable label
+	Description     string      // Help text displayed in right pane
+	Type            SettingType // "string", "int", "int64", "bool", "duration", "float64", "auth_token", "link"
+	Unit            SettingUnit // Display and input unit used by the UI
+	RequiresRestart bool        // Whether changing this setting requires an application restart
 }
+
+var (
+	cachedSettingsMetadata map[string][]SettingMeta
+	settingsMetadataOnce   sync.Once
+)
 
 // GetSettingsMetadata returns metadata for all settings organized by category.
+// The result is computed once and cached since metadata is static.
 func GetSettingsMetadata() map[string][]SettingMeta {
-	s := DefaultSettings()
-	meta := make(map[string][]SettingMeta)
-	for _, cat := range s.CategoriesList {
-		var list []SettingMeta
-		for _, set := range cat.Settings {
-			list = append(list, SettingMeta{
-				Key:             set.Key,
-				Label:           set.Label,
-				Description:     set.Description,
-				Type:            set.Type,
-				RequiresRestart: set.NeedsRestart,
-			})
+	settingsMetadataOnce.Do(func() {
+		s := DefaultSettings()
+		cachedSettingsMetadata = make(map[string][]SettingMeta)
+		for _, category := range CategoryOrder() {
+			for _, key := range settingsDisplayGroups[category] {
+				set := s.FindSetting(category, key)
+				cachedSettingsMetadata[category] = append(cachedSettingsMetadata[category], SettingMeta{
+					Key: set.Key, Label: set.Label, Description: set.Description,
+					Type: set.Type, Unit: set.Unit, RequiresRestart: set.NeedsRestart,
+				})
+			}
 		}
-		meta[cat.Name] = list
-	}
-	return meta
+	})
+	return cachedSettingsMetadata
 }
 
-// CategoryOrder returns the order of categories for UI tabs.
+// CategoryOrder returns the display order of settings categories.
 func CategoryOrder() []string {
-	return []string{"General", "Network", "Performance", "Categories", "Extension"}
+	return []string{"General", "Downloads", "Appearance", "Network", "Categories", "Extension", "Advanced"}
 }
-
-const (
-	KB = 1 << 10
-	MB = 1 << 20
-)
 
 const (
 	ThemeAdaptive = 0
 	ThemeLight    = 1
 	ThemeDark     = 2
 )
+
+func parseAnyInt(val any) (int, error) {
+	switch v := val.(type) {
+	case int:
+		return v, nil
+	case int64:
+		return int(v), nil
+	case float64:
+		return int(v), nil
+	default:
+		return 0, fmt.Errorf("invalid type: %T", val)
+	}
+}
 
 // DefaultSettings returns a new Settings instance with sensible defaults.
 func DefaultSettings() *Settings {
@@ -371,9 +526,9 @@ func DefaultSettings() *Settings {
 		General: GeneralSettings{
 			DefaultDownloadDir: &Setting{
 				Key:          "default_download_dir",
-				Label:        "Default Download Dir",
+				Label:        "Default download dir",
 				Description:  "Default directory for new downloads. Leave empty to use current directory.",
-				Type:         "string",
+				Type:         TypeString,
 				DefaultValue: defaultDir,
 				Value:        defaultDir,
 				ValidateFunc: func(val any) error {
@@ -394,87 +549,91 @@ func DefaultSettings() *Settings {
 			},
 			WarnOnDuplicate: &Setting{
 				Key:          "warn_on_duplicate",
-				Label:        "Warn on Duplicate",
+				Label:        "Warn on duplicate",
 				Description:  "Show warning when adding a download that already exists.",
-				Type:         "bool",
+				Type:         TypeBool,
 				DefaultValue: true,
 				Value:        true,
 			},
 			DownloadCompleteNotification: &Setting{
 				Key:          "download_complete_notification",
-				Label:        "Download Complete Notification",
+				Label:        "Download notifications",
 				Description:  "Show system notification when a download finishes.",
-				Type:         "bool",
+				Type:         TypeBool,
 				DefaultValue: true,
 				Value:        true,
 			},
+			AutoShutdownAfterDownloads: &Setting{
+				Key:          "auto_shutdown_after_downloads",
+				Label:        "Auto shutdown",
+				Description:  "Shut down the computer after all downloads finish. Active, queued, and paused downloads block shutdown.",
+				Type:         TypeBool,
+				DefaultValue: false,
+				Value:        false,
+			},
 			AllowRemoteOpenActions: &Setting{
 				Key:          "allow_remote_open_actions",
-				Label:        "Allow Remote Open Actions",
+				Label:        "Remote open actions",
 				Description:  "Allow /open-file and /open-folder API calls from non-loopback clients. Disabled by default for security.",
-				Type:         "bool",
+				Type:         TypeBool,
 				NeedsRestart: true,
 				DefaultValue: false,
 				Value:        false,
 			},
 			AutoResume: &Setting{
 				Key:          "auto_resume",
-				Label:        "Auto Resume",
+				Label:        "Auto resume",
 				Description:  "Automatically resume paused downloads on startup.",
-				Type:         "bool",
+				Type:         TypeBool,
 				NeedsRestart: true,
 				DefaultValue: false,
 				Value:        false,
 			},
 			AutoStart: &Setting{
 				Key:          "auto_start",
-				Label:        "Automatic Startup",
-				Description:  "Start Surge automatically when the system boots (requires service installation).",
-				Type:         "bool",
+				Label:        "Start at login",
+				Description:  "Install the Surge user service and start it automatically when you log in.",
+				Type:         TypeBool,
 				DefaultValue: false,
 				Value:        false,
 			},
 			DownloadSubtitles: &Setting{
 				Key:          "download_subtitles",
-				Label:        "Download Subtitles",
+				Label:        "Download subtitles",
 				Description:  "Download all subtitle tracks for HLS streams: embed them into the video (.mkv) and write .srt sidecar files.",
-				Type:         "bool",
+				Type:         TypeBool,
 				DefaultValue: true,
 				Value:        true,
 			},
 			SkipUpdateCheck: &Setting{
 				Key:          "skip_update_check",
-				Label:        "Skip Update Check",
+				Label:        "Skip update check",
 				Description:  "Disable automatic check for new versions on startup.",
-				Type:         "bool",
+				Type:         TypeBool,
 				NeedsRestart: true,
 				DefaultValue: false,
 				Value:        false,
 			},
 			ClipboardMonitor: &Setting{
 				Key:          "clipboard_monitor",
-				Label:        "Clipboard Monitor",
+				Label:        "Clipboard monitor",
 				Description:  "Watch clipboard for URLs and prompt to download them.",
-				Type:         "bool",
+				Type:         TypeBool,
 				NeedsRestart: true,
 				DefaultValue: true,
 				Value:        true,
 			},
 			Theme: &Setting{
 				Key:          "theme",
-				Label:        "App Theme",
+				Label:        "App theme",
 				Description:  "UI Theme (System, Light, Dark).",
-				Type:         "int",
+				Type:         TypeInt,
 				DefaultValue: ThemeAdaptive,
 				Value:        ThemeAdaptive,
 				ValidateFunc: func(val any) error {
-					v, ok := val.(int)
-					if !ok {
-						if f, ok := val.(float64); ok {
-							v = int(f)
-						} else {
-							return fmt.Errorf("invalid type")
-						}
+					v, err := parseAnyInt(val)
+					if err != nil {
+						return err
 					}
 					if v < 0 || v > 2 {
 						return fmt.Errorf("theme must be 0, 1, or 2")
@@ -484,28 +643,32 @@ func DefaultSettings() *Settings {
 			},
 			ThemePath: &Setting{
 				Key:          "theme_path",
-				Label:        "Theme File",
+				Label:        "Theme file",
 				Description:  "Path to a custom .toml color scheme.",
-				Type:         "string",
+				Type:         TypeString,
 				DefaultValue: "",
 				Value:        "",
 			},
+			TransparentBackground: &Setting{
+				Key:          "transparent_background",
+				Label:        "Transparent background",
+				Description:  "Use the terminal background throughout the UI.",
+				Type:         TypeBool,
+				DefaultValue: false,
+				Value:        false,
+			},
 			LogRetentionCount: &Setting{
 				Key:          "log_retention_count",
-				Label:        "Log Retention Count",
+				Label:        "Log retention count",
 				Description:  "Number of recent log files to keep.",
-				Type:         "int",
+				Type:         TypeInt,
 				NeedsRestart: true,
 				DefaultValue: 5,
 				Value:        5,
 				ValidateFunc: func(val any) error {
-					v, ok := val.(int)
-					if !ok {
-						if f, ok := val.(float64); ok {
-							v = int(f)
-						} else {
-							return fmt.Errorf("invalid type")
-						}
+					v, err := parseAnyInt(val)
+					if err != nil {
+						return err
 					}
 					if v < 1 || v > 100 {
 						return fmt.Errorf("must be between 1 and 100")
@@ -515,29 +678,33 @@ func DefaultSettings() *Settings {
 			},
 			LiveSpeedGraph: &Setting{
 				Key:          "live_speed_graph",
-				Label:        "Live Speed Graph",
+				Label:        "Live speed graph",
 				Description:  "Use live speed for graph instead of EMA smoothed speed.",
-				Type:         "bool",
+				Type:         TypeBool,
 				DefaultValue: false,
 				Value:        false,
+			},
+			ShowSpeedGraph: &Setting{
+				Key:          "show_speed_graph",
+				Label:        "Show speed graph",
+				Description:  "Display the network activity graph on the dashboard. Disable to reduce CPU usage.",
+				Type:         TypeBool,
+				DefaultValue: true,
+				Value:        true,
 			},
 		},
 		Network: NetworkSettings{
 			MaxConnectionsPerDownload: &Setting{
 				Key:          "max_connections_per_host",
-				Label:        "Max Connections/Download",
+				Label:        "Max connections/download",
 				Description:  "Maximum concurrent connections per download (1-64).",
-				Type:         "int",
-				DefaultValue: 32,
-				Value:        32,
+				Type:         TypeInt,
+				DefaultValue: types.PerDownloadMax,
+				Value:        types.PerDownloadMax,
 				ValidateFunc: func(val any) error {
-					v, ok := val.(int)
-					if !ok {
-						if f, ok := val.(float64); ok {
-							v = int(f)
-						} else {
-							return fmt.Errorf("invalid type")
-						}
+					v, err := parseAnyInt(val)
+					if err != nil {
+						return err
 					}
 					if v < 1 || v > 64 {
 						return fmt.Errorf("must be between 1 and 64")
@@ -547,9 +714,9 @@ func DefaultSettings() *Settings {
 			},
 			StreamSegmentWorkers: &Setting{
 				Key:          "hls_segment_workers",
-				Label:        "HLS/DASH Connections",
+				Label:        "Stream segment connections",
 				Description:  "Parallel segment connections for HLS/DASH streams (1-32). Higher is faster but some CDNs rate-limit; lower if you hit 429 errors.",
-				Type:         "int",
+				Type:         TypeInt,
 				DefaultValue: 6,
 				Value:        6,
 				ValidateFunc: func(val any) error {
@@ -569,20 +736,16 @@ func DefaultSettings() *Settings {
 			},
 			MaxConcurrentDownloads: &Setting{
 				Key:          "max_concurrent_downloads",
-				Label:        "Max Concurrent Downloads",
+				Label:        "Max concurrent downloads",
 				Description:  "Maximum number of downloads running at once (1-10).",
-				Type:         "int",
+				Type:         TypeInt,
 				NeedsRestart: true,
 				DefaultValue: 3,
 				Value:        3,
 				ValidateFunc: func(val any) error {
-					v, ok := val.(int)
-					if !ok {
-						if f, ok := val.(float64); ok {
-							v = int(f)
-						} else {
-							return fmt.Errorf("invalid type")
-						}
+					v, err := parseAnyInt(val)
+					if err != nil {
+						return err
 					}
 					if v < 1 || v > 10 {
 						return fmt.Errorf("must be between 1 and 10")
@@ -592,20 +755,16 @@ func DefaultSettings() *Settings {
 			},
 			MaxConcurrentProbes: &Setting{
 				Key:          "max_concurrent_probes",
-				Label:        "Max Concurrent Probes",
+				Label:        "Max concurrent probes",
 				Description:  "Maximum number of simultaneous server probes when adding many downloads at once (1-10).",
-				Type:         "int",
+				Type:         TypeInt,
 				NeedsRestart: true,
 				DefaultValue: 3,
 				Value:        3,
 				ValidateFunc: func(val any) error {
-					v, ok := val.(int)
-					if !ok {
-						if f, ok := val.(float64); ok {
-							v = int(f)
-						} else {
-							return fmt.Errorf("invalid type")
-						}
+					v, err := parseAnyInt(val)
+					if err != nil {
+						return err
 					}
 					if v < 1 || v > 10 {
 						return fmt.Errorf("must be between 1 and 10")
@@ -615,9 +774,9 @@ func DefaultSettings() *Settings {
 			},
 			UserAgent: &Setting{
 				Key:          "user_agent",
-				Label:        "User Agent",
+				Label:        "User agent",
 				Description:  "Custom User-Agent string for HTTP requests. Leave empty for default.",
-				Type:         "string",
+				Type:         TypeString,
 				DefaultValue: "",
 				Value:        "",
 			},
@@ -625,7 +784,7 @@ func DefaultSettings() *Settings {
 				Key:          "proxy_url",
 				Label:        "Proxy URL",
 				Description:  "HTTP/HTTPS proxy URL (e.g. http://127.0.0.1:1700). Leave empty to use system default.",
-				Type:         "string",
+				Type:         TypeString,
 				DefaultValue: "",
 				Value:        "",
 				ValidateFunc: func(val any) error {
@@ -644,9 +803,9 @@ func DefaultSettings() *Settings {
 			},
 			CustomDNS: &Setting{
 				Key:          "custom_dns",
-				Label:        "Custom DNS Server",
+				Label:        "Custom DNS server",
 				Description:  "Set custom DNS (e.g., 1.1.1.1:53, 94.140.14.14:53). Leave empty for system.",
-				Type:         "string",
+				Type:         TypeString,
 				DefaultValue: "",
 				Value:        "",
 				ValidateFunc: func(val any) error {
@@ -659,74 +818,63 @@ func DefaultSettings() *Settings {
 			},
 			SequentialDownload: &Setting{
 				Key:          "sequential_download",
-				Label:        "Sequential Download",
+				Label:        "Sequential download",
 				Description:  "Download pieces in order (Streaming Mode). May be slower.",
-				Type:         "bool",
+				Type:         TypeBool,
 				DefaultValue: false,
 				Value:        false,
 			},
 			MinChunkSize: &Setting{
 				Key:          "min_chunk_size",
-				Label:        "Min Chunk Size",
-				Description:  "Minimum download chunk size in MB (e.g., 2).",
-				Type:         "int64",
-				DefaultValue: int64(2 * MB),
-				Value:        int64(2 * MB),
+				Label:        "Min chunk size",
+				Description:  "Minimum download chunk size in MiB (e.g., 2).",
+				Type:         TypeInt64,
+				Unit:         UnitMegabytes,
+				DefaultValue: int64(2 * utils.MiB),
+				Value:        int64(2 * utils.MiB),
 				ValidateFunc: func(val any) error {
-					var v int64
-					switch actual := val.(type) {
-					case int64:
-						v = actual
-					case int:
-						v = int64(actual)
-					case float64:
-						v = int64(actual)
-					default:
-						return fmt.Errorf("invalid type")
+					vInt, err := parseAnyInt(val)
+					if err != nil {
+						return err
 					}
-					if v < 100*KB {
-						return fmt.Errorf("min chunk size must be at least 100KB")
+					v := int64(vInt)
+					if v < 100*utils.KiB {
+						return fmt.Errorf("min chunk size must be at least 100KiB")
 					}
 					return nil
 				},
 			},
 			WorkerBufferSize: &Setting{
 				Key:          "worker_buffer_size",
-				Label:        "Worker Buffer Size",
-				Description:  "I/O buffer size per worker in KB (e.g., 512).",
-				Type:         "int",
-				DefaultValue: int(512 * KB),
-				Value:        int(512 * KB),
+				Label:        "Worker buffer size",
+				Description:  "I/O buffer size per worker in KiB (e.g., 512).",
+				Type:         TypeInt,
+				Unit:         UnitKilobytes,
+				DefaultValue: int(512 * utils.KiB),
+				Value:        int(512 * utils.KiB),
 				ValidateFunc: func(val any) error {
-					v, ok := val.(int)
-					if !ok {
-						if f, ok := val.(float64); ok {
-							v = int(f)
-						} else {
-							return fmt.Errorf("invalid type")
-						}
+					v, err := parseAnyInt(val)
+					if err != nil {
+						return err
 					}
-					if v < 1*KB {
-						return fmt.Errorf("worker buffer size must be at least 1KB")
+					if v < 1*utils.KiB {
+						return fmt.Errorf("worker buffer size must be at least 1KiB")
 					}
 					return nil
 				},
 			},
 			DialHedgeCount: &Setting{
 				Key:          "dial_hedge_count",
-				Label:        "Dial Hedge Count",
-				Description:  "Number of extra connections to dial pre-emptively to avoid slow connects (0-16).",
-				Type:         "int",
+				Label:        "Dial hedge count",
+				Description:  "Deprecated and ignored; connection prewarming is no longer performed.",
+				Type:         TypeInt,
+				Unit:         UnitConnections,
 				DefaultValue: 4,
 				Value:        4,
 				ValidateFunc: func(val any) error {
-					v, ok := val.(int)
-					if !ok {
-						if f, ok := val.(float64); ok {
-							v = int(f)
-						} else {
-							return fmt.Errorf("invalid type")
-						}
+					v, err := parseAnyInt(val)
+					if err != nil {
+						return err
 					}
 					if v < 0 || v > 16 {
 						return fmt.Errorf("must be between 0 and 16")
@@ -734,23 +882,46 @@ func DefaultSettings() *Settings {
 					return nil
 				},
 			},
+			GlobalRateLimit: &Setting{
+				Key:          "global_rate_limit",
+				Label:        "Global rate limit",
+				Description:  "Cap total download bandwidth (e.g., 10MiB/s, 80Mbps). Use 0 to disable.",
+				Type:         TypeString,
+				Unit:         UnitMegabytesPerSecond,
+				DefaultValue: "0",
+				Value:        "0",
+				ValidateFunc: func(val any) error {
+					_, err := utils.ParseRateLimitValue(val)
+					return err
+				},
+			},
+			DefaultDownloadRateLimit: &Setting{
+				Key:          "default_download_rate_limit",
+				Label:        "Default download rate limit",
+				Description:  "Default cap per download (e.g., 2MiB/s). Use 0 to disable.",
+				Type:         TypeString,
+				Unit:         UnitMegabytesPerSecond,
+				DefaultValue: "0",
+				Value:        "0",
+				ValidateFunc: func(val any) error {
+					_, err := utils.ParseRateLimitValue(val)
+					return err
+				},
+			},
 		},
 		Performance: PerformanceSettings{
 			MaxTaskRetries: &Setting{
 				Key:          "max_task_retries",
-				Label:        "Max Task Retries",
+				Label:        "Max task retries",
 				Description:  "Number of times to retry a failed chunk before giving up.",
-				Type:         "int",
+				Type:         TypeInt,
+				Unit:         UnitRetries,
 				DefaultValue: 3,
 				Value:        3,
 				ValidateFunc: func(val any) error {
-					v, ok := val.(int)
-					if !ok {
-						if f, ok := val.(float64); ok {
-							v = int(f)
-						} else {
-							return fmt.Errorf("invalid type")
-						}
+					v, err := parseAnyInt(val)
+					if err != nil {
+						return err
 					}
 					if v < 0 || v > 10 {
 						return fmt.Errorf("must be between 0 and 10")
@@ -760,9 +931,10 @@ func DefaultSettings() *Settings {
 			},
 			SlowWorkerThreshold: &Setting{
 				Key:          "slow_worker_threshold",
-				Label:        "Slow Worker Threshold",
+				Label:        "Slow worker threshold",
 				Description:  "Restart workers slower than this fraction of mean speed (0.0-1.0, 0 disables relative slow-worker checks).",
-				Type:         "float64",
+				Type:         TypeFloat64,
+				Unit:         UnitRatio,
 				DefaultValue: 0.3,
 				Value:        0.3,
 				ValidateFunc: func(val any) error {
@@ -771,6 +943,8 @@ func DefaultSettings() *Settings {
 					case float64:
 						v = actual
 					case int:
+						v = float64(actual)
+					case int64:
 						v = float64(actual)
 					default:
 						return fmt.Errorf("invalid type")
@@ -783,9 +957,10 @@ func DefaultSettings() *Settings {
 			},
 			SlowWorkerGracePeriod: &Setting{
 				Key:          "slow_worker_grace_period",
-				Label:        "Slow Worker Grace",
+				Label:        "Slow worker grace",
 				Description:  "Grace period before checking worker speed (e.g., 5s, 0 checks immediately).",
-				Type:         "duration",
+				Type:         TypeDuration,
+				Unit:         UnitSeconds,
 				DefaultValue: 5 * time.Second,
 				Value:        5 * time.Second,
 				ValidateFunc: func(val any) error {
@@ -808,9 +983,10 @@ func DefaultSettings() *Settings {
 			},
 			StallTimeout: &Setting{
 				Key:          "stall_timeout",
-				Label:        "Stall Timeout",
+				Label:        "Stall timeout",
 				Description:  "Restart workers with no data for this duration (e.g., 5s, 0 disables stall detection).",
-				Type:         "duration",
+				Type:         TypeDuration,
+				Unit:         UnitSeconds,
 				DefaultValue: 3 * time.Second,
 				Value:        3 * time.Second,
 				ValidateFunc: func(val any) error {
@@ -833,9 +1009,10 @@ func DefaultSettings() *Settings {
 			},
 			SpeedEmaAlpha: &Setting{
 				Key:          "speed_ema_alpha",
-				Label:        "Speed EMA Alpha",
+				Label:        "Speed EMA alpha",
 				Description:  "Exponential moving average smoothing factor (0.0-1.0, 0 disables smoothing).",
-				Type:         "float64",
+				Type:         TypeFloat64,
+				Unit:         UnitRatio,
 				DefaultValue: 0.3,
 				Value:        0.3,
 				ValidateFunc: func(val any) error {
@@ -844,6 +1021,8 @@ func DefaultSettings() *Settings {
 					case float64:
 						v = actual
 					case int:
+						v = float64(actual)
+					case int64:
 						v = float64(actual)
 					default:
 						return fmt.Errorf("invalid type")
@@ -854,13 +1033,39 @@ func DefaultSettings() *Settings {
 					return nil
 				},
 			},
+			AdaptiveConcurrencyInterval: &Setting{
+				Key:          "adaptive_concurrency_interval",
+				Label:        "Adaptive concurrency interval",
+				Description:  "Halve connections when throttled, add one connection per interval, and split small tail ranges among idle workers on healthy hosts; 0 disables adaptation (0s or 1s-60s).",
+				Type:         TypeDuration,
+				Unit:         UnitSeconds,
+				DefaultValue: types.DefaultAdaptiveConcurrencyInterval,
+				Value:        types.DefaultAdaptiveConcurrencyInterval,
+				ValidateFunc: func(val any) error {
+					var v time.Duration
+					switch actual := val.(type) {
+					case time.Duration:
+						v = actual
+					case float64:
+						v = time.Duration(actual)
+					case int64:
+						v = time.Duration(actual)
+					default:
+						return fmt.Errorf("invalid type")
+					}
+					if v < 0 || v > time.Minute || v > 0 && v < time.Second {
+						return fmt.Errorf("must be 0 or between 1s and 60s")
+					}
+					return nil
+				},
+			},
 		},
 		Categories: CategorySettings{
 			CategoryEnabled: &Setting{
 				Key:          "category_enabled",
-				Label:        "Manage Categories",
-				Description:  "Sort downloads into subfolders by file type. Press Enter to open Category Manager.",
-				Type:         "bool",
+				Label:        "Manage categories",
+				Description:  "Sort downloads into subfolders using category rules.",
+				Type:         TypeBool,
 				DefaultValue: false,
 				Value:        false,
 			},
@@ -869,49 +1074,49 @@ func DefaultSettings() *Settings {
 		Extension: ExtensionSettings{
 			ExtensionPrompt: &Setting{
 				Key:          "extension_prompt",
-				Label:        "Extension Prompt",
+				Label:        "Extension prompt",
 				Description:  "Prompt for confirmation when adding downloads via browser extension.",
-				Type:         "bool",
+				Type:         TypeBool,
 				DefaultValue: true,
 				Value:        true,
 			},
 			ChromeExtensionURL: &Setting{
 				Key:          "chrome_extension_url",
-				Label:        "Get Chrome Extension",
+				Label:        "Get Chrome extension",
 				Description:  "Open the Surge Chrome extension page.",
-				Type:         "link",
-				DefaultValue: "https://github.com/SurgeDM/Surge/releases/latest",
-				Value:        "https://github.com/SurgeDM/Surge/releases/latest",
+				Type:         TypeLink,
+				DefaultValue: "https://chromewebstore.google.com/detail/surge-download-manager/cakjmkhlofkhjmfkjlclgbfdklhdnkgl",
+				Value:        "https://chromewebstore.google.com/detail/surge-download-manager/cakjmkhlofkhjmfkjlclgbfdklhdnkgl",
 			},
 			FirefoxExtensionURL: &Setting{
 				Key:          "firefox_extension_url",
-				Label:        "Get Firefox Extension",
+				Label:        "Get Firefox extension",
 				Description:  "Open the Surge Firefox extension page.",
-				Type:         "link",
+				Type:         TypeLink,
 				DefaultValue: "https://addons.mozilla.org/en-US/firefox/addon/surge/",
 				Value:        "https://addons.mozilla.org/en-US/firefox/addon/surge/",
 			},
 			AuthToken: &Setting{
 				Key:          "auth_token",
-				Label:        "Auth Token",
+				Label:        "Auth token",
 				Description:  "Your authentication token. Use this to connect the Browser Extension to Surge.",
-				Type:         "auth_token",
+				Type:         TypeAuthToken,
 				DefaultValue: "",
 				Value:        "",
 			},
 			InstructionsURL: &Setting{
 				Key:          "instructions_url",
-				Label:        "Setup Instructions",
+				Label:        "Setup instructions",
 				Description:  "View detailed instructions on how to set up the Surge browser extension.",
-				Type:         "link",
-				DefaultValue: "https://github.com/SurgeDM/Surge#browser-extension",
-				Value:        "https://github.com/SurgeDM/Surge#browser-extension",
+				Type:         TypeLink,
+				DefaultValue: "https://github.com/msh2050/fluxget#browser-extension",
+				Value:        "https://github.com/msh2050/fluxget#browser-extension",
 			},
 			HFToken: &Setting{
 				Key:          "hf_token",
-				Label:        "HuggingFace Token",
+				Label:        "HuggingFace token",
 				Description:  "Your HuggingFace access token (hf_...). Required to download private or gated models.",
-				Type:         "password",
+				Type:         TypeString,
 				DefaultValue: "",
 				Value:        "",
 			},
@@ -940,15 +1145,6 @@ func (s *Settings) Validate() []string {
 	validCats := make([]Category, 0, len(s.Categories.Categories))
 	for _, cat := range s.Categories.Categories {
 		if err := cat.Validate(); err == nil {
-			// Extra path check for each category
-			catPath := strings.TrimSpace(cat.Path)
-			if catPath != "" {
-				if info, err := os.Stat(catPath); err != nil || !info.IsDir() {
-					// Fallback to default download dir
-					cat.Path = Resolve[string](s.General.DefaultDownloadDir)
-					s.StartupWarnings = append(s.StartupWarnings, fmt.Sprintf("Category %q path is broken; reset to default", cat.Name))
-				}
-			}
 			validCats = append(validCats, cat)
 		} else {
 			s.StartupWarnings = append(s.StartupWarnings, fmt.Sprintf("Removed invalid category %q: %v", cat.Name, err))
@@ -958,6 +1154,155 @@ func (s *Settings) Validate() []string {
 	s.Categories.Categories = validCats
 
 	return s.StartupWarnings
+}
+
+// NormalizedClone validates the schema and normalizes a caller-owned copy.
+// Validating before cloning prevents null settings from becoming defaults.
+func (s *Settings) NormalizedClone() (*Settings, error) {
+	if err := s.validateRequiredSettings(); err != nil {
+		return nil, err
+	}
+	cloned := s.Clone()
+	if err := cloned.NormalizeValues(); err != nil {
+		return nil, err
+	}
+	return cloned, nil
+}
+
+// NormalizeValues converts decoded JSON/TOML primitives back to the types
+// declared by the settings schema.
+func (s *Settings) NormalizeValues() error {
+	if err := s.validateRequiredSettings(); err != nil {
+		return err
+	}
+	for _, cat := range s.CategoriesList {
+		for _, set := range cat.Settings {
+			value, err := set.normalizedValue()
+			if err != nil {
+				return fmt.Errorf("invalid setting %s.%s: %w", cat.Name, set.Key, err)
+			}
+			set.Value = value
+		}
+	}
+	return nil
+}
+
+func (s *Settings) validateRequiredSettings() error {
+	if s == nil {
+		return errors.New("settings cannot be nil")
+	}
+	s.initializeCategoriesList()
+	for _, cat := range s.CategoriesList {
+		for index, set := range cat.Settings {
+			if set == nil {
+				return fmt.Errorf("settings category %s contains null setting at index %d", cat.Name, index)
+			}
+		}
+	}
+	return nil
+}
+
+func (s *Setting) normalizedValue() (any, error) {
+	if s.Value == nil {
+		return nil, errors.New("value cannot be null")
+	}
+	switch s.Type {
+	case TypeBool:
+		switch s.Value.(type) {
+		case bool, int, int64, float64:
+			return Resolve[bool](s), nil
+		}
+	case TypeInt, TypeInt64:
+		bits := strconv.IntSize
+		if s.Type == TypeInt64 {
+			bits = 64
+		}
+		switch value := s.Value.(type) {
+		case int:
+		case int64:
+			if bits == 32 && (value < math.MinInt32 || value > math.MaxInt32) {
+				return nil, errors.New("integer out of range")
+			}
+		case float64:
+			limit := math.Ldexp(1, bits-1)
+			if math.Trunc(value) != value || !(value >= -limit && value < limit) {
+				return nil, errors.New("expected an integer within range")
+			}
+		default:
+			return nil, fmt.Errorf("expected %s value, got %T", s.Type, s.Value)
+		}
+		if s.Type == TypeInt {
+			return Resolve[int](s), nil
+		}
+		return Resolve[int64](s), nil
+	case TypeFloat64:
+		switch s.Value.(type) {
+		case int, int64, float32, float64:
+			return Resolve[float64](s), nil
+		}
+	case TypeString, TypeAuthToken, TypeLink:
+		if _, ok := s.Value.(string); ok {
+			return Resolve[string](s), nil
+		}
+	case TypeDuration:
+		switch value := s.Value.(type) {
+		case time.Duration, int, int64, float64:
+			return Resolve[time.Duration](s), nil
+		case string:
+			if _, err := time.ParseDuration(value); err == nil {
+				return Resolve[time.Duration](s), nil
+			}
+		}
+	default:
+		return s.Value, nil
+	}
+	return nil, fmt.Errorf("expected %s value, got %T", s.Type, s.Value)
+}
+
+// ValidateStrict validates an externally supplied settings snapshot without
+// silently replacing invalid values. It is used by the authenticated settings
+// API so malformed updates are rejected instead of partially applied.
+func (s *Settings) ValidateStrict(localPaths bool) error {
+	if err := s.validateRequiredSettings(); err != nil {
+		return err
+	}
+	for _, cat := range s.CategoriesList {
+		for _, set := range cat.Settings {
+			if !localPaths && set == s.General.DefaultDownloadDir {
+				continue // Directory accessibility belongs to the daemon filesystem.
+			}
+			if err := set.Validate(set.Value); err != nil {
+				return fmt.Errorf("invalid setting %s.%s: %w", cat.Name, set.Key, err)
+			}
+		}
+	}
+	for i := range s.Categories.Categories {
+		cat := &s.Categories.Categories[i]
+		if err := cat.Validate(); err != nil {
+			return fmt.Errorf("invalid category %q: %w", cat.Name, err)
+		}
+	}
+	return nil
+}
+
+// RequiresRestartComparedTo reports whether a setting marked as restart-only
+// changed between snapshots.
+func (s *Settings) RequiresRestartComparedTo(previous *Settings) bool {
+	if s == nil || previous == nil {
+		return false
+	}
+	for _, cat := range s.CategoriesList {
+		for _, set := range cat.Settings {
+			if !set.NeedsRestart {
+				continue
+			}
+			old := previous.FindSetting(cat.Name, set.Key)
+			if old != nil && !reflect.DeepEqual(old.Value, set.Value) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // ValidateDNSList checks if a comma-separated list of DNS servers (IP or IP:port) is valid.
@@ -986,45 +1331,206 @@ func ValidateDNSList(s string) error {
 	return nil
 }
 
-// SaveSettings saves settings to disk atomically.
-func SaveSettings(s *Settings) error {
-	path := GetSettingsPath()
+var jsonWriteMutex sync.Mutex
 
-	// Ensure directory exists
+// writeJSONAtomic marshals v as indented JSON and writes it to path atomically
+// using a temp-file-then-rename strategy.
+func writeJSONAtomic(path string, v any) error {
+	jsonWriteMutex.Lock()
+	defer jsonWriteMutex.Unlock()
+
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-
-	data, err := json.MarshalIndent(s, "", "  ")
+	data, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		return err
 	}
-
-	// Atomic write: write to temp file, then rename
-	tempPath := path + ".tmp"
-	if err := os.WriteFile(tempPath, data, 0o644); err != nil {
+	f, err := os.CreateTemp(filepath.Dir(path), "json-*.tmp")
+	if err != nil {
 		return err
 	}
+	tempPath := f.Name()
 
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tempPath)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tempPath)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tempPath)
+		return err
+	}
 	return os.Rename(tempPath, path)
+}
+
+var settingsWriteMutex sync.Mutex
+
+// writeTOMLAtomic marshals v as TOML and writes it to path atomically
+// using a temp-file-then-rename strategy.
+func writeTOMLAtomic(path string, v any) error {
+	settingsWriteMutex.Lock()
+	defer settingsWriteMutex.Unlock()
+
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	data, err := toml.Marshal(v)
+	if err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(filepath.Dir(path), "settings-*.tmp")
+	if err != nil {
+		return err
+	}
+	tempPath := f.Name()
+
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tempPath)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tempPath)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tempPath)
+		return err
+	}
+	return os.Rename(tempPath, path)
+}
+
+// SaveSettings saves settings to disk atomically.
+func SaveSettings(s *Settings) error {
+	raw := make(map[string]any)
+	for _, cat := range s.CategoriesList {
+		catKey := strings.ToLower(cat.Name)
+		if cat.Name == "Categories" {
+			catMap := make(map[string]any)
+			if set := s.FindSetting("Categories", "category_enabled"); set != nil {
+				catMap["category_enabled"] = set.Value
+			}
+			catsRaw := make([]map[string]any, 0, len(s.Categories.Categories))
+			for _, c := range s.Categories.Categories {
+				cMap := map[string]any{
+					"name":        c.Name,
+					"description": c.Description,
+					"pattern":     c.Pattern,
+					"path":        c.Path,
+				}
+				catsRaw = append(catsRaw, cMap)
+			}
+			catMap["categories"] = catsRaw
+			raw[catKey] = catMap
+			continue
+		}
+
+		catMap, ok := raw[catKey].(map[string]any)
+		if !ok {
+			catMap = make(map[string]any)
+		}
+		for _, set := range cat.Settings {
+			if set.Type == TypeDuration {
+				if d, ok := set.Value.(time.Duration); ok {
+					catMap[set.Key] = d.String()
+					continue
+				}
+			}
+			catMap[set.Key] = set.Value
+		}
+		raw[catKey] = catMap
+	}
+	return writeTOMLAtomic(GetSettingsPath(), raw)
+}
+
+// AddCategory adds a new custom download category and saves settings.
+func (s *Settings) AddCategory(name, pattern, path string) error {
+	for _, cat := range s.Categories.Categories {
+		if strings.EqualFold(cat.Name, name) {
+			return fmt.Errorf("%w: %q", ErrCategoryExists, name)
+		}
+	}
+	s.Categories.Categories = append(s.Categories.Categories, Category{
+		Name:    name,
+		Pattern: pattern,
+		Path:    path,
+	})
+	return SaveSettings(s)
+}
+
+// UpdateCategory updates an existing custom download category and saves settings.
+func (s *Settings) UpdateCategory(name, pattern, path string) error {
+	for i, cat := range s.Categories.Categories {
+		if strings.EqualFold(cat.Name, name) {
+			s.Categories.Categories[i].Pattern = pattern
+			s.Categories.Categories[i].Path = path
+			return SaveSettings(s)
+		}
+	}
+	return fmt.Errorf("category %q not found", name)
+}
+
+// RemoveCategory removes a custom download category by name and saves settings.
+func (s *Settings) RemoveCategory(name string) error {
+	found := false
+	var newCats []Category
+	for _, cat := range s.Categories.Categories {
+		if strings.EqualFold(cat.Name, name) {
+			found = true
+			continue
+		}
+		newCats = append(newCats, cat)
+	}
+
+	if !found {
+		return fmt.Errorf("category %q not found", name)
+	}
+
+	s.Categories.Categories = newCats
+	return SaveSettings(s)
 }
 
 // ToRuntimeConfig creates the engine runtime config from validated settings.
 func (s *Settings) ToRuntimeConfig() *types.RuntimeConfig {
+	var globalRate, defaultRate int64
+	if s.Network.GlobalRateLimit != nil {
+		var err error
+		globalRate, err = utils.ParseRateLimitValue(s.Network.GlobalRateLimit.Value)
+		if err != nil {
+			globalRate, _ = utils.ParseRateLimitValue(s.Network.GlobalRateLimit.DefaultValue)
+		}
+	}
+	if s.Network.DefaultDownloadRateLimit != nil {
+		var err error
+		defaultRate, err = utils.ParseRateLimitValue(s.Network.DefaultDownloadRateLimit.Value)
+		if err != nil {
+			defaultRate, _ = utils.ParseRateLimitValue(s.Network.DefaultDownloadRateLimit.DefaultValue)
+		}
+	}
 	return &types.RuntimeConfig{
-		MaxConnectionsPerDownload: Resolve[int](s.Network.MaxConnectionsPerDownload),
-		UserAgent:                 Resolve[string](s.Network.UserAgent),
-		ProxyURL:                  Resolve[string](s.Network.ProxyURL),
-		CustomDNS:                 Resolve[string](s.Network.CustomDNS),
-		SequentialDownload:        Resolve[bool](s.Network.SequentialDownload),
-		MinChunkSize:              Resolve[int64](s.Network.MinChunkSize),
-		WorkerBufferSize:          Resolve[int](s.Network.WorkerBufferSize),
-		DialHedgeCount:            Resolve[int](s.Network.DialHedgeCount),
-		MaxTaskRetries:            Resolve[int](s.Performance.MaxTaskRetries),
-		SlowWorkerThreshold:       Resolve[float64](s.Performance.SlowWorkerThreshold),
-		SlowWorkerGracePeriod:     Resolve[time.Duration](s.Performance.SlowWorkerGracePeriod),
-		StallTimeout:              Resolve[time.Duration](s.Performance.StallTimeout),
-		SpeedEmaAlpha:             Resolve[float64](s.Performance.SpeedEmaAlpha),
+		MaxConnectionsPerDownload:   Resolve[int](s.Network.MaxConnectionsPerDownload),
+		UserAgent:                   Resolve[string](s.Network.UserAgent),
+		ProxyURL:                    Resolve[string](s.Network.ProxyURL),
+		CustomDNS:                   Resolve[string](s.Network.CustomDNS),
+		SequentialDownload:          Resolve[bool](s.Network.SequentialDownload),
+		MinChunkSize:                Resolve[int64](s.Network.MinChunkSize),
+		GlobalRateLimitBps:          globalRate,
+		DefaultDownloadRateLimitBps: defaultRate,
+		WorkerBufferSize:            Resolve[int](s.Network.WorkerBufferSize),
+		DialHedgeCount:              Resolve[int](s.Network.DialHedgeCount),
+		MaxTaskRetries:              Resolve[int](s.Performance.MaxTaskRetries),
+		SlowWorkerThreshold:         Resolve[float64](s.Performance.SlowWorkerThreshold),
+		SlowWorkerGracePeriod:       Resolve[time.Duration](s.Performance.SlowWorkerGracePeriod),
+		StallTimeout:                Resolve[time.Duration](s.Performance.StallTimeout),
+		SpeedEmaAlpha:               Resolve[float64](s.Performance.SpeedEmaAlpha),
+		AdaptiveConcurrencyInterval: Resolve[time.Duration](s.Performance.AdaptiveConcurrencyInterval),
 	}
 }
 
@@ -1033,14 +1539,26 @@ func (s *Settings) Clone() *Settings {
 	if s == nil {
 		return nil
 	}
-	data, err := json.Marshal(s)
-	if err != nil {
-		utils.Debug("Warning: failed to marshal settings for Clone: %v", err)
-		return nil
-	}
 	cloned := DefaultSettings()
-	if err := json.Unmarshal(data, cloned); err != nil {
-		utils.Debug("Warning: failed to unmarshal settings for Clone: %v", err)
+
+	for _, clonedCat := range cloned.CategoriesList {
+		sourceCat := s.FindSettingsCategory(clonedCat.Name)
+		if sourceCat == nil {
+			continue
+		}
+		for _, clonedSetting := range clonedCat.Settings {
+			if sourceSetting := s.FindSetting(sourceCat.Name, clonedSetting.Key); sourceSetting != nil {
+				clonedSetting.Value = sourceSetting.Value
+			}
+		}
 	}
+
+	cloned.Categories.Categories = slices.Clone(s.Categories.Categories)
+
+	// Deep copy startup warnings
+	if len(s.StartupWarnings) > 0 {
+		cloned.StartupWarnings = append([]string(nil), s.StartupWarnings...)
+	}
+
 	return cloned
 }

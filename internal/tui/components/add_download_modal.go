@@ -20,6 +20,7 @@ type AddDownloadModal struct {
 	ShowURL         bool
 	URL             string
 	BrowseHintIndex int
+	BrowseHintKey   string
 	Help            help.Model
 	HelpKeys        help.KeyMap
 	BorderColor     color.Color
@@ -29,7 +30,7 @@ type AddDownloadModal struct {
 
 // View renders the inner content (without border box).
 func (m AddDownloadModal) View() string {
-	labelStyle := lipgloss.NewStyle().Width(10).Foreground(colors.LightGray())
+	labelStyle := lipgloss.NewStyle().Width(12).Foreground(colors.LightGray())
 	hintBase := lipgloss.NewStyle().MarginLeft(1).Foreground(colors.LightGray())
 	content := []string{""}
 
@@ -46,12 +47,12 @@ func (m AddDownloadModal) View() string {
 	for i := 0; i < len(m.Inputs) && i < len(m.Labels); i++ {
 		// Calculate available width for inputs
 		// Accounts for: horizontal padding (4), label (10), and box borders (2)
-		const labelWidth = 10
+		const labelWidth = 12
 		horizontalPadding := lipgloss.NewStyle().Padding(0, 2).GetHorizontalFrameSize()
 		inputW := m.Width - BorderFrameWidth - horizontalPadding - labelWidth
 
 		if m.BrowseHintIndex == i {
-			inputW -= 13 // Margin (1) + "[Tab] Browse" (12)
+			inputW -= lipgloss.Width(m.browseHint()) + 1
 		}
 		if inputW < 10 {
 			inputW = 10
@@ -59,19 +60,33 @@ func (m AddDownloadModal) View() string {
 		ti := m.Inputs[i]
 		ti.SetWidth(inputW)
 
-		row := lipgloss.JoinHorizontal(lipgloss.Left, labelStyle.Render(m.Labels[i]), ti.View())
+		label := "  " + m.Labels[i]
+		style := labelStyle
+		if m.FocusedInput == i {
+			label = "> " + m.Labels[i]
+			style = style.Foreground(colors.Pink()).Bold(true)
+		}
+		row := lipgloss.JoinHorizontal(lipgloss.Left, style.Render(label), ti.View())
 		if m.BrowseHintIndex == i {
 			hintStyle := hintBase
 			if m.FocusedInput == i {
 				hintStyle = hintStyle.Foreground(colors.Pink())
 			}
-			row = lipgloss.JoinHorizontal(lipgloss.Left, row, hintStyle.Render("[Tab] Browse"))
+			row = lipgloss.JoinHorizontal(lipgloss.Left, row, hintStyle.Render(m.browseHint()))
 		}
 		content = append(content, row, "")
 	}
 
 	content = append(content, m.Help.View(m.HelpKeys))
 	return lipgloss.NewStyle().Padding(0, 2).Render(lipgloss.JoinVertical(lipgloss.Left, content...))
+}
+
+func (m AddDownloadModal) browseHint() string {
+	key := m.BrowseHintKey
+	if key == "" {
+		key = "tab"
+	}
+	return "[" + key + "] Browse"
 }
 
 // RenderWithBtopBox renders the modal with btop-style border.

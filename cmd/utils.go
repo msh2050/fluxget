@@ -2,18 +2,21 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 
+	"github.com/msh2050/fluxget/internal/clioutput"
 	"github.com/msh2050/fluxget/internal/config"
-	"github.com/msh2050/fluxget/internal/engine/state"
-	"github.com/msh2050/fluxget/internal/engine/types"
+	"github.com/msh2050/fluxget/internal/store"
+	"github.com/msh2050/fluxget/internal/types"
 	"github.com/msh2050/fluxget/internal/utils"
 )
 
@@ -35,6 +38,19 @@ func readPortFile(runtimeDir string) int {
 	return port
 }
 
+var checkUserServiceRunning = isUserServiceRunning
+
+func readPIDFile(runtimeDir string) int {
+	pidFile := filepath.Join(runtimeDir, "pid")
+	data, err := os.ReadFile(pidFile)
+	if err != nil {
+		return 0
+	}
+	var pid int
+	_, _ = fmt.Sscanf(string(data), "%d", &pid)
+	return pid
+}
+
 func readStateToken(stateDir string) string {
 	token, err := readTokenFromFile(filepath.Join(stateDir, "token"))
 	if err != nil {
@@ -44,16 +60,10 @@ func readStateToken(stateDir string) string {
 }
 
 func activeConnectionCandidates() []activeConnectionDetails {
-	return []activeConnectionDetails{
-		{
-			runtimeDir: config.GetRuntimeDir(),
-			stateDir:   config.GetStateDir(),
-		},
-		{
-			runtimeDir: config.GetSystemRuntimeDir(),
-			stateDir:   config.GetSystemStateDir(),
-		},
-	}
+	return []activeConnectionDetails{{
+		runtimeDir: config.GetRuntimeDir(),
+		stateDir:   config.GetStateDir(),
+	}}
 }
 
 func getActiveConnectionDetails() (activeConnectionDetails, bool) {
@@ -69,8 +79,6 @@ func getActiveConnectionDetails() (activeConnectionDetails, bool) {
 	return activeConnectionDetails{}, false
 }
 
-// readActivePort reads the active port and keeps legacy callers on the same
-// user-first/system-fallback resolution path as token resolution.
 func readActivePort() int {
 	details, ok := getActiveConnectionDetails()
 	if !ok {
@@ -85,9 +93,19 @@ func ParseURLArg(arg string) (string, []string) {
 	parts := strings.Split(arg, ",")
 	var urls []string
 	for _, p := range parts {
-		if trimmed := strings.TrimSpace(p); trimmed != "" {
-			urls = append(urls, trimmed)
+		trimmed := strings.TrimSpace(p)
+		if trimmed == "" {
+			continue
 		}
+		// Only an http(s) URL starts a new mirror. A segment without a
+		// scheme means the comma lived inside the previous URL (e.g. the
+		// "formats=PNG,ITEM TILE,LOG" query in an archive.org compress link),
+		// so glue it back instead of treating it as a separate mirror.
+		if len(urls) > 0 && !startsNewMirror(trimmed) {
+			urls[len(urls)-1] += "," + trimmed
+			continue
+		}
+		urls = append(urls, trimmed)
 	}
 	if len(urls) == 0 {
 		return "", nil
@@ -95,21 +113,99 @@ func ParseURLArg(arg string) (string, []string) {
 	return urls[0], urls
 }
 
-func resolveLocalToken() string {
-	return resolveLocalTokenForDetails(activeConnectionDetails{})
+// startsNewMirror reports whether a comma-separated segment begins a new
+// mirror rather than continuing the previous URL. A valid scheme:// prefix is
+// a boundary even for unsupported schemes, so validation can reject those
+// mirrors instead of treating them as part of the preceding URL. Bare-scheme
+// query values like "http:" remain attached to the preceding URL.
+func startsNewMirror(segment string) bool {
+	schemeEnd := strings.Index(segment, "://")
+	if schemeEnd <= 0 {
+		return false
+	}
+
+	for i, r := range segment[:schemeEnd] {
+		isLetter := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')
+		isSchemeCharacter := isLetter ||
+			(i > 0 && ((r >= '0' && r <= '9') || r == '+' || r == '-' || r == '.'))
+		if !isSchemeCharacter {
+			return false
+		}
+	}
+	return true
 }
 
-func resolveLocalTokenForDetails(details activeConnectionDetails) string {
+// ValidateAndNormalizeURL ensures a provided download string has a valid URL scheme
+// and normalizes missing schemes for common domains.
+func ValidateAndNormalizeURL(rawURL string) (string, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "", fmt.Errorf("invalid URL format: %w", err)
+	}
+
+	if u.Scheme == "" {
+		// Could be a domain (e.g. example.com/file.zip or github.com/release/v1.0.0), try prepending https
+		if strings.Contains(rawURL, ".") {
+			return "https://" + rawURL, nil
+		}
+		return "", fmt.Errorf("missing or unsupported scheme (must be http:// or https://)")
+	}
+
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return "", fmt.Errorf("unsupported URL scheme: %s (must be http:// or https://)", u.Scheme)
+	}
+	if u.Hostname() == "" {
+		return "", fmt.Errorf("missing host")
+	}
+
+	return rawURL, nil
+}
+
+// parseAndNormalizeURLArg parses a URL argument and normalizes its primary URL
+// and mirrors before they are sent to the server.
+func parseAndNormalizeURLArg(arg string) (string, []string, error) {
+	primary, mirrors := ParseURLArg(arg)
+	if primary == "" {
+		return "", nil, nil
+	}
+
+	normalizedPrimary, err := ValidateAndNormalizeURL(primary)
+	if err != nil {
+		return "", nil, fmt.Errorf("invalid URL %q: %w", primary, err)
+	}
+
+	normalizedMirrors := make([]string, len(mirrors))
+	for i, mirror := range mirrors {
+		normalizedMirror, err := ValidateAndNormalizeURL(mirror)
+		if err != nil {
+			return "", nil, fmt.Errorf("invalid mirror %q: %w", mirror, err)
+		}
+		normalizedMirrors[i] = normalizedMirror
+	}
+
+	return normalizedPrimary, normalizedMirrors, nil
+}
+
+func resolveLocalToken() string {
+	token, _ := resolveLocalTokenForDetails(activeConnectionDetails{})
+	return token
+}
+
+func resolveLocalTokenForDetails(details activeConnectionDetails) (string, error) {
 	if token := strings.TrimSpace(globalToken); token != "" {
-		return token
+		return token, nil
 	}
 	if token := strings.TrimSpace(os.Getenv("SURGE_TOKEN")); token != "" {
-		return token
+		return token, nil
 	}
 	if token := strings.TrimSpace(details.token); token != "" {
-		return token
+		return token, nil
 	}
-	return ensureAuthToken()
+	if details.port != 0 {
+		return "", fmt.Errorf("local server is running on port %d but its token could not be read from %s", details.port, config.GetStateDir())
+	}
+	return ensureAuthToken(), nil
 }
 
 // resolveHostTarget returns the target host, prioritizing the --host flag over the SURGE_HOST environment variable.
@@ -142,7 +238,11 @@ func resolveAPIConnection(requireServer bool) (string, string, error) {
 	if target == "" {
 		details, ok := getActiveConnectionDetails()
 		if ok {
-			return fmt.Sprintf("http://127.0.0.1:%d", details.port), resolveLocalTokenForDetails(details), nil
+			token, err := resolveLocalTokenForDetails(details)
+			if err != nil {
+				return "", "", err
+			}
+			return fmt.Sprintf("http://127.0.0.1:%d", details.port), token, nil
 		}
 		if !requireServer {
 			return "", "", nil
@@ -163,8 +263,24 @@ func resolveAPIConnection(requireServer bool) (string, string, error) {
 }
 
 func doAPIRequest(method string, baseURL string, token string, path string, body io.Reader) (*http.Response, error) {
+	return doAPIRequestContext(context.Background(), method, baseURL, token, path, body)
+}
+
+func doAPIRequestContext(ctx context.Context, method string, baseURL string, token string, path string, body io.Reader) (*http.Response, error) {
+	client, err := newRemoteAPIHTTPClient()
+	if err != nil {
+		return nil, err
+	}
+	return doAPIRequestWithClientContext(ctx, client, method, baseURL, token, path, body)
+}
+
+func doAPIRequestWithClient(client *http.Client, method string, baseURL string, token string, path string, body io.Reader) (*http.Response, error) {
+	return doAPIRequestWithClientContext(context.Background(), client, method, baseURL, token, path, body)
+}
+
+func doAPIRequestWithClientContext(ctx context.Context, client *http.Client, method string, baseURL string, token string, path string, body io.Reader) (*http.Response, error) {
 	reqURL := fmt.Sprintf("%s%s", strings.TrimRight(baseURL, "/"), path)
-	req, err := http.NewRequest(method, reqURL, body)
+	req, err := http.NewRequestWithContext(ctx, method, reqURL, body)
 	if err != nil {
 		return nil, err
 	}
@@ -176,25 +292,74 @@ func doAPIRequest(method string, baseURL string, token string, path string, body
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	client, err := newRemoteAPIHTTPClient()
-	if err != nil {
-		return nil, err
-	}
 	return client.Do(req)
 }
 
 func sendToServer(url string, mirrors []string, outPath string, baseURL string, token string) error {
+	_, err := sendToServerWithApproval(url, mirrors, outPath, baseURL, token, true)
+	return err
+}
+
+// sendToServerWithApproval reports whether the request is awaiting TUI approval.
+func sendToServerWithApproval(url string, mirrors []string, outPath string, baseURL string, token string, skipApproval bool) (pendingApproval bool, err error) {
 	reqBody := DownloadRequest{
-		URL:     url,
-		Mirrors: mirrors,
-		Path:    outPath,
+		URL:          url,
+		Mirrors:      mirrors,
+		Path:         outPath,
+		SkipApproval: skipApproval,
 	}
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return false, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	resp, err := doAPIRequest(http.MethodPost, baseURL, token, "/download", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return false, fmt.Errorf("failed to connect to server: %w", err)
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			utils.Debug("Error closing response body: %v", err)
+		}
+	}()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
+		body, _ := io.ReadAll(resp.Body)
+		return false, fmt.Errorf("server error: %s - %s", resp.Status, string(body))
+	}
+
+	return resp.StatusCode == http.StatusAccepted, nil
+}
+
+func sendBatchToServer(urls []string, outPath string, baseURL string, token string, skipApproval bool) error {
+	reqBody := BatchDownloadRequest{
+		Path:         outPath,
+		SkipApproval: skipApproval,
+	}
+	for _, arg := range urls {
+		url, mirrors, err := parseAndNormalizeURLArg(arg)
+		if err != nil {
+			return err
+		}
+		if url == "" {
+			continue
+		}
+		reqBody.Downloads = append(reqBody.Downloads, DownloadRequest{
+			URL:     url,
+			Mirrors: mirrors,
+			Path:    outPath,
+		})
+	}
+	if len(reqBody.Downloads) == 0 {
+		return fmt.Errorf("no valid URLs to add")
+	}
+
 	jsonData, err := json.Marshal(reqBody)
 	if err != nil {
 		return fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	resp, err := doAPIRequest(http.MethodPost, baseURL, token, "/download", bytes.NewBuffer(jsonData))
+	resp, err := doAPIRequest(http.MethodPost, baseURL, token, "/download/batch", bytes.NewBuffer(jsonData))
 	if err != nil {
 		return fmt.Errorf("failed to connect to server: %w", err)
 	}
@@ -214,7 +379,11 @@ func sendToServer(url string, mirrors []string, outPath string, baseURL string, 
 
 // GetRemoteDownloads fetches all downloads from the running server
 func GetRemoteDownloads(baseURL string, token string) ([]types.DownloadStatus, error) {
-	resp, err := doAPIRequest(http.MethodGet, baseURL, token, "/list", nil)
+	return getRemoteDownloadsContext(context.Background(), baseURL, token)
+}
+
+func getRemoteDownloadsContext(ctx context.Context, baseURL, token string) ([]types.DownloadStatus, error) {
+	resp, err := doAPIRequestContext(ctx, http.MethodGet, baseURL, token, "/list", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -225,7 +394,7 @@ func GetRemoteDownloads(baseURL string, token string) ([]types.DownloadStatus, e
 	}()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("server returned status: %s", resp.Status)
+		return nil, remoteStatusError(resp.StatusCode, fmt.Errorf("server returned status: %s", resp.Status))
 	}
 
 	var statuses []types.DownloadStatus
@@ -248,7 +417,11 @@ func ExecuteAPIAction(rawID, endpoint, method, successMsg string) error {
 		return fmt.Errorf("failed to resolve download ID: %w", err)
 	}
 
-	resp, err := doAPIRequest(method, baseURL, token, fmt.Sprintf("%s/%s", endpoint, id), nil)
+	// The HTTP API expects the download id as the "id" query parameter (see
+	// withRequiredID in cmd/http_api.go); a path segment (e.g. /pause/<id>)
+	// doesn't match the registered routes and 404s. Matches the extension and
+	// internal/core/remote_service.go, which already use ?id=.
+	resp, err := doAPIRequest(method, baseURL, token, fmt.Sprintf("%s?id=%s", endpoint, url.QueryEscape(id)), nil)
 	if err != nil {
 		return fmt.Errorf("failed to send request to server: %w", err)
 	}
@@ -286,11 +459,12 @@ func resolveDownloadID(partialID string) (string, error) {
 	if baseURL != "" {
 		remoteDownloads, err := GetRemoteDownloads(baseURL, token)
 		if err != nil {
-			if strictRemote {
+			if !canUseHistory(err, strictRemote) {
 				return "", fmt.Errorf("failed to list remote downloads: %w", err)
 			}
 		} else {
 			appendCandidateIDs(&candidates, remoteDownloads)
+			return resolveIDFromCandidates(partialID, candidates)
 		}
 	}
 
@@ -299,7 +473,7 @@ func resolveDownloadID(partialID string) (string, error) {
 	}
 
 	// 2. Get all downloads from database
-	downloads, err := state.ListAllDownloads()
+	downloads, err := store.ListAllDownloads()
 	if err == nil {
 		for _, d := range downloads {
 			candidates = append(candidates, d.ID)
@@ -336,7 +510,7 @@ func resolveIDFromCandidates(partialID string, candidates []string) (string, err
 		return matches[0], nil
 	}
 	if len(matches) > 1 {
-		return "", fmt.Errorf("ambiguous ID prefix '%s' matches %d downloads", partialID, len(matches))
+		return "", clioutput.NewError(clioutput.Conflict, "The download ID prefix is ambiguous; use a longer ID.", fmt.Errorf("ambiguous ID prefix '%s' matches %d downloads", partialID, len(matches)))
 	}
 
 	return partialID, nil // No match, use as-is (will fail with "not found" later)

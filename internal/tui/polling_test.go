@@ -1,44 +1,31 @@
 package tui
 
 import (
-	"os"
-	"path/filepath"
+	"github.com/msh2050/fluxget/internal/orchestrator"
+	engineprogress "github.com/msh2050/fluxget/internal/progress"
+
 	"testing"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
-	"github.com/msh2050/fluxget/internal/core"
-	"github.com/msh2050/fluxget/internal/download"
-	"github.com/msh2050/fluxget/internal/engine/events"
-	"github.com/msh2050/fluxget/internal/engine/state"
-	"github.com/msh2050/fluxget/internal/engine/types"
-	"github.com/msh2050/fluxget/internal/processing"
+	"github.com/msh2050/fluxget/internal/service"
+	"github.com/msh2050/fluxget/internal/testutil"
+	"github.com/msh2050/fluxget/internal/types"
 )
 
 // TestStateSync verifies that the TUI uses the shared state object
 // from the worker, allowing external progress updates to be seen.
 func TestStateSync(t *testing.T) {
-	// Setup temp DB to avoid auto-resuming real downloads (which causes panic if pool is nil)
-	tmpDir, err := os.MkdirTemp("", "surge-test-sync")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = os.RemoveAll(tmpDir) }()
-
-	dbPath := filepath.Join(tmpDir, "surge.db")
-	state.Configure(dbPath)
-	defer state.CloseDB()
-
-	// Provide a dummy pool to avoid panics if logic tries to use it
-	progressChan := make(chan any, 10)
-	pool := download.NewWorkerPool(progressChan, 1)
+	_ = testutil.SetupStateDB(t)
 
 	// Initialize model with progress channel and service
-	m := InitialRootModel(1700, "test-version", core.NewLocalDownloadServiceWithInput(pool, progressChan), processing.NewLifecycleManager(nil, nil), false)
+	bus := orchestrator.NewEventBus()
+	mgr := orchestrator.NewLifecycleManager(nil, bus, nil)
+	m := InitialRootModel(1700, "dev", service.NewLocalDownloadService(mgr), mgr, nil, false)
 
 	downloadID := "external-id"
 	// Create the "worker" state - this is the source of truth
-	workerState := types.NewProgressState(downloadID, 1000)
+	workerState := engineprogress.New(downloadID, 1000)
 
 	p := tea.NewProgram(m, tea.WithoutRenderer(), tea.WithInput(nil))
 
@@ -47,20 +34,22 @@ func TestStateSync(t *testing.T) {
 		// Current implementation of DownloadStartedMsg doesn't carry state
 		// So TUI will create its own state (BUG).
 		time.Sleep(200 * time.Millisecond)
-		p.Send(events.DownloadStartedMsg{
+		p.Send(types.DownloadEvent{
+			Type:       types.EventStarted,
 			DownloadID: downloadID,
 			Filename:   "external.file",
 			Total:      1000,
 			URL:        "http://example.com/external",
 			DestPath:   "/tmp/external.file",
-			State:      workerState,
+			State:      &types.DownloadRecord{ProgressState: workerState},
 		})
 
 		// Simulate worker updating the state -> Send Progress Event
 		// Note: The ProgressReporter reads from VerifiedProgress (via GetProgress)
 		time.Sleep(300 * time.Millisecond)
-		workerState.VerifiedProgress.Store(500)
-		p.Send(events.ProgressMsg{
+		workerState.Bytes.VerifiedProgress.Store(500)
+		p.Send(types.DownloadEvent{
+			Type:       types.EventProgress,
 			DownloadID: downloadID,
 			Downloaded: 500,
 			Total:      1000,

@@ -51,14 +51,14 @@ function guessTitle(url) {
 // Parse HLS master playlist and return variants sorted best-first.
 // Returns [] if it's a media playlist (no #EXT-X-STREAM-INF).
 // Returns the parsed variants and whether the master declares subtitle tracks.
+// The fetch runs in the service worker (with the page's cookies).
 async function fetchHLSInfo(url) {
-  try {
-    const res = await fetch(url);
-    const body = await res.text();
-    const hasSubs = /#EXT-X-MEDIA[^\n]*TYPE=SUBTITLES/i.test(body);
-    if (!body.includes("#EXT-X-STREAM-INF")) return { variants: [], hasSubs };
-    return { variants: parseHLSVariantLines(body, url), hasSubs };
-  } catch { return { variants: [], hasSubs: false }; }
+  return new Promise(resolve => {
+    chrome.runtime.sendMessage({ action: "inspect_hls", url }, r => {
+      if (chrome.runtime.lastError || !r) resolve({ variants: [], hasSubs: false });
+      else resolve(r);
+    });
+  });
 }
 
 function parseHLSVariantLines(body, url) {
@@ -161,7 +161,7 @@ function renderList() {
           sel.innerHTML = "";
           variants.forEach((v, i) => {
             const o = document.createElement("option");
-            o.value = v.url;
+            o.value = String(v.height || "");
             o.textContent = v.height ? `${v.height}p` : `Stream ${i + 1}`;
             if (i === 0) o.textContent += " (Best)";
             sel.appendChild(o);
@@ -192,12 +192,10 @@ function renderList() {
     dlBtn.className = "dl-btn";
     dlBtn.innerHTML = "⬇ Download";
     dlBtn.addEventListener("click", () => {
-      // For HLS with real variant selected, override item URL with specific variant
-      const selectedVariantUrl = isHLS && sel.value ? sel.value : "";
-      const itemToDownload = selectedVariantUrl
-        ? { ...item, url: selectedVariantUrl }
-        : item;
-      downloadItem(itemToDownload, fmt, "");
+      // Quality = height cap applied to the master playlist, so the backend
+      // keeps the variant's separate audio track and the subtitles.
+      const maxHeight = isHLS && sel.value ? parseInt(sel.value, 10) || 0 : 0;
+      downloadItem(item, fmt, "", maxHeight);
     });
     row.appendChild(dlBtn);
 
@@ -211,13 +209,8 @@ function renderList() {
       subBtn.style.display = "none";
       subBtn.addEventListener("click", () => {
         const title = item.title || currentTabTitle || guessTitle(item.url);
-        const headers = {};
-        if (item.referer) headers["Referer"] = item.referer;
-        fetch(`${BASE_URL}/stream`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ url: item.url, title, headers, subtitles: true }),
-        }).catch(() => {});
+        chrome.runtime.sendMessage({ action: "send_stream", url: item.url, title,
+          opts: { referer: item.referer || currentTabUrl, subtitles: true } });
         subBtn.innerHTML = "✓ Subs";
         setTimeout(() => { subBtn.innerHTML = "💬 Subs"; }, 1500);
       });
@@ -241,42 +234,22 @@ function renderList() {
 }
 
 // ── Download ──────────────────────────────────────────────────────────────────
-async function downloadItem(item, fmt, ytFormat) {
+// All sends go through the service worker so cookies/User-Agent are attached
+// the same way as for in-page downloads.
+async function downloadItem(item, fmt, ytFormat, maxHeight = 0, audioOnly = false) {
   const isManifest  = fmt === "HLS" || fmt === "DASH";
   const isKnownHost = isKnownVideoSite(currentTabUrl);
-
-  // Title: prefer item title (set from page/tab title), then tab title, then guessed
   const title = item.title || currentTabTitle || guessTitle(item.url);
+  const referer = item.referer || currentTabUrl;
+  const send = (msg) => new Promise(resolve => chrome.runtime.sendMessage(msg, r => resolve(r)));
 
-  // Referer: required for CDN-protected streams
-  const headers = {};
-  if (item.referer) headers["Referer"] = item.referer;
-
-  // YouTube adaptive: send formats[] for native video+audio mux
-  if (item._ytFmts && item._ytFmts.length > 0) {
-    await fetch(`${BASE_URL}/stream`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url: item.url, title, formats: item._ytFmts, headers }),
-    });
-    return;
+  if ((item._ytFmts && item._ytFmts.length > 0) || isManifest || isKnownHost || /^(video|audio)\//i.test(item.type || "")) {
+    return send({ action: "send_stream", url: item.url, title, opts: {
+      referer, pageUrl: currentTabUrl, formats: item._ytFmts || [],
+      maxHeight, audioOnly, ytFormat: ytFormat || "",
+    } });
   }
-
-  const body = { url: item.url, title, ytFormat: ytFormat || "", headers };
-
-  if (isManifest || isKnownHost) {
-    await fetch(`${BASE_URL}/stream`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-  } else {
-    await fetch(`${BASE_URL}/download`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url: item.url, filename: title, headers }),
-    });
-  }
+  return send({ action: "download", url: item.url, filename: title, referer });
 }
 
 function isKnownVideoSite(url) {

@@ -5,17 +5,30 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
-	"github.com/msh2050/fluxget/internal/config"
-	"github.com/msh2050/fluxget/internal/core"
-	"github.com/msh2050/fluxget/internal/utils"
 	"github.com/google/uuid"
+	"github.com/msh2050/fluxget/internal/config"
+	"github.com/msh2050/fluxget/internal/service"
+	"github.com/msh2050/fluxget/internal/utils"
 )
 
+func resolveTokenPath() string {
+	return filepath.Join(config.GetStateDir(), "token")
+}
+
+func resolveRuntimeDir() string {
+	return config.GetRuntimeDir()
+}
+
 const serverBindHost = "0.0.0.0"
+
+const maxAPIRequestBodyBytes = 8 << 20
 
 // findAvailablePort tries ports starting from 'start' until one is available
 func findAvailablePort(start int) (int, net.Listener) {
@@ -47,12 +60,13 @@ func bindServerListener(portFlag int) (int, net.Listener, error) {
 
 // saveActivePort writes the active port for local CLI and extension discovery.
 func saveActivePort(port int) {
-	if err := os.MkdirAll(config.GetRuntimeDir(), 0o755); err != nil {
+	runtimeDir := resolveRuntimeDir()
+	if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
 		utils.Debug("Error creating runtime directory for port file: %v", err)
 		return
 	}
 
-	portFile := filepath.Join(config.GetRuntimeDir(), "port")
+	portFile := filepath.Join(runtimeDir, "port")
 	if err := os.WriteFile(portFile, []byte(fmt.Sprintf("%d", port)), 0o644); err != nil {
 		utils.Debug("Error writing port file: %v", err)
 	}
@@ -61,14 +75,20 @@ func saveActivePort(port int) {
 
 // removeActivePort cleans up the port file on exit
 func removeActivePort() {
-	portFile := filepath.Join(config.GetRuntimeDir(), "port")
+	portFile := filepath.Join(resolveRuntimeDir(), "port")
 	if err := os.Remove(portFile); err != nil && !os.IsNotExist(err) {
 		utils.Debug("Error removing port file: %v", err)
 	}
 }
 
+var (
+	globalHTTPServer   *http.Server
+	globalHTTPServerMu sync.Mutex
+	activeServerMode   = "local"
+)
+
 // startHTTPServer starts the HTTP server using an existing listener
-func startHTTPServer(ln net.Listener, port int, defaultOutputDir string, service core.DownloadService, tokenOverride string) {
+func startHTTPServer(ln net.Listener, port int, defaultOutputDir string, service service.DownloadService, tokenOverride string) {
 	authToken := strings.TrimSpace(tokenOverride)
 	if authToken == "" {
 		authToken = ensureAuthToken()
@@ -80,12 +100,27 @@ func startHTTPServer(ln net.Listener, port int, defaultOutputDir string, service
 	registerHTTPRoutes(mux, port, defaultOutputDir, service)
 
 	// Wrap mux with Auth and CORS (CORS outermost to ensure 401/403 include headers)
-	handler := corsMiddleware(authMiddleware(authToken, mux))
+	handler := corsMiddleware(authMiddleware(authToken, limitAPIRequestBody(mux)))
 
-	server := &http.Server{Handler: handler}
+	server := &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	globalHTTPServerMu.Lock()
+	globalHTTPServer = server
+	globalHTTPServerMu.Unlock()
 	if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
 		utils.Debug("HTTP server error: %v", err)
 	}
+}
+
+func limitAPIRequestBody(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, maxAPIRequestBodyBytes)
+		next.ServeHTTP(w, r)
+	})
 }
 
 func corsMiddleware(next http.Handler) http.Handler {
@@ -129,8 +164,16 @@ func authMiddleware(token string, next http.Handler) http.Handler {
 			return
 		}
 
-		// Loopback connections (browser extension on same machine) bypass token auth
+		// Loopback connections (browser extension on same machine) bypass token
+		// auth — but only for non-browser clients, the FluxGet extension, the
+		// dashboard itself and the desktop GUI. Without this, any web page the
+		// user visits could POST to 127.0.0.1 and download files to arbitrary
+		// folders (drive-by request forgery).
 		if isLoopback(r) {
+			if !loopbackOriginAllowed(r) {
+				http.Error(w, "Forbidden: cross-origin request from "+r.Header.Get("Origin"), http.StatusForbidden)
+				return
+			}
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -158,23 +201,22 @@ func authMiddleware(token string, next http.Handler) http.Handler {
 }
 
 func ensureAuthToken() string {
-	stateTokenFile := filepath.Join(config.GetStateDir(), "token")
-	if token, err := readTokenFromFile(stateTokenFile); err == nil {
+	tokenFile := resolveTokenPath()
+	if token, err := readTokenFromFile(tokenFile); err == nil {
 		return token
 	}
 
 	token := uuid.New().String()
-	if err := writeTokenToFile(stateTokenFile, token); err != nil {
-		utils.Debug("Failed to write token file in state dir: %v", err)
+	if err := writeTokenToFile(tokenFile, token); err != nil {
+		utils.Debug("Failed to write token file in %s: %v", tokenFile, err)
 	}
 	return token
 }
 
 func persistAuthToken(token string) {
-	stateTokenFile := filepath.Join(config.GetStateDir(), "token")
-
-	if err := writeTokenToFile(stateTokenFile, token); err != nil {
-		utils.Debug("Failed to write token file in state dir: %v", err)
+	tokenFile := resolveTokenPath()
+	if err := writeTokenToFile(tokenFile, token); err != nil {
+		utils.Debug("Failed to write token file in %s: %v", tokenFile, err)
 	}
 }
 
@@ -194,5 +236,42 @@ func writeTokenToFile(path string, token string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(path, []byte(token), 0o600)
+	if err := os.WriteFile(path, []byte(token), 0o600); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o600)
+}
+
+// loopbackOriginAllowed decides whether a loopback request may skip token auth
+// based on the browser-supplied Origin / Sec-Fetch-Site headers.
+func loopbackOriginAllowed(r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		// Non-browser clients (CLI, curl, GUI proxy) send no Origin. Browsers
+		// omit it on simple GETs; reject those only when they are flagged as
+		// cross-site navigations/subresources.
+		return !strings.EqualFold(r.Header.Get("Sec-Fetch-Site"), "cross-site")
+	}
+	u, err := url.Parse(origin)
+	if err != nil || origin == "null" {
+		return false
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "chrome-extension", "moz-extension", "safari-web-extension", "extension", "wails":
+		return true
+	case "http", "https":
+	default:
+		return false
+	}
+	host := u.Hostname()
+	if strings.EqualFold(u.Host, r.Host) {
+		return true // same-origin: the /ui dashboard
+	}
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true // desktop GUI (wails.localhost) and local dev servers
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return true
+	}
+	return false
 }

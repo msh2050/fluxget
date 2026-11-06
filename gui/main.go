@@ -25,26 +25,24 @@ var windowIcon []byte
 var apiPaths = []string{
 	"/events", "/list", "/history", "/pause", "/resume",
 	"/delete", "/download", "/stream", "/health", "/open-file", "/open-folder",
-	"/update-url", "/settings",
+	"/update-url", "/settings", "/gui/settings", "/ytdlp", "/ui",
 }
 
 func backendProxy() func(http.Handler) http.Handler {
 	target, _ := url.Parse("http://localhost:1700")
-	proxy := httputil.NewSingleHostReverseProxy(target)
-	// httputil.ReverseProxy adds X-Forwarded-For by default. The backend's
-	// open-file/open-folder guard rejects requests that have this header even
-	// when the underlying connection is loopback. Strip it so the backend sees
-	// a pure loopback request and allows the action.
-	//
-	// NOTE: a plain Header.Del here does NOT work — ReverseProxy.ServeHTTP runs
-	// after Director and re-populates X-Forwarded-For with the client IP. The
-	// documented way to suppress it entirely is to set the header to nil (see
-	// Go issue 38079); the proxy then omits it instead of overwriting.
-	orig := proxy.Director
-	proxy.Director = func(req *http.Request) {
-		orig(req)
-		req.Header["X-Forwarded-For"] = nil
-		req.Header.Del("X-Real-IP")
+	// Rewrite (not the deprecated Director): unlike Director it never adds
+	// X-Forwarded-For and strips inbound X-Forwarded-* headers. The backend's
+	// open-file/open-folder guard rejects requests carrying those even over
+	// loopback, so the proxied call must look like a plain local client.
+	proxy := &httputil.ReverseProxy{
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			pr.SetURL(target)
+			pr.Out.Header.Del("X-Real-IP")
+			// The webview's own origin is trusted; drop it so the backend's
+			// cross-origin guard treats this as a local client.
+			pr.Out.Header.Del("Origin")
+			pr.Out.Header.Del("Sec-Fetch-Site")
+		},
 	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -71,7 +69,7 @@ func main() {
 			Assets:     assets,
 			Middleware: backendProxy(),
 		},
-		BackgroundColour:   &options.RGBA{R: 11, G: 11, B: 12, A: 255},
+		BackgroundColour:  &options.RGBA{R: 11, G: 11, B: 12, A: 255},
 		HideWindowOnClose: true,
 		// Prevent a second tray icon / engine: if FluxGet is already running
 		// (e.g. GNOME session-restore plus the XDG autostart entry both fire on
@@ -83,9 +81,9 @@ func main() {
 				wailsruntime.WindowUnminimise(app.ctx)
 			},
 		},
-		OnStartup:         app.startup,
-		OnShutdown:        app.shutdown,
-		Bind:             []interface{}{app},
+		OnStartup:  app.startup,
+		OnShutdown: app.shutdown,
+		Bind:       []interface{}{app},
 		Linux: &linux.Options{
 			ProgramName:         "fluxget-gui",
 			Icon:                windowIcon,

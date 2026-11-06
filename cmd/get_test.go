@@ -4,27 +4,27 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/msh2050/fluxget/internal/core"
-	"github.com/msh2050/fluxget/internal/download"
-	"github.com/msh2050/fluxget/internal/engine/state"
-	"github.com/msh2050/fluxget/internal/engine/types"
-	"github.com/msh2050/fluxget/internal/processing"
+	"github.com/msh2050/fluxget/internal/orchestrator"
+	"github.com/msh2050/fluxget/internal/scheduler"
+	"github.com/msh2050/fluxget/internal/service"
+	"github.com/msh2050/fluxget/internal/store"
+	"github.com/msh2050/fluxget/internal/testutil"
+	"github.com/msh2050/fluxget/internal/types"
 )
 
-func startAuthedTestServer(t *testing.T, service core.DownloadService, token string) string {
+func startAuthedTestServer(t *testing.T, service service.DownloadService, token string) string {
 	t.Helper()
 
 	mux := http.NewServeMux()
 	registerHTTPRoutes(mux, 0, "", service)
 	handler := corsMiddleware(authMiddleware(token, mux))
 
-	server := httptest.NewServer(handler)
+	server := testutil.NewHTTPServerT(t, handler)
 	t.Cleanup(server.Close)
 	return server.URL
 }
@@ -32,19 +32,30 @@ func startAuthedTestServer(t *testing.T, service core.DownloadService, token str
 func TestCLI_DeleteEndpoint_CleansPausedStateAndPartialFile(t *testing.T) {
 	tempDir := setupXDGEnvIsolation(t)
 
-	state.CloseDB()
+	store.CloseDB()
 	if err := initializeGlobalState(); err != nil {
 		t.Fatalf("initializeGlobalState failed: %v", err)
 	}
 
-	GlobalProgressCh = make(chan any, 100)
-	GlobalPool = download.NewWorkerPool(GlobalProgressCh, 2)
+	GlobalProgressCh = make(chan types.DownloadEvent, 100)
+	if GlobalPool != nil {
+		GlobalPool.GracefulShutdown()
+	}
+	tmpPool := scheduler.New(GlobalProgressCh, 2)
+	t.Cleanup(func() {
+		if tmpPool != nil {
+			tmpPool.GracefulShutdown()
+		}
+	})
+	GlobalPool = tmpPool
 
 	// Start server
-	svc := core.NewLocalDownloadService(GlobalPool)
+	eventBus := orchestrator.NewEventBus()
+	t.Cleanup(func() { eventBus.Shutdown() })
+	getAll := func() []types.DownloadRecord { return GlobalPool.GetAll() }
+	lifecycle := orchestrator.NewLifecycleManager(GlobalPool, eventBus, nil, buildActiveDownloadChecker(getAll))
+	svc := service.NewLocalDownloadService(lifecycle)
 	t.Cleanup(func() { _ = svc.Shutdown() })
-
-	lifecycle := processing.NewLifecycleManager(nil, nil)
 	stream, streamCleanup, err := svc.StreamEvents(context.Background())
 	if err != nil {
 		t.Fatalf("failed to open event stream: %v", err)
@@ -85,7 +96,19 @@ func TestCLI_DeleteEndpoint_CleansPausedStateAndPartialFile(t *testing.T) {
 		t.Fatalf("failed to create partial file: %v", err)
 	}
 
-	if err := state.SaveState(url, destPath, &types.DownloadState{
+	if err := store.AddToMasterList(types.DownloadRecord{
+		ID:         id,
+		URL:        url,
+		DestPath:   destPath,
+		Filename:   "file.bin",
+		Status:     "paused",
+		TotalSize:  1000,
+		Downloaded: 250,
+	}); err != nil {
+		t.Fatalf("failed to seed master list: %v", err)
+	}
+
+	if err := store.SaveState(url, destPath, &types.DownloadRecord{
 		ID:         id,
 		URL:        url,
 		DestPath:   destPath,
@@ -120,7 +143,7 @@ func TestCLI_DeleteEndpoint_CleansPausedStateAndPartialFile(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		_, statErr := os.Stat(incompletePath)
-		entry, dbErr := state.GetDownload(id)
+		entry, dbErr := store.GetDownload(id)
 		if dbErr != nil {
 			t.Fatalf("failed to query entry after delete: %v", dbErr)
 		}
@@ -133,7 +156,7 @@ func TestCLI_DeleteEndpoint_CleansPausedStateAndPartialFile(t *testing.T) {
 	if _, err := os.Stat(incompletePath); !os.IsNotExist(err) {
 		t.Fatalf("expected partial file to be deleted, stat err: %v", err)
 	}
-	entry, err := state.GetDownload(id)
+	entry, err := store.GetDownload(id)
 	if err != nil {
 		t.Fatalf("failed to query entry after delete: %v", err)
 	}

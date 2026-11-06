@@ -1,45 +1,356 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	tea "charm.land/bubbletea/v2"
 	"github.com/msh2050/fluxget/internal/config"
-	"github.com/msh2050/fluxget/internal/core"
-	"github.com/msh2050/fluxget/internal/engine/events"
-	"github.com/msh2050/fluxget/internal/engine/types"
+	"github.com/msh2050/fluxget/internal/orchestrator"
+	"github.com/msh2050/fluxget/internal/scheduler"
+	"github.com/msh2050/fluxget/internal/service"
+	"github.com/msh2050/fluxget/internal/testutil"
+	"github.com/msh2050/fluxget/internal/types"
+	"github.com/msh2050/fluxget/internal/utils"
 )
 
+func TestPostSettingsAppliesDefaultDownloadDirToRunningLifecycle(t *testing.T) {
+	setupIsolatedCmdState(t)
+	originalSettings := globalSettings
+	originalLifecycle := GlobalLifecycle
+	originalService := GlobalService
+	originalPool := GlobalPool
+	originalProgressCh := GlobalProgressCh
+	originalCleanup := GlobalLifecycleCleanup
+	t.Cleanup(func() {
+		if GlobalLifecycleCleanup != nil {
+			GlobalLifecycleCleanup()
+			GlobalLifecycleCleanup = nil
+		}
+		if GlobalService != nil {
+			_ = GlobalService.Shutdown()
+			GlobalService = nil
+		}
+		globalSettings = originalSettings
+		GlobalLifecycle = originalLifecycle
+		GlobalService = originalService
+		GlobalPool = originalPool
+		GlobalProgressCh = originalProgressCh
+		GlobalLifecycleCleanup = originalCleanup
+	})
+
+	initial := config.DefaultSettings()
+	initial.General.DefaultDownloadDir.Value = t.TempDir()
+	globalSettings = initial
+
+	eventBus := orchestrator.NewEventBus()
+	t.Cleanup(func() { eventBus.Shutdown() })
+	GlobalProgressCh = eventBus.InputCh
+	if GlobalPool != nil {
+		GlobalPool.GracefulShutdown()
+	}
+	pool := scheduler.New(GlobalProgressCh, 1)
+	t.Cleanup(func() {
+		if pool != nil {
+			pool.GracefulShutdown()
+		}
+	})
+	GlobalPool = pool
+	getAll := func() []types.DownloadRecord { return GlobalPool.GetAll() }
+	lifecycle := orchestrator.NewLifecycleManager(GlobalPool, eventBus, initial, buildActiveDownloadChecker(getAll))
+	t.Cleanup(func() { lifecycle.Shutdown() })
+	GlobalLifecycle = lifecycle
+	localService := service.NewLocalDownloadService(GlobalLifecycle)
+	GlobalService = localService
+
+	if err := ensureGlobalLocalServiceAndLifecycle(); err != nil {
+		t.Fatalf("ensureGlobalLocalServiceAndLifecycle failed: %v", err)
+	}
+
+	updatedDir := t.TempDir()
+	updated := initial.Clone()
+	updated.General.DefaultDownloadDir.Value = updatedDir
+	body, err := json.Marshal(updated)
+	if err != nil {
+		t.Fatalf("marshal settings: %v", err)
+	}
+	mux := http.NewServeMux()
+	registerHTTPRoutes(mux, 0, "", localService)
+	recorder := httptest.NewRecorder()
+	mux.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/settings", bytes.NewReader(body)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("POST /settings returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+
+	const filename = "settings-updated.bin"
+	const fileSize = int64(16 * 1024)
+	downloader := testutil.NewStreamingMockServerT(t, fileSize,
+		testutil.WithFilename(filename), testutil.WithRangeSupport(true))
+	defer downloader.Close()
+	downloadBody, err := json.Marshal(map[string]string{"url": downloader.URL() + "/" + filename})
+	if err != nil {
+		t.Fatalf("marshal download request: %v", err)
+	}
+	downloadRecorder := httptest.NewRecorder()
+	mux.ServeHTTP(downloadRecorder, httptest.NewRequest(http.MethodPost, "/download", bytes.NewReader(downloadBody)))
+	if downloadRecorder.Code != http.StatusOK {
+		t.Fatalf("POST /download returned %d: %s", downloadRecorder.Code, downloadRecorder.Body.String())
+	}
+	wantPath := filepath.Join(updatedDir, filename)
+	deadline := time.Now().Add(10 * time.Second)
+	var downloaded bool
+	for time.Now().Before(deadline) {
+		if info, err := os.Stat(wantPath); err == nil && info.Size() == fileSize {
+			downloaded = true
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if !downloaded {
+		t.Fatalf("download did not complete at %s", wantPath)
+	}
+
+	lifecycle.ApplySettings(initial)
+	globalSettings = initial
+	reloadRecorder := httptest.NewRecorder()
+	mux.ServeHTTP(reloadRecorder, httptest.NewRequest(http.MethodPost, "/settings/reload", nil))
+	if reloadRecorder.Code != http.StatusOK {
+		t.Fatalf("POST /settings/reload returned %d: %s", reloadRecorder.Code, reloadRecorder.Body.String())
+	}
+	if got := config.Resolve[string](lifecycle.GetSettings().General.DefaultDownloadDir); got != updatedDir {
+		t.Fatalf("lifecycle retained default directory %q after reload, want %q", got, updatedDir)
+	}
+}
+
+func TestHTTPSettingsRejectsInvalidUpdatesAndKeepsConcurrentChanges(t *testing.T) {
+	setupIsolatedCmdState(t)
+	previousSettings, previousLifecycle := globalSettings, GlobalLifecycle
+	initial := config.DefaultSettings()
+	globalSettings = initial
+	lifecycle := orchestrator.NewLifecycleManager(nil, nil, initial)
+	GlobalLifecycle = lifecycle
+	t.Cleanup(func() {
+		GlobalLifecycle = previousLifecycle
+		globalSettings = previousSettings
+		lifecycle.Shutdown()
+	})
+
+	mux := http.NewServeMux()
+	registerHTTPRoutes(mux, 0, "", service.NewLocalDownloadService(lifecycle))
+	post := func(body string) *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		mux.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/settings", strings.NewReader(body)))
+		return recorder
+	}
+
+	for _, body := range []string{
+		`{"network":{"max_connections_per_host":1000}}`,
+		`{"network":{"max_connections_per_host":null}}`,
+		`{"general":{"auto_resume":"yes"}}`,
+		`null`,
+		`{} {}`,
+	} {
+		if response := post(body); response.Code != http.StatusBadRequest {
+			t.Fatalf("POST %s returned %d, want 400: %s", body, response.Code, response.Body.String())
+		}
+		if got := config.Resolve[int](lifecycle.GetSettings().Network.MaxConnectionsPerDownload); got != types.PerDownloadMax {
+			t.Fatalf("invalid POST changed active max connections to %d", got)
+		}
+		if _, err := os.Stat(config.GetSettingsPath()); !os.IsNotExist(err) {
+			t.Fatalf("invalid POST wrote settings file: %v", err)
+		}
+	}
+
+	const updates = 20
+	for i := 0; i < updates; i++ {
+		wantConnections, wantDownloads := 8+i%2, 4+i%2
+		start := make(chan struct{})
+		results := make(chan *httptest.ResponseRecorder, 3)
+		for _, body := range []string{
+			fmt.Sprintf(`{"network":{"max_connections_per_host":%d}}`, wantConnections),
+			fmt.Sprintf(`{"network":{"max_concurrent_downloads":%d}}`, wantDownloads),
+		} {
+			go func(body string) {
+				<-start
+				results <- post(body)
+			}(body)
+		}
+		go func() {
+			<-start
+			recorder := httptest.NewRecorder()
+			mux.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/settings", nil))
+			results <- recorder
+		}()
+		close(start)
+		for j := 0; j < 3; j++ {
+			response := <-results
+			if response.Code != http.StatusOK {
+				t.Fatalf("concurrent settings request returned %d: %s", response.Code, response.Body.String())
+			}
+		}
+		settings := lifecycle.GetSettings()
+		if got := config.Resolve[int](settings.Network.MaxConnectionsPerDownload); got != wantConnections {
+			t.Fatalf("max connections = %d, want %d", got, wantConnections)
+		}
+		if got := config.Resolve[int](settings.Network.MaxConcurrentDownloads); got != wantDownloads {
+			t.Fatalf("max downloads = %d, want %d", got, wantDownloads)
+		}
+	}
+
+	stored, err := config.LoadSettings()
+	if err != nil {
+		t.Fatalf("load saved settings: %v", err)
+	}
+	if got := config.Resolve[int](stored.Network.MaxConnectionsPerDownload); got != 9 {
+		t.Fatalf("saved max connections = %d, want 9", got)
+	}
+	if got := config.Resolve[int](stored.Network.MaxConcurrentDownloads); got != 5 {
+		t.Fatalf("saved max downloads = %d, want 5", got)
+	}
+}
+
+func TestHTTPSettingsAppliesGlobalRateLimit(t *testing.T) {
+	setupIsolatedCmdState(t)
+	previousSettings, previousLifecycle := globalSettings, GlobalLifecycle
+	initial := config.DefaultSettings()
+	initial.Network.GlobalRateLimit.Value = "128 B/s"
+	globalSettings = initial
+
+	pool := scheduler.New(make(chan types.DownloadEvent, 1), 1)
+	lifecycle := orchestrator.NewLifecycleManager(pool, nil, initial)
+	GlobalLifecycle = lifecycle
+	t.Cleanup(func() {
+		GlobalLifecycle = previousLifecycle
+		globalSettings = previousSettings
+		lifecycle.Shutdown()
+	})
+	if got := pool.GlobalRateLimit(); got != 128 {
+		t.Fatalf("initial global rate limit = %d, want 128", got)
+	}
+
+	mux := http.NewServeMux()
+	registerHTTPRoutes(mux, 0, "", service.NewLocalDownloadService(lifecycle))
+	post := func(path, body string, wantStatus int) {
+		t.Helper()
+		response := httptest.NewRecorder()
+		mux.ServeHTTP(response, httptest.NewRequest(http.MethodPost, path, strings.NewReader(body)))
+		if response.Code != wantStatus {
+			t.Fatalf("POST %s returned %d, want %d: %s", path, response.Code, wantStatus, response.Body.String())
+		}
+	}
+
+	post("/settings", `{"network":{"global_rate_limit":"256 B/s"}}`, http.StatusOK)
+	if got := pool.GlobalRateLimit(); got != 256 {
+		t.Fatalf("global rate limit after update = %d, want 256", got)
+	}
+	post("/settings", `{"network":{"global_rate_limit":"invalid"}}`, http.StatusBadRequest)
+	if got := pool.GlobalRateLimit(); got != 256 {
+		t.Fatalf("global rate limit after invalid update = %d, want 256", got)
+	}
+
+	saved := lifecycle.GetSettings()
+	saved.Network.GlobalRateLimit.Value = "512 B/s"
+	if err := config.SaveSettings(saved); err != nil {
+		t.Fatalf("save settings for reload: %v", err)
+	}
+	post("/settings/reload", "", http.StatusOK)
+	if got := pool.GlobalRateLimit(); got != 512 {
+		t.Fatalf("global rate limit after reload = %d, want 512", got)
+	}
+	post("/settings", `{"network":{"global_rate_limit":"0"}}`, http.StatusOK)
+	if got := pool.GlobalRateLimit(); got != 0 {
+		t.Fatalf("global rate limit after disabling = %d, want 0", got)
+	}
+}
+
 type httpAPITestService struct {
-	history      []types.DownloadEntry
-	historyErr   error
-	statusByID   map[string]*types.DownloadStatus
-	getStatusErr error
-	streamMsgs   []interface{}
+	history               []types.DownloadRecord
+	historyErr            error
+	statusByID            map[string]*types.DownloadStatus
+	getStatusErr          error
+	streamMsgs            []types.DownloadEvent
+	rateLimitCalls        []string
+	rateLimitValues       map[string]int64
+	clearRateLimitID      []string
+	setRateLimitErr       error
+	clearRateLimitErr     error
+	clearCompletedReturns int64
+	clearFailedReturns    int64
+	clearCompletedErr     error
+	clearFailedErr        error
+}
+
+type settingsHTTPTestService struct {
+	*httpAPITestService
+	mu          sync.Mutex
+	settings    *config.Settings
+	updateCalls int
+}
+
+func (s *settingsHTTPTestService) GetSettings() (*config.Settings, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.settings.Clone(), nil
+}
+
+func (s *settingsHTTPTestService) UpdateSettings(settings *config.Settings) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.settings = settings.Clone()
+	s.updateCalls++
+	return nil
+}
+
+func (s *settingsHTTPTestService) PatchSettings(patch config.SettingsPatch) (*config.Settings, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	settings, err := patch.Apply(s.settings)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", service.ErrInvalidSettings, err)
+	}
+	if err := settings.ValidateStrict(true); err != nil {
+		return nil, fmt.Errorf("%w: %w", service.ErrInvalidSettings, err)
+	}
+	s.settings = settings
+	s.updateCalls++
+	return settings.Clone(), nil
+}
+
+func newRateLimitTestService() *httpAPITestService {
+	return &httpAPITestService{
+		rateLimitCalls:  make([]string, 0),
+		rateLimitValues: make(map[string]int64),
+	}
 }
 
 func (s *httpAPITestService) List() ([]types.DownloadStatus, error) {
 	return nil, nil
 }
 
-func (s *httpAPITestService) History() ([]types.DownloadEntry, error) {
+func (s *httpAPITestService) History() ([]types.DownloadRecord, error) {
 	if s.historyErr != nil {
 		return nil, s.historyErr
 	}
 	return s.history, nil
 }
 
-func (s *httpAPITestService) Add(string, string, string, []string, map[string]string, bool, int64, bool) (string, error) {
+func (s *httpAPITestService) Add(string, string, string, []string, map[string]string, bool, int, int64) (string, error) {
 	return "", errors.New("not implemented")
 }
 
-func (s *httpAPITestService) AddWithID(string, string, string, []string, map[string]string, string, int64, bool) (string, error) {
+func (s *httpAPITestService) AddWithID(string, string, string, []string, map[string]string, string, bool, int, int64) (string, error) {
 	return "", errors.New("not implemented")
 }
 
@@ -62,9 +373,12 @@ func (s *httpAPITestService) UpdateURL(string, string) error {
 func (s *httpAPITestService) Delete(string) error {
 	return nil
 }
+func (s *httpAPITestService) Purge(string) error {
+	return nil
+}
 
-func (s *httpAPITestService) StreamEvents(context.Context) (<-chan interface{}, func(), error) {
-	channel := make(chan interface{}, len(s.streamMsgs))
+func (s *httpAPITestService) StreamEvents(context.Context) (<-chan types.DownloadEvent, func(), error) {
+	channel := make(chan types.DownloadEvent, len(s.streamMsgs))
 	for _, msg := range s.streamMsgs {
 		channel <- msg
 	}
@@ -73,8 +387,34 @@ func (s *httpAPITestService) StreamEvents(context.Context) (<-chan interface{}, 
 	return channel, cleanup, nil
 }
 
-func (s *httpAPITestService) Publish(interface{}) error {
+func (s *httpAPITestService) Publish(types.DownloadEvent) error {
 	return nil
+}
+
+type publishRecordingHTTPService struct {
+	*httpAPITestService
+	published []types.DownloadEvent
+}
+
+func (s *publishRecordingHTTPService) Publish(msg types.DownloadEvent) error {
+	s.published = append(s.published, msg)
+	return nil
+}
+
+type batchAddRecordingService struct {
+	*httpAPITestService
+	added    []string
+	explicit []bool
+	failOn   string
+}
+
+func (s *batchAddRecordingService) Add(url string, _ string, _ string, _ []string, _ map[string]string, explicit bool, _ int, _ int64) (string, error) {
+	if url == s.failOn {
+		return "", errors.New("enqueue failed")
+	}
+	s.added = append(s.added, url)
+	s.explicit = append(s.explicit, explicit)
+	return "id-" + url, nil
 }
 
 func (s *httpAPITestService) GetStatus(id string) (*types.DownloadStatus, error) {
@@ -95,7 +435,57 @@ func (s *httpAPITestService) Shutdown() error {
 	return nil
 }
 
+func (s *httpAPITestService) ClearCompleted() (int64, error) {
+	if s.clearCompletedErr != nil {
+		return 0, s.clearCompletedErr
+	}
+	return s.clearCompletedReturns, nil
+}
+
+func (s *httpAPITestService) ClearFailed() (int64, error) {
+	if s.clearFailedErr != nil {
+		return 0, s.clearFailedErr
+	}
+	return s.clearFailedReturns, nil
+}
+
+func (s *httpAPITestService) SetRateLimit(id string, rate int64) error {
+	if s.setRateLimitErr != nil {
+		return s.setRateLimitErr
+	}
+	if s.rateLimitCalls != nil {
+		s.rateLimitCalls = append(s.rateLimitCalls, "per-download:"+id)
+	}
+	if s.rateLimitValues != nil {
+		s.rateLimitValues[id] = rate
+	}
+	return nil
+}
+
+func (s *httpAPITestService) ClearRateLimit(id string) error {
+	if s.clearRateLimitErr != nil {
+		return s.clearRateLimitErr
+	}
+	s.clearRateLimitID = append(s.clearRateLimitID, id)
+	return nil
+}
+
+func (s *httpAPITestService) SetGlobalRateLimit(rate int64) error {
+	s.rateLimitCalls = append(s.rateLimitCalls, "global")
+	s.rateLimitValues["__global__"] = rate
+	return nil
+}
+
+func (s *httpAPITestService) SetDefaultRateLimit(rate int64) error {
+	s.rateLimitCalls = append(s.rateLimitCalls, "default")
+	s.rateLimitValues["__default__"] = rate
+	return nil
+}
+
 func TestEnsureOpenActionRequestAllowed_RemoteToggle(t *testing.T) {
+	originalService := GlobalService
+	GlobalService = nil
+	t.Cleanup(func() { GlobalService = originalService })
 	original := globalSettings
 	t.Cleanup(func() {
 		globalSettings = original
@@ -116,9 +506,90 @@ func TestEnsureOpenActionRequestAllowed_RemoteToggle(t *testing.T) {
 	}
 }
 
+func TestSettingsEndpoint_ReadsAndUpdatesDaemonSettings(t *testing.T) {
+	settings := config.DefaultSettings()
+	settings.Categories.Categories = nil
+	settings.General.AutoResume.Value = false
+	service := &settingsHTTPTestService{httpAPITestService: &httpAPITestService{}, settings: settings}
+
+	mux := http.NewServeMux()
+	registerHTTPRoutes(mux, 0, "", service)
+
+	getRecorder := httptest.NewRecorder()
+	mux.ServeHTTP(getRecorder, httptest.NewRequest(http.MethodGet, "/settings", nil))
+	if getRecorder.Code != http.StatusOK {
+		t.Fatalf("GET /settings status = %d: %s", getRecorder.Code, getRecorder.Body.String())
+	}
+
+	updated := settings.Clone()
+	updated.General.AutoResume.Value = true
+	body, err := json.Marshal(updated)
+	if err != nil {
+		t.Fatalf("Marshal settings: %v", err)
+	}
+	putRecorder := httptest.NewRecorder()
+	mux.ServeHTTP(putRecorder, httptest.NewRequest(http.MethodPut, "/settings", strings.NewReader(string(body))))
+	if putRecorder.Code != http.StatusOK {
+		t.Fatalf("PUT /settings status = %d: %s", putRecorder.Code, putRecorder.Body.String())
+	}
+	if service.updateCalls != 1 || !config.Resolve[bool](service.settings.General.AutoResume) {
+		t.Fatal("daemon settings were not updated")
+	}
+}
+
+func TestSettingsEndpoint_RejectsInvalidUpdate(t *testing.T) {
+	settings := config.DefaultSettings()
+	settings.Categories.Categories = nil
+	service := &settingsHTTPTestService{httpAPITestService: &httpAPITestService{}, settings: settings}
+	mux := http.NewServeMux()
+	registerHTTPRoutes(mux, 0, "", service)
+
+	updated := settings.Clone()
+	updated.Network.MaxConnectionsPerDownload.Value = 0
+	body, err := json.Marshal(updated)
+	if err != nil {
+		t.Fatalf("Marshal settings: %v", err)
+	}
+	recorder := httptest.NewRecorder()
+	mux.ServeHTTP(recorder, httptest.NewRequest(http.MethodPut, "/settings", strings.NewReader(string(body))))
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("PUT invalid settings status = %d, want 400: %s", recorder.Code, recorder.Body.String())
+	}
+	if service.updateCalls != 0 {
+		t.Fatal("invalid settings update reached the service")
+	}
+}
+
+func TestSettingsEndpoint_RejectsNullAndWrongTypeSettings(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		body string
+	}{
+		{name: "null setting", body: `{"general":{"auto_resume":null}}`},
+		{name: "wrong boolean type", body: `{"general":{"warn_on_duplicate":"false"}}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			settings := config.DefaultSettings()
+			settings.Categories.Categories = nil
+			service := &settingsHTTPTestService{httpAPITestService: &httpAPITestService{}, settings: settings}
+			mux := http.NewServeMux()
+			registerHTTPRoutes(mux, 0, "", service)
+
+			recorder := httptest.NewRecorder()
+			mux.ServeHTTP(recorder, httptest.NewRequest(http.MethodPut, "/settings", strings.NewReader(test.body)))
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("PUT invalid settings status = %d, want 400: %s", recorder.Code, recorder.Body.String())
+			}
+			if service.updateCalls != 0 {
+				t.Fatal("invalid settings update reached the service")
+			}
+		})
+	}
+}
+
 func TestHistoryEndpoint_SortsMostRecentFirst(t *testing.T) {
 	service := &httpAPITestService{
-		history: []types.DownloadEntry{
+		history: []types.DownloadRecord{
 			{ID: "old", CompletedAt: 10},
 			{ID: "new", CompletedAt: 30},
 			{ID: "middle", CompletedAt: 20},
@@ -136,7 +607,7 @@ func TestHistoryEndpoint_SortsMostRecentFirst(t *testing.T) {
 		t.Fatalf("expected status 200, got %d", recorder.Code)
 	}
 
-	var got []types.DownloadEntry
+	var got []types.DownloadRecord
 	if err := json.Unmarshal(recorder.Body.Bytes(), &got); err != nil {
 		t.Fatalf("failed to parse response: %v", err)
 	}
@@ -152,8 +623,9 @@ func TestHistoryEndpoint_SortsMostRecentFirst(t *testing.T) {
 
 func TestEventsEndpoint_RequiresAuthAndStreamsSSE(t *testing.T) {
 	service := &httpAPITestService{
-		streamMsgs: []interface{}{
-			events.DownloadQueuedMsg{
+		streamMsgs: []types.DownloadEvent{
+			types.DownloadEvent{
+				Type:       types.EventQueued,
 				DownloadID: "queue-1",
 				Filename:   "archive.zip",
 				URL:        "https://example.com/archive.zip",
@@ -164,14 +636,15 @@ func TestEventsEndpoint_RequiresAuthAndStreamsSSE(t *testing.T) {
 
 	mux := http.NewServeMux()
 	registerHTTPRoutes(mux, 0, "", service)
-	// remoteAddrOverride makes requests appear to come from a non-loopback IP
-	// so the auth middleware's loopback bypass does not mask token enforcement.
-	remoteAddrOverride := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// FluxGet lets loopback clients (the browser extension) skip the token, so
+	// present the test client as a remote host to exercise token enforcement.
+	remote := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		r2 := r.Clone(r.Context())
 		r2.RemoteAddr = "203.0.113.1:12345"
-		corsMiddleware(authMiddleware("test-token", mux)).ServeHTTP(w, r2)
+		authMiddleware("test-token", mux).ServeHTTP(w, r2)
 	})
-	server := httptest.NewServer(remoteAddrOverride)
+	handler := corsMiddleware(remote)
+	server := testutil.NewHTTPServerT(t, handler)
 	defer server.Close()
 
 	noAuthResp, err := server.Client().Get(server.URL + "/events")
@@ -210,8 +683,103 @@ func TestEventsEndpoint_RequiresAuthAndStreamsSSE(t *testing.T) {
 	if !strings.Contains(text, "event: queued") {
 		t.Fatalf("expected queued SSE event, got %q", text)
 	}
-	if !strings.Contains(text, `"DownloadID":"queue-1"`) {
+	if !strings.Contains(text, `"download_id":"queue-1"`) {
 		t.Fatalf("expected queued payload in SSE body, got %q", text)
+	}
+}
+
+func TestHandleBatchDownload_ConfirmPublishesSingleBatchRequest(t *testing.T) {
+	previousProgram := serverProgram
+	serverProgram = &tea.Program{}
+	t.Cleanup(func() {
+		serverProgram = previousProgram
+	})
+
+	service := &publishRecordingHTTPService{
+		httpAPITestService: &httpAPITestService{},
+	}
+	body := `{
+		"path": "/tmp/downloads",
+		"skip_approval": false,
+		"downloads": [
+			{"url": "https://example.com/one.zip", "is_explicit_category": true},
+			{"url": "https://example.com/two.zip"}
+		]
+	}`
+	request := httptest.NewRequest(http.MethodPost, "/download/batch", strings.NewReader(body))
+	recorder := httptest.NewRecorder()
+
+	handleBatchDownload(recorder, request, "", service)
+
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("expected status 202, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if len(service.published) != 1 {
+		t.Fatalf("expected 1 published message, got %d", len(service.published))
+	}
+	msg := service.published[0]
+	if len(msg.BatchEvents) != 2 {
+		t.Fatalf("expected 2 batch requests, got %d", len(msg.BatchEvents))
+	}
+	if msg.BatchEvents[0].URL != "https://example.com/one.zip" || msg.BatchEvents[1].URL != "https://example.com/two.zip" {
+		t.Fatalf("unexpected batch URLs: %#v", msg.BatchEvents)
+	}
+	if !msg.BatchEvents[0].IsExplicitCategory || msg.BatchEvents[1].IsExplicitCategory {
+		t.Fatalf("batch category intent was lost: %#v", msg.BatchEvents)
+	}
+}
+
+func TestHandleBatchDownload_SkipApprovalReportsPartialFailure(t *testing.T) {
+	previousLifecycle := GlobalLifecycle
+	previousCleanup := GlobalLifecycleCleanup
+	t.Cleanup(func() {
+		GlobalLifecycle = previousLifecycle
+		GlobalLifecycleCleanup = previousCleanup
+	})
+	GlobalLifecycle = nil
+	GlobalLifecycleCleanup = nil
+
+	service := &batchAddRecordingService{
+		httpAPITestService: &httpAPITestService{},
+		failOn:             "https://example.com/two.zip",
+	}
+	body := `{
+		"path": "/tmp/downloads",
+		"skip_approval": true,
+		"downloads": [
+			{"url": "https://example.com/one.zip", "is_explicit_category": true},
+			{"url": "https://example.com/two.zip"},
+			{"url": "https://example.com/three.zip"}
+		]
+	}`
+	request := httptest.NewRequest(http.MethodPost, "/download/batch", strings.NewReader(body))
+	recorder := httptest.NewRecorder()
+
+	handleBatchDownload(recorder, request, "", service)
+
+	if recorder.Code != http.StatusMultiStatus {
+		t.Fatalf("expected status 207, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if len(service.added) != 2 {
+		t.Fatalf("expected 2 queued downloads, got %d: %#v", len(service.added), service.added)
+	}
+	if len(service.explicit) != 2 || !service.explicit[0] || service.explicit[1] {
+		t.Fatalf("batch category intent was lost: %#v", service.explicit)
+	}
+
+	var response struct {
+		Status   string              `json:"status"`
+		Count    int                 `json:"count"`
+		Failures []map[string]string `json:"failures"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if response.Status != "partial" || response.Count != 2 || len(response.Failures) != 1 {
+		t.Fatalf("unexpected partial response: %#v", response)
+	}
+	if response.Failures[0]["url"] != "https://example.com/two.zip" {
+		t.Fatalf("unexpected failed URL: %#v", response.Failures)
 	}
 }
 
@@ -247,7 +815,7 @@ func TestResolveDownloadDestPath(t *testing.T) {
 				statusByID: map[string]*types.DownloadStatus{
 					"fallback": {ID: "fallback", DestPath: ""},
 				},
-				history: []types.DownloadEntry{{ID: "fallback", DestPath: "C:\\tmp\\b.bin"}},
+				history: []types.DownloadRecord{{ID: "fallback", DestPath: "C:\\tmp\\b.bin"}},
 			},
 			id:       "fallback",
 			wantPath: `C:\tmp\b.bin`,
@@ -255,7 +823,7 @@ func TestResolveDownloadDestPath(t *testing.T) {
 		{
 			name: "history entry has no destination path",
 			service: &httpAPITestService{
-				history: []types.DownloadEntry{{ID: "bad", DestPath: "."}},
+				history: []types.DownloadRecord{{ID: "bad", DestPath: "."}},
 			},
 			id:        "bad",
 			wantErrIs: ErrNoDestinationPath,
@@ -263,7 +831,7 @@ func TestResolveDownloadDestPath(t *testing.T) {
 		{
 			name: "id absent returns not found",
 			service: &httpAPITestService{
-				history: []types.DownloadEntry{{ID: "other", DestPath: "C:\\tmp\\c.bin"}},
+				history: []types.DownloadRecord{{ID: "other", DestPath: "C:\\tmp\\c.bin"}},
 			},
 			id:        "missing",
 			wantErrIs: ErrDownloadNotFound,
@@ -280,7 +848,7 @@ func TestResolveDownloadDestPath(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			var service core.DownloadService
+			var service service.DownloadService
 			if !test.useNilService {
 				service = test.service
 			}
@@ -334,7 +902,7 @@ func TestOpenEndpoints_ReturnMappedResolveStatuses(t *testing.T) {
 			name: "missing download returns 404",
 			path: "/open-folder?id=missing",
 			service: &httpAPITestService{
-				history: []types.DownloadEntry{},
+				history: []types.DownloadRecord{},
 			},
 			statusCode: http.StatusNotFound,
 		},
@@ -351,7 +919,7 @@ func TestOpenEndpoints_ReturnMappedResolveStatuses(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			mux := http.NewServeMux()
-			var service core.DownloadService
+			var service service.DownloadService
 			if !test.useNil {
 				service = test.service
 			}
@@ -371,6 +939,9 @@ func TestOpenEndpoints_ReturnMappedResolveStatuses(t *testing.T) {
 }
 
 func TestEnsureOpenActionRequestAllowed_ForwardedLoopbackDenied(t *testing.T) {
+	originalService := GlobalService
+	GlobalService = nil
+	t.Cleanup(func() { GlobalService = originalService })
 	original := globalSettings
 	t.Cleanup(func() {
 		globalSettings = original
@@ -389,5 +960,687 @@ func TestEnsureOpenActionRequestAllowed_ForwardedLoopbackDenied(t *testing.T) {
 	globalSettings.General.AllowRemoteOpenActions.Value = true
 	if err := ensureOpenActionRequestAllowed(request); err != nil {
 		t.Fatalf("expected forwarded loopback request to be allowed when enabled, got: %v", err)
+	}
+}
+
+// TestRateLimitEndpoint_NegativeRateReturns400 verifies that negative rate
+// values are rejected with 400 on all three rate-limit endpoints.
+func TestRateLimitEndpoint_NegativeRateReturns400(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+	}{
+		{name: "per-download", path: "/rate-limit?id=dl-id&rate=-2"},
+		{name: "global", path: "/rate-limit/global?rate=-2"},
+		{name: "default", path: "/rate-limit/default?rate=-2"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mux := http.NewServeMux()
+			svc := newRateLimitTestService()
+			registerHTTPRoutes(mux, 0, "", svc)
+
+			req := httptest.NewRequest(http.MethodPost, tt.path, nil)
+			req.RemoteAddr = "127.0.0.1:12345"
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400 for negative rate, got %d: %s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+// recordingActionService records the id passed to each lifecycle action so
+// tests can assert how the CLI delivered it to the HTTP API.
+type recordingActionService struct {
+	*httpAPITestService
+	ids map[string]string // action -> received id
+}
+
+func (s *recordingActionService) Pause(id string) error  { s.ids["pause"] = id; return nil }
+func (s *recordingActionService) Resume(id string) error { s.ids["resume"] = id; return nil }
+func (s *recordingActionService) Delete(id string) error { s.ids["delete"] = id; return nil }
+func (s *recordingActionService) Purge(id string) error  { s.ids["purge"] = id; return nil }
+
+// Regression for #456: ExecuteAPIAction sent the download id as a path segment
+// (e.g. POST /pause/<id>), but the HTTP API registers exact routes and reads the
+// ExecuteAPIAction caller (pause/resume/delete), not just one, so a future
+// action-specific regression is caught.
+func TestExecuteAPIAction_SendsIDAsQueryParam(t *testing.T) {
+	rec := &recordingActionService{httpAPITestService: &httpAPITestService{}, ids: map[string]string{}}
+	mux := http.NewServeMux()
+	registerHTTPRoutes(mux, 0, "", rec)
+	server := testutil.NewHTTPServerT(t, mux)
+	defer server.Close()
+
+	prevHost, prevToken := globalHost, globalToken
+	globalHost, globalToken = "", ""
+	defer func() { globalHost, globalToken = prevHost, prevToken }()
+	t.Setenv("SURGE_HOST", server.URL)
+	t.Setenv("SURGE_TOKEN", "test-token")
+
+	// 32 chars so resolveDownloadID treats it as a full id (no server lookup).
+	const fullID = "abcdef0123456789abcdef0123456789"
+	for _, action := range []struct{ name, endpoint string }{
+		{"pause", "/pause"},
+		{"resume", "/resume"},
+		{"delete", "/delete"},
+		{"purge", "/purge"},
+	} {
+		if err := ExecuteAPIAction(fullID, action.endpoint, http.MethodPost, action.name); err != nil {
+			t.Fatalf("ExecuteAPIAction(%s): id should reach %s via ?id=, got error: %v", action.name, action.endpoint, err)
+		}
+		if rec.ids[action.name] != fullID {
+			t.Fatalf("%s: server received id %q via query param, want %q", action.name, rec.ids[action.name], fullID)
+		}
+	}
+}
+
+// TestRateLimitPerDownloadEndpoint tests the /rate-limit?id=...&rate=... endpoint.
+func TestRateLimitPerDownloadEndpoint(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		path      string
+		wantCode  int
+		wantID    string
+		wantRate  int64
+		wantClear bool
+	}{
+		{
+			name:     "missing id returns 400",
+			path:     "/rate-limit?rate=1000",
+			wantCode: http.StatusBadRequest,
+		},
+		{
+			name:     "missing rate returns 400",
+			path:     "/rate-limit?id=dl-1",
+			wantCode: http.StatusBadRequest,
+		},
+		{
+			name:     "valid request succeeds",
+			path:     "/rate-limit?id=dl-1&rate=5000000",
+			wantCode: http.StatusOK,
+			wantID:   "dl-1",
+			wantRate: 5000000,
+		},
+		{
+			name:     "zero rate is valid (unlimited)",
+			path:     "/rate-limit?id=dl-2&rate=0",
+			wantCode: http.StatusOK,
+			wantID:   "dl-2",
+			wantRate: 0,
+		},
+		{
+			name:      "inherit clears explicit override",
+			path:      "/rate-limit?id=dl-3&inherit=true",
+			wantCode:  http.StatusOK,
+			wantID:    "dl-3",
+			wantClear: true,
+		},
+		{
+			name:      "rate inherit clears explicit override",
+			path:      "/rate-limit?id=dl-5&rate=inherit",
+			wantCode:  http.StatusOK,
+			wantID:    "dl-5",
+			wantClear: true,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			svc := newRateLimitTestService()
+			mux := http.NewServeMux()
+			registerHTTPRoutes(mux, 0, "", svc)
+			handler := authMiddleware("test-token", mux)
+
+			req := httptest.NewRequest(http.MethodPost, tt.path, nil)
+			req.Header.Set("Authorization", "Bearer test-token")
+			req.RemoteAddr = "127.0.0.1:12345"
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			if rec.Code != tt.wantCode {
+				t.Fatalf("expected status %d, got %d: %s", tt.wantCode, rec.Code, rec.Body.String())
+			}
+
+			if tt.wantID != "" {
+				if tt.wantClear {
+					if len(svc.clearRateLimitID) != 1 || svc.clearRateLimitID[0] != tt.wantID {
+						t.Fatalf("clear calls = %v, want [%s]", svc.clearRateLimitID, tt.wantID)
+					}
+				} else if got := svc.rateLimitValues[tt.wantID]; got != tt.wantRate {
+					t.Fatalf("rate for %s = %d, want %d", tt.wantID, got, tt.wantRate)
+				}
+			}
+		})
+	}
+}
+
+func TestRateLimitPerDownloadEndpoint_NotFoundReturns404(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		svc  *httpAPITestService
+	}{
+		{
+			name: "set missing download",
+			path: "/rate-limit?id=missing&rate=1024",
+			svc:  &httpAPITestService{setRateLimitErr: types.ErrNotFound},
+		},
+		{
+			name: "clear missing download",
+			path: "/rate-limit?id=missing&inherit=true",
+			svc:  &httpAPITestService{clearRateLimitErr: types.ErrNotFound},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mux := http.NewServeMux()
+			registerHTTPRoutes(mux, 0, "", tt.svc)
+
+			req := httptest.NewRequest(http.MethodPost, tt.path, nil)
+			req.RemoteAddr = "127.0.0.1:12345"
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("expected status 404, got %d: %s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+// TestRateLimitGlobalEndpoint tests the /rate-limit/global endpoint.
+func TestRateLimitGlobalEndpoint(t *testing.T) {
+	tests := []struct {
+		name       string
+		path       string
+		wantCode   int
+		wantGlobal int64
+		wantCall   string
+	}{
+		{
+			name:       "valid global rate",
+			path:       "/rate-limit/global?rate=1048576",
+			wantCode:   http.StatusOK,
+			wantGlobal: 1048576,
+			wantCall:   "global",
+		},
+		{
+			name:       "zero global rate (unlimited)",
+			path:       "/rate-limit/global?rate=0",
+			wantCode:   http.StatusOK,
+			wantGlobal: 0,
+			wantCall:   "global",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc := newRateLimitTestService()
+			mux := http.NewServeMux()
+			registerHTTPRoutes(mux, 0, "", svc)
+			handler := authMiddleware("test-token", mux)
+
+			req := httptest.NewRequest(http.MethodPost, tt.path, nil)
+			req.Header.Set("Authorization", "Bearer test-token")
+			req.RemoteAddr = "127.0.0.1:12345"
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			if rec.Code != tt.wantCode {
+				t.Fatalf("expected status %d, got %d: %s", tt.wantCode, rec.Code, rec.Body.String())
+			}
+
+			found := false
+			for _, c := range svc.rateLimitCalls {
+				if c == tt.wantCall {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Fatalf("expected call %q in %v", tt.wantCall, svc.rateLimitCalls)
+			}
+			if got := svc.rateLimitValues["__global__"]; got != tt.wantGlobal {
+				t.Fatalf("global rate = %d, want %d", got, tt.wantGlobal)
+			}
+		})
+	}
+}
+
+// TestRateLimitGlobalEndpoint_UnsupportedService returns 501 when the service
+// does not implement rateLimitSettingsService.
+func TestRateLimitGlobalEndpoint_UnsupportedService(t *testing.T) {
+	// httpAPITestService without SetGlobalRateLimit/SetDefaultRateLimit methods
+	// returns 501. But our current test service implements them.
+	// Test via a minimal service that only satisfies DownloadService.
+	mux := http.NewServeMux()
+	svc := newRateLimitTestService()
+	// Remove the rate limit methods by wrapping
+	wrapper := &rateLimitWrapper{svc: svc}
+	registerHTTPRoutes(mux, 0, "", wrapper)
+
+	req := httptest.NewRequest(http.MethodPost, "/rate-limit/global?rate=1000", nil)
+	req.RemoteAddr = "127.0.0.1:12345"
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("expected 501 for unsupported service, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+type rateLimitWrapper struct {
+	svc *httpAPITestService
+}
+
+func (r *rateLimitWrapper) List() ([]types.DownloadStatus, error)    { return nil, nil }
+func (r *rateLimitWrapper) History() ([]types.DownloadRecord, error) { return nil, nil }
+func (r *rateLimitWrapper) Add(string, string, string, []string, map[string]string, bool, int, int64) (string, error) {
+	return "", nil
+}
+func (r *rateLimitWrapper) AddWithID(string, string, string, []string, map[string]string, string, bool, int, int64) (string, error) {
+	return "", nil
+}
+func (r *rateLimitWrapper) Pause(string) error                              { return nil }
+func (r *rateLimitWrapper) Resume(string) error                             { return nil }
+func (r *rateLimitWrapper) ResumeBatch([]string) []error                    { return nil }
+func (r *rateLimitWrapper) UpdateURL(string, string) error                  { return nil }
+func (r *rateLimitWrapper) Delete(string) error                             { return nil }
+func (r *rateLimitWrapper) Purge(string) error                              { return nil }
+func (r *rateLimitWrapper) Publish(types.DownloadEvent) error               { return nil }
+func (r *rateLimitWrapper) GetStatus(string) (*types.DownloadStatus, error) { return nil, nil }
+func (r *rateLimitWrapper) Shutdown() error                                 { return nil }
+func (r *rateLimitWrapper) ClearCompleted() (int64, error)                  { return 0, nil }
+func (r *rateLimitWrapper) ClearFailed() (int64, error)                     { return 0, nil }
+func (r *rateLimitWrapper) SetRateLimit(string, int64) error                { return nil }
+func (r *rateLimitWrapper) ClearRateLimit(string) error                     { return nil }
+func (r *rateLimitWrapper) StreamEvents(context.Context) (<-chan types.DownloadEvent, func(), error) {
+	return make(chan types.DownloadEvent), func() {}, nil
+}
+
+// TestRateLimitDefaultEndpoint tests the /rate-limit/default endpoint.
+func TestRateLimitDefaultEndpoint(t *testing.T) {
+	svc := newRateLimitTestService()
+	mux := http.NewServeMux()
+	registerHTTPRoutes(mux, 0, "", svc)
+	handler := authMiddleware("test-token", mux)
+
+	req := httptest.NewRequest(http.MethodPost, "/rate-limit/default?rate=2097152", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	req.RemoteAddr = "127.0.0.1:12345"
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	found := false
+	for _, c := range svc.rateLimitCalls {
+		if c == "default" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected 'default' call in %v", svc.rateLimitCalls)
+	}
+	if got := svc.rateLimitValues["__default__"]; got != 2097152 {
+		t.Fatalf("default rate = %d, want %d", got, 2097152)
+	}
+}
+
+func TestClearCompletedEndpoint(t *testing.T) {
+	tests := []struct {
+		name         string
+		method       string
+		svcErr       error
+		svcReturns   int64
+		wantCode     int
+		wantResponse string
+	}{
+		{
+			name:     "requires POST method",
+			method:   http.MethodGet,
+			wantCode: http.StatusMethodNotAllowed,
+		},
+		{
+			name:         "success",
+			method:       http.MethodPost,
+			svcReturns:   5,
+			wantCode:     http.StatusOK,
+			wantResponse: `{"deleted":5}`,
+		},
+		{
+			name:         "service error",
+			method:       http.MethodPost,
+			svcErr:       errors.New("db error"),
+			wantCode:     http.StatusInternalServerError,
+			wantResponse: "db error",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc := &httpAPITestService{
+				clearCompletedReturns: tt.svcReturns,
+				clearCompletedErr:     tt.svcErr,
+			}
+			mux := http.NewServeMux()
+			registerHTTPRoutes(mux, 0, "", svc)
+
+			req := httptest.NewRequest(tt.method, "/clear-completed", nil)
+			req.RemoteAddr = "127.0.0.1:12345"
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+
+			if rec.Code != tt.wantCode {
+				t.Fatalf("expected status %d, got %d: %s", tt.wantCode, rec.Code, rec.Body.String())
+			}
+
+			if tt.wantResponse != "" {
+				if !strings.Contains(rec.Body.String(), tt.wantResponse) {
+					t.Fatalf("expected response to contain %q, got %q", tt.wantResponse, rec.Body.String())
+				}
+			}
+		})
+	}
+}
+
+func TestClearFailedEndpoint(t *testing.T) {
+	tests := []struct {
+		name         string
+		method       string
+		svcErr       error
+		svcReturns   int64
+		wantCode     int
+		wantResponse string
+	}{
+		{
+			name:     "requires POST method",
+			method:   http.MethodGet,
+			wantCode: http.StatusMethodNotAllowed,
+		},
+		{
+			name:         "success",
+			method:       http.MethodPost,
+			svcReturns:   2,
+			wantCode:     http.StatusOK,
+			wantResponse: `{"deleted":2}`,
+		},
+		{
+			name:         "service error",
+			method:       http.MethodPost,
+			svcErr:       errors.New("db fail error"),
+			wantCode:     http.StatusInternalServerError,
+			wantResponse: "db fail error",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc := &httpAPITestService{
+				clearFailedReturns: tt.svcReturns,
+				clearFailedErr:     tt.svcErr,
+			}
+			mux := http.NewServeMux()
+			registerHTTPRoutes(mux, 0, "", svc)
+
+			req := httptest.NewRequest(tt.method, "/clear-failed", nil)
+			req.RemoteAddr = "127.0.0.1:12345"
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+
+			if rec.Code != tt.wantCode {
+				t.Fatalf("expected status %d, got %d: %s", tt.wantCode, rec.Code, rec.Body.String())
+			}
+
+			if tt.wantResponse != "" {
+				if !strings.Contains(rec.Body.String(), tt.wantResponse) {
+					t.Fatalf("expected response to contain %q, got %q", tt.wantResponse, rec.Body.String())
+				}
+			}
+		})
+	}
+}
+
+func TestSettingsEndpointConcurrentPartialUpdates(t *testing.T) {
+	settings := config.DefaultSettings()
+	settings.Categories.Categories = nil
+	settings.General.AutoResume.Value = false
+	settings.General.WarnOnDuplicate.Value = false
+	service := &settingsHTTPTestService{httpAPITestService: &httpAPITestService{}, settings: settings}
+	mux := http.NewServeMux()
+	registerHTTPRoutes(mux, 0, "", service)
+	var wg sync.WaitGroup
+	for _, body := range []string{`{"general":{"auto_resume":true}}`, `{"general":{"warn_on_duplicate":true}}`} {
+		wg.Add(1)
+		go func(body string) {
+			defer wg.Done()
+			recorder := httptest.NewRecorder()
+			mux.ServeHTTP(recorder, httptest.NewRequest(http.MethodPut, "/settings", strings.NewReader(body)))
+			if recorder.Code != http.StatusOK {
+				t.Errorf("PUT status = %d: %s", recorder.Code, recorder.Body.String())
+			}
+		}(body)
+	}
+	wg.Wait()
+	if !config.Resolve[bool](service.settings.General.AutoResume) || !config.Resolve[bool](service.settings.General.WarnOnDuplicate) {
+		t.Fatal("concurrent partial update lost a setting")
+	}
+}
+
+func TestRemoteSettingsPatchRoundTripAndConflict(t *testing.T) {
+	setupXDGEnvIsolation(t)
+	baseline := config.DefaultSettings()
+	baseline.Categories.Categories = nil
+	baseline.Extension.AuthToken.Value = "private-token"
+	manager := orchestrator.NewLifecycleManager(nil, nil, baseline)
+	defer manager.Shutdown()
+	local := service.NewLocalDownloadService(manager)
+	mux := http.NewServeMux()
+	registerHTTPRoutes(mux, 1701, "", local)
+	server := testutil.NewHTTPServerT(t, authMiddleware("test-token", mux))
+	defer server.Close()
+	remote, err := service.NewRemoteDownloadService(server.URL, "test-token", service.HTTPClientOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = remote.Shutdown() }()
+	loaded, err := remote.GetSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	edited := loaded.Clone()
+	edited.Network.MaxConcurrentDownloads.Value = 5
+	patch := config.DiffSettings(loaded, edited)
+	got, err := remote.PatchSettings(patch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Network.MaxConcurrentDownloads.Value != 5 || got.Extension.AuthToken.Value != "" {
+		t.Fatal("patch response incorrect or exposes token")
+	}
+	stored, _ := local.GetSettings()
+	if stored.Extension.AuthToken.Value != "private-token" {
+		t.Fatal("patch changed private token")
+	}
+	data, err := json.Marshal(patch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPatch, "/settings", strings.NewReader(string(data))))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestSettingsPatchReportsPersistenceFailureAsServerError(t *testing.T) {
+	setupXDGEnvIsolation(t)
+	settings := config.DefaultSettings()
+	settings.Categories.Categories = nil
+	manager := orchestrator.NewLifecycleManager(nil, nil, settings)
+	defer manager.Shutdown()
+	owner := service.NewLocalDownloadService(manager)
+	blocker := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(blocker, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_CONFIG_HOME", blocker)
+	t.Setenv("APPDATA", blocker)
+	mux := http.NewServeMux()
+	registerHTTPRoutes(mux, 0, "", owner)
+	rec := httptest.NewRecorder()
+	updated := settings.Clone()
+	updated.Network.GlobalRateLimit.Value = "1024 B/s"
+	data, err := json.Marshal(config.DiffSettings(settings, updated))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPatch, "/settings", strings.NewReader(string(data))))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestMixedSettingsMethodsPreserveEdits(t *testing.T) {
+	setupIsolatedCmdState(t)
+	initial := config.DefaultSettings()
+	initial.Categories.Categories = nil
+	initial.General.DefaultDownloadDir.Value = t.TempDir()
+	pool := scheduler.New(make(chan types.DownloadEvent, 100), 1)
+	lifecycle := orchestrator.NewLifecycleManager(pool, nil, initial)
+	defer lifecycle.Shutdown()
+	svc := service.NewLocalDownloadService(lifecycle)
+	mux := http.NewServeMux()
+	registerHTTPRoutes(mux, 0, "", svc)
+	edited := initial.Clone()
+	edited.General.WarnOnDuplicate.Value = !config.Resolve[bool](initial.General.WarnOnDuplicate)
+	patch, err := json.Marshal(config.DiffSettings(initial, edited))
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for _, request := range []struct{ method, body string }{
+		{http.MethodPost, fmt.Sprintf(`{"general":{"auto_resume":%t}}`, !config.Resolve[bool](initial.General.AutoResume))},
+		{http.MethodPatch, string(patch)},
+	} {
+		wg.Go(func() {
+			<-start
+			response := httptest.NewRecorder()
+			mux.ServeHTTP(response, httptest.NewRequest(request.method, "/settings", strings.NewReader(request.body)))
+			if response.Code != http.StatusOK {
+				t.Errorf("%s: %d %s", request.method, response.Code, response.Body.String())
+			}
+		})
+	}
+	wg.Go(func() {
+		<-start
+		if err := svc.SetGlobalRateLimit(128); err != nil {
+			t.Error(err)
+		}
+	})
+	close(start)
+	wg.Wait()
+	for _, snapshot := range []*config.Settings{lifecycle.GetSettings(), mustLoadSettings(t)} {
+		if config.Resolve[bool](snapshot.General.AutoResume) == config.Resolve[bool](initial.General.AutoResume) || config.Resolve[bool](snapshot.General.WarnOnDuplicate) == config.Resolve[bool](initial.General.WarnOnDuplicate) {
+			t.Fatal("concurrent update lost an edit")
+		}
+		if rate, err := utils.ParseRateLimitValue(snapshot.Network.GlobalRateLimit.Value); err != nil || rate != 128 {
+			t.Fatalf("rate = %d, err = %v", rate, err)
+		}
+	}
+}
+
+func mustLoadSettings(t *testing.T) *config.Settings {
+	t.Helper()
+	settings, err := config.LoadSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return settings
+}
+
+func TestPostSettingsPreservesAuthToken(t *testing.T) {
+	setupIsolatedCmdState(t)
+	initial := config.DefaultSettings()
+	initial.General.DefaultDownloadDir.Value = t.TempDir()
+	initial.Categories.Categories = nil
+	initial.Extension.AuthToken.Value = "original-token"
+	initial.General.AutoResume.Value = true
+	lifecycle := orchestrator.NewLifecycleManager(nil, nil, initial)
+	defer lifecycle.Shutdown()
+	mux := http.NewServeMux()
+	registerHTTPRoutes(mux, 0, "", service.NewLocalDownloadService(lifecycle))
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/settings", strings.NewReader(`{"extension":{"auth_token":"replacement"},"general":{"auto_resume":false}}`)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("POST: %d %s", response.Code, response.Body.String())
+	}
+	for _, snapshot := range []*config.Settings{lifecycle.GetSettings(), mustLoadSettings(t)} {
+		if snapshot.Extension.AuthToken.Value != "original-token" {
+			t.Fatal("POST changed auth token")
+		}
+		if config.Resolve[bool](snapshot.General.AutoResume) {
+			t.Fatal("POST did not apply editable setting")
+		}
+	}
+}
+
+type failingBulkService struct {
+	*httpAPITestService
+	status string
+}
+
+func (s *failingBulkService) List() ([]types.DownloadStatus, error) {
+	return []types.DownloadStatus{{ID: "success", Status: s.status}, {ID: "failure", Status: s.status}}, nil
+}
+func (s *failingBulkService) Pause(id string) error {
+	if id == "failure" {
+		return errors.New("pause failed")
+	}
+	return nil
+}
+func (s *failingBulkService) Resume(id string) error {
+	if id == "failure" {
+		return errors.New("resume failed")
+	}
+	return nil
+}
+func TestBulkActionCountsOnlySuccesses(t *testing.T) {
+	for _, tc := range []struct{ path, status, count string }{
+		{"/pause-all", "downloading", "paused"},
+		{"/resume-all", "paused", "resumed"},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			mux := http.NewServeMux()
+			registerHTTPRoutes(mux, 0, "", &failingBulkService{httpAPITestService: &httpAPITestService{}, status: tc.status})
+			response := httptest.NewRecorder()
+			mux.ServeHTTP(response, httptest.NewRequest(http.MethodPost, tc.path, nil))
+			if response.Code != http.StatusOK {
+				t.Fatalf("status = %d", response.Code)
+			}
+			var body map[string]json.RawMessage
+			if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			var count int
+			if err := json.Unmarshal(body[tc.count], &count); err != nil {
+				t.Fatal(err)
+			}
+			var results []downloadActionResult
+			if err := json.Unmarshal(body["results"], &results); err != nil {
+				t.Fatal(err)
+			}
+			if count != 1 || len(results) != 2 || results[0].Error != "" || results[1].Error == "" {
+				t.Fatalf("unexpected response: %s", response.Body.String())
+			}
+		})
 	}
 }

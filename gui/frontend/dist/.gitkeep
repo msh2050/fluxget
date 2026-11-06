@@ -1,0 +1,2 @@
+# Placeholder so `//go:embed all:frontend/dist` compiles before the Wails
+# frontend is built (CI, `go build ./...`). `wails build` fills this folder.

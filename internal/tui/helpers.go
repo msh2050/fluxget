@@ -1,6 +1,9 @@
 package tui
 
 import (
+	"github.com/msh2050/fluxget/internal/orchestrator"
+	engineprogress "github.com/msh2050/fluxget/internal/progress"
+
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,20 +15,40 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/msh2050/fluxget/internal/config"
-	"github.com/msh2050/fluxget/internal/engine/types"
-	"github.com/msh2050/fluxget/internal/processing"
+	"github.com/msh2050/fluxget/internal/service"
+	"github.com/msh2050/fluxget/internal/tui/colors"
+	"github.com/msh2050/fluxget/internal/types"
 	"github.com/msh2050/fluxget/internal/utils"
 )
 
 // addLogEntry adds a log entry to the log viewport
 func (m *RootModel) addLogEntry(msg string) {
+	m.addStyledLogEntry(logPlain, msg)
+}
+
+type logKind uint8
+
+const (
+	logPlain logKind = iota
+	logStarted
+	logComplete
+	logError
+	logPaused
+)
+
+func (m *RootModel) addStyledLogEntry(kind logKind, msg string) {
 	timestamp := time.Now().Format("15:04:05")
 	entry := fmt.Sprintf("[%s] %s", timestamp, msg)
+	if len(m.logKinds) != len(m.logEntries) {
+		m.logKinds = make([]logKind, len(m.logEntries))
+	}
 	m.logEntries = append(m.logEntries, entry)
+	m.logKinds = append(m.logKinds, kind)
 
 	// Keep only the last 100 entries to prevent memory issues
 	if len(m.logEntries) > 100 {
 		m.logEntries = m.logEntries[len(m.logEntries)-100:]
+		m.logKinds = m.logKinds[len(m.logKinds)-100:]
 	}
 
 	m.refreshLogViewportContent()
@@ -44,7 +67,21 @@ func (m *RootModel) refreshLogViewportContent() {
 	// TruncateTwoLines ensures long messages don't overflow the UI.
 
 	var wrappedEntries []string
-	for _, entry := range m.logEntries {
+	for i, entry := range m.logEntries {
+		style := lipgloss.NewStyle().Foreground(colors.Foreground())
+		if i < len(m.logKinds) {
+			switch m.logKinds[i] {
+			case logStarted:
+				style = LogStyleStarted
+			case logComplete:
+				style = LogStyleComplete
+			case logError:
+				style = LogStyleError
+			case logPaused:
+				style = LogStylePaused
+			}
+		}
+		entry = style.Render(entry)
 		wrapped := utils.TruncateTwoLines(entry, width)
 		wrappedEntries = append(wrappedEntries, strings.Split(wrapped, "\n")...)
 	}
@@ -52,7 +89,7 @@ func (m *RootModel) refreshLogViewportContent() {
 	// Bottom-align entries if they don't fill the viewport
 	height := m.logViewport.Height()
 	if height > 0 && len(wrappedEntries) < height {
-		padding := make([]string, height-len(wrappedEntries))
+		padding := make([]string, height-len(wrappedEntries), height)
 		wrappedEntries = append(padding, wrappedEntries...)
 	}
 
@@ -72,10 +109,17 @@ func (m *RootModel) removeDownloadByID(id string) bool {
 }
 
 func (m *RootModel) handleFilePickerSelection(path string) (tea.Model, tea.Cmd) {
+	path = filepath.Clean(path)
 	switch m.filepickerOrigin {
 	case FilePickerOriginTheme:
 		m.Settings.General.ThemePath.Value = path
 		m.ApplyTheme(config.Resolve[int](m.Settings.General.Theme), path)
+		m.filepickerOrigin = FilePickerOriginNone
+		m.state = SettingsState
+		m.resetFilepickerToDirMode()
+		return m, nil
+	case FilePickerOriginCategory:
+		m.catMgrInputs[3].SetValue(path)
 		m.filepickerOrigin = FilePickerOriginNone
 		m.state = SettingsState
 		m.resetFilepickerToDirMode()
@@ -92,14 +136,7 @@ func (m *RootModel) handleFilePickerSelection(path string) (tea.Model, tea.Cmd) 
 		m.filepickerOrigin = FilePickerOriginNone
 		m.state = ExtensionConfirmationState
 		return m, nil
-	case FilePickerOriginCategory:
-		m.catMgrInputs[3].SetValue(path)
-		m.catMgrEditField = 3
-		m.blurAllCatInputs()
-		m.catMgrInputs[3].Focus()
-		m.filepickerOrigin = FilePickerOriginNone
-		m.state = CategoryManagerState
-		return m, nil
+
 	default:
 		m.inputs[2].SetValue(path)
 		m.focusInput(2)
@@ -153,23 +190,23 @@ func (m *RootModel) openDirectoryPicker(origin FilePickerOrigin, originalPath, b
 }
 
 // checkForDuplicate checks if a compatible download already exists
-func (m RootModel) checkForDuplicate(url string) *processing.DuplicateResult {
-	activeDownloads := func() map[string]*types.DownloadConfig {
-		active := make(map[string]*types.DownloadConfig)
+func (m RootModel) checkForDuplicate(url string) *orchestrator.DuplicateResult {
+	activeDownloads := func() map[string]*types.DownloadRecord {
+		active := make(map[string]*types.DownloadRecord)
 		for _, d := range m.downloads {
 			if !d.done {
-				state := &types.ProgressState{}
+				state := &engineprogress.DownloadProgress{}
 				// Create dummy config to pass into processing duplicate check
-				active[d.ID] = &types.DownloadConfig{
-					URL:      d.URL,
-					Filename: d.Filename,
-					State:    state,
+				active[d.ID] = &types.DownloadRecord{
+					URL:           d.URL,
+					Filename:      d.Filename,
+					ProgressState: state,
 				}
 			}
 		}
 		return active
 	}
-	return processing.CheckForDuplicate(url, activeDownloads)
+	return orchestrator.CheckForDuplicate(url, activeDownloads)
 }
 
 // renderEmptyMessage provides a consistent visual for "no data" states in dashboard panes.
@@ -181,12 +218,38 @@ func renderEmptyMessage(width, height int, message string) string {
 		EmptyMessageStyle.Render(message))
 }
 
+func (m *RootModel) refreshSettings() error {
+	if provider, ok := m.Service.(service.SettingsService); ok && !m.SettingsReadOnly {
+		settings, err := provider.GetSettings()
+		if err != nil {
+			return err
+		}
+		m.Settings = settings
+	}
+	return nil
+}
+
 func (m *RootModel) snapshotSettings() {
 	if m.Settings == nil {
 		return
 	}
 	// Deep clone settings to compare restart-required fields later.
 	m.SettingsBaseline = m.Settings.Clone()
+}
+
+func asFloat64(value any) (float64, bool) {
+	switch v := value.(type) {
+	case float64:
+		return v, true
+	case int:
+		return float64(v), true
+	case int64:
+		return float64(v), true
+	case time.Duration:
+		return float64(v), true
+	default:
+		return 0, false
+	}
 }
 
 func settingsEqual(s1, s2 *config.Setting) bool {
@@ -196,28 +259,12 @@ func settingsEqual(s1, s2 *config.Setting) bool {
 	// If both are numbers, compare their float64 representations to handle JSON deserialization type differences (int vs float64)
 	switch s1.Type {
 	case "int", "int64", "float64", "duration":
-		var v1, v2 float64
-		switch val := s1.Value.(type) {
-		case int:
-			v1 = float64(val)
-		case int64:
-			v1 = float64(val)
-		case float64:
-			v1 = val
-		case time.Duration:
-			v1 = float64(val)
+		v1, ok1 := asFloat64(s1.Value)
+		v2, ok2 := asFloat64(s2.Value)
+		if ok1 && ok2 {
+			return v1 == v2
 		}
-		switch val := s2.Value.(type) {
-		case int:
-			v2 = float64(val)
-		case int64:
-			v2 = float64(val)
-		case float64:
-			v2 = val
-		case time.Duration:
-			v2 = float64(val)
-		}
-		return v1 == v2
+		return reflect.DeepEqual(s1.Value, s2.Value)
 	default:
 		return reflect.DeepEqual(s1.Value, s2.Value)
 	}
@@ -228,28 +275,19 @@ func (m *RootModel) checkRestartRequirement() bool {
 		return false
 	}
 
-	val1 := reflect.ValueOf(m.Settings).Elem()
-	val2 := reflect.ValueOf(m.SettingsBaseline).Elem()
-	typ := val1.Type()
-
-	for i := 0; i < typ.NumField(); i++ {
-		catField1 := val1.Field(i)
-		catField2 := val2.Field(i)
-		if catField1.Kind() != reflect.Struct {
+	for i, cat := range m.Settings.CategoriesList {
+		if i >= len(m.SettingsBaseline.CategoriesList) {
 			continue
 		}
-
-		catTyp := catField1.Type()
-		for j := 0; j < catTyp.NumField(); j++ {
-			f1 := catField1.Field(j)
-			f2 := catField2.Field(j)
-			s1, ok1 := f1.Interface().(*config.Setting)
-			s2, ok2 := f2.Interface().(*config.Setting)
-			if ok1 && ok2 && s1 != nil && s2 != nil {
-				if s1.NeedsRestart {
-					if !settingsEqual(s1, s2) {
-						return true
-					}
+		baselineCat := m.SettingsBaseline.CategoriesList[i]
+		for j, set := range cat.Settings {
+			if set.NeedsRestart {
+				if j >= len(baselineCat.Settings) {
+					continue
+				}
+				baseline := baselineCat.Settings[j]
+				if !settingsEqual(set, baseline) {
+					return true
 				}
 			}
 		}

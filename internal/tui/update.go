@@ -1,7 +1,13 @@
 package tui
 
 import (
+	"errors"
+	"fmt"
+	"os"
+	"time"
+
 	"github.com/msh2050/fluxget/internal/config"
+	"github.com/msh2050/fluxget/internal/selfupdate"
 	"github.com/msh2050/fluxget/internal/utils"
 
 	"charm.land/lipgloss/v2"
@@ -10,16 +16,26 @@ import (
 )
 
 func (m RootModel) updatePaste(msg tea.PasteMsg) (tea.Model, tea.Cmd) {
-
-	if m.state == DashboardState && m.searchActive {
-		var cmd tea.Cmd
-		m.searchInput, cmd = m.searchInput.Update(msg)
-		m.searchQuery = m.searchInput.Value()
-		m.UpdateListItems()
-		return m, cmd
+	if m.state == DashboardState {
+		if m.searchActive {
+			var cmd tea.Cmd
+			m.searchInput, cmd = m.searchInput.Update(msg)
+			m.searchQuery = m.searchInput.Value()
+			m.UpdateListItems()
+			return m, cmd
+		}
+		return m.handleClipboardPaste(msg.String())
 	}
 
 	switch m.state {
+	case HelpModalState:
+		if m.helpSearchActive {
+			var cmd tea.Cmd
+			m.helpSearchInput, cmd = m.helpSearchInput.Update(msg)
+			m.helpSearchQuery = m.helpSearchInput.Value()
+			return m, cmd
+		}
+		return m, nil
 	case InputState, ExtensionConfirmationState:
 		var cmd tea.Cmd
 		m.inputs[m.focusedInput], cmd = m.inputs[m.focusedInput].Update(msg)
@@ -28,20 +44,35 @@ func (m RootModel) updatePaste(msg tea.PasteMsg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.urlUpdateInput, cmd = m.urlUpdateInput.Update(msg)
 		return m, cmd
-	case SettingsState:
-		if m.SettingsIsEditing {
+	case SpeedLimitsState:
+		if m.speedLimitsIsEditing {
 			var cmd tea.Cmd
 			m.SettingsInput, cmd = m.SettingsInput.Update(msg)
 			return m, cmd
 		}
 		return m, nil
-	case CategoryManagerState:
-		if m.catMgrEditing {
+	case SettingsState:
+		if m.settingsSearchActive {
 			var cmd tea.Cmd
-			m.catMgrInputs[m.catMgrEditField], cmd = m.catMgrInputs[m.catMgrEditField].Update(msg)
+			m.settingsSearchInput, cmd = m.settingsSearchInput.Update(msg)
+			m.settingsSearchQuery = m.settingsSearchInput.Value()
+			m.SettingsSelectedRow = 0
+			m.normalizeSettingsSelection()
+			return m, cmd
+		}
+		if m.SettingsIsEditing {
+			typ := m.getCurrentSettingType()
+			if typ == config.TypeCustomCategory || typ == config.TypeCustomCategoryAdd {
+				var cmd tea.Cmd
+				m.catMgrInputs[m.catMgrEditField], cmd = m.catMgrInputs[m.catMgrEditField].Update(msg)
+				return m, cmd
+			}
+			var cmd tea.Cmd
+			m.SettingsInput, cmd = m.SettingsInput.Update(msg)
 			return m, cmd
 		}
 		return m, nil
+
 	default:
 		return m, nil
 	}
@@ -49,9 +80,63 @@ func (m RootModel) updatePaste(msg tea.PasteMsg) (tea.Model, tea.Cmd) {
 
 // Update handles messages and updates the model
 func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if result, ok := msg.(categoryAssignedMsg); ok {
+		if d := m.FindDownloadByID(result.id); d != nil {
+			d.moving = false
+			if result.status != nil {
+				d.fileMissing = result.status.FileMissing
+				d.moving = result.status.Moving
+			}
+		}
+		m.UpdateListItems()
+		if result.err != nil {
+			if result.status != nil && result.status.FileMissing {
+				m.addStyledLogEntry(logError, "Move failed: file missing")
+				return m, nil
+			}
+			m.addStyledLogEntry(logError, "Category update failed: "+result.err.Error())
+			return m, nil
+		}
+		if d := m.FindDownloadByID(result.id); d != nil {
+			category := result.category
+			d.categoryOverride = &category
+			if result.status != nil {
+				if result.status.DestPath != "" {
+					d.Destination = result.status.DestPath
+				}
+				d.fileMissing = result.status.FileMissing
+			}
+		}
+		m.addStyledLogEntry(logStarted, "Category assignment saved")
+		m.UpdateListItems()
+		return m, nil
+	}
+
+	// Dynamically reload keymap.json on the fly if it is updated on disk
+	if time.Since(m.lastConfigCheckTime) > 1*time.Second {
+		m.lastConfigCheckTime = time.Now()
+		if info, err := os.Stat(config.GetKeyMapConfigPath()); err == nil {
+			if info.ModTime().After(m.lastKeyMapModTime) {
+				preLoadModTime := info.ModTime()
+				if newKeys, err := config.LoadKeyMap(); err == nil && newKeys != nil {
+					m.keys = newKeys
+					if postInfo, postErr := os.Stat(config.GetKeyMapConfigPath()); postErr == nil {
+						m.lastKeyMapModTime = postInfo.ModTime()
+					} else {
+						m.lastKeyMapModTime = preLoadModTime
+					}
+					utils.Debug("TUI: dynamically reloaded keymap.json from disk")
+				}
+			}
+		}
+	}
 
 	if m.Settings == nil {
 		m.Settings = config.DefaultSettings()
+	}
+
+	if m.keys == nil {
+		m.keys = config.DefaultKeyMap()
 	}
 
 	if m.shuttingDown {
@@ -71,22 +156,15 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	switch msg := msg.(type) {
-
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m.lastResizeTime = time.Now()
 
 		if m.state == SettingsState {
 			m.normalizeSettingsSelection()
 			if m.SettingsIsEditing {
 				m.updateSettingsInputWidthForViewport()
-			}
-		}
-
-		if m.state == CategoryManagerState {
-			m.normalizeCategoryManagerSelection()
-			if m.catMgrEditing {
-				m.updateCategoryInputWidthsForViewport()
 			}
 		}
 
@@ -106,7 +184,7 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		listInnerPadding := lipgloss.NewStyle().Padding(1, 2)
 		m.list.SetSize(
 			layout.ListWidth-listInnerPadding.GetHorizontalFrameSize()-BoxStyle.GetHorizontalFrameSize(),
-			layout.ListHeight-layout.TabBarHeight-BoxStyle.GetVerticalFrameSize()-listInnerPadding.GetVerticalFrameSize(),
+			layout.ListHeight-layout.TabBarHeight-BoxStyle.GetVerticalFrameSize()-listInnerPadding.GetVerticalFrameSize()-1,
 		)
 
 		// Update list based on active tab
@@ -119,10 +197,6 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		return m, nil
 
-	case notificationTickMsg:
-		// Notification tick is still used but logs don't expire
-		return m, nil
-
 	case extensionTokenFlashFadeMsg:
 		m.ExtensionTokenCopied = false
 		return m, nil
@@ -133,6 +207,24 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.state = UpdateAvailableState
 		}
 		return m, nil
+
+	case selfUpdateResultMsg:
+		if errors.Is(msg.err, selfupdate.ErrNoUpdate) {
+			m.addStyledLogEntry(logComplete, "\u2714 Surge is already up to date")
+			return m, nil
+		}
+		if msg.err != nil {
+			m.addStyledLogEntry(logError, fmt.Sprintf("\u2716 Update failed: %s", msg.err.Error()))
+			return m, nil
+		}
+		versionLabel := "latest version"
+		if msg.Info != nil && msg.Info.LatestVersion != "" {
+			versionLabel = msg.Info.LatestVersion
+		}
+		m.addStyledLogEntry(logComplete, fmt.Sprintf("\u2714 Installed Surge %s. Restarting...", versionLabel))
+		m.RestartRequested = true
+		m.shuttingDown = true
+		return m, shutdownCmd(m.Service)
 
 	case shutdownCompleteMsg:
 		if msg.err != nil {
@@ -180,7 +272,6 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyPressMsg:
 		switch m.state {
-
 		case DashboardState:
 			return m.updateDashboard(msg)
 
@@ -214,8 +305,19 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case BatchConfirmState:
 			return m.updateBatchConfirm(msg)
 
+		case SpeedLimitsState:
+			return m.updateSpeedLimits(msg)
+
+		case CategoryMoveConfirmState:
+			return m.updateCategoryMoveConfirm(msg)
+
+		case CategoryPickerState:
+			return m.updateCategoryPicker(msg)
+
 		case SettingsState:
 			return m.updateSettings(msg)
+		case SettingsConfirmState:
+			return m.updateSettingsConfirmation(msg)
 
 		case UpdateAvailableState:
 			return m.updateUpdateAvailable(msg)
@@ -223,15 +325,8 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case URLUpdateState:
 			return m.updateURLUpdate(msg)
 
-		case CategoryManagerState:
-			return m.updateCategoryManager(msg)
-
 		case HelpModalState:
-			if msg.String() == "esc" {
-				m.state = DashboardState
-				return m, nil
-			}
-			return m, nil
+			return m.updateHelpModal(msg)
 
 		case BugReportTargetState:
 			return m.updateBugReportTarget(msg)
@@ -242,8 +337,11 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case BugReportLogPathState:
 			return m.updateBugReportLogPath(msg)
 
-		case CategoryResetConfirmState:
-			return m.updateCategoryResetConfirm(msg)
+		case PurgeConfirmState:
+			return m.updatePurgeConfirm(msg)
+
+		case RemoveConfirmState:
+			return m.updateRemoveConfirm(msg)
 
 		default:
 			return m, nil

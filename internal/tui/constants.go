@@ -1,15 +1,8 @@
 package tui
 
-import (
-	"time"
-
-	"github.com/msh2050/fluxget/internal/engine/types"
-)
+import "time"
 
 const (
-	// === Timeouts and Intervals ===
-	TickInterval = 200 * time.Millisecond
-
 	// === Layout Ratios ===
 	ListWidthRatio         = 0.6  // Dashboard: List takes 60% width
 	SettingsWidthRatio     = 0.72 // Modals: Settings/Category use 72% width
@@ -23,17 +16,14 @@ const (
 
 	MinSettingsWidth      = 64
 	MaxSettingsWidth      = 130
-	MinSettingsHeight     = 12
 	DefaultSettingsHeight = 26
 
-	MinRightColumnWidth = 50 // Hide right column if narrow
+	MinRightColumnWidth = 48 // Keep details visible at the common 120-column width
 	MinGraphStatsWidth  = 50 // Show inline graph stats whenever right column is visible
 	MinLogoWidth        = 40 // Hide ASCII logo if narrow
 
 	MinGraphHeight      = 9
 	MinGraphHeightShort = 5
-	MinListHeight       = 10
-	MinChunkMapHeight   = 4
 	MinChunkMapVisibleH = 18 // Min term height to show chunk map
 
 	// === Component Heights ===
@@ -41,38 +31,30 @@ const (
 	HeaderHeightMax    = 11
 	HeaderHeightMin    = 3
 	FilePickerHeight   = 12
-	CardHeight         = 2 // Compact rows for downloads list
 
 	// === Padding and Offsets ===
 	DefaultPaddingX        = 1
 	DefaultPaddingY        = 0
 	PopupPaddingX          = 2
 	PopupPaddingY          = 1
-	PopupWidth             = 70 // Consistent width for small popup dialogs
+	PopupWidth             = 96 // Fits the complete three-column shortcut list on standard terminals
 	HeaderWidthOffset      = 2
 	ProgressBarWidthOffset = 4
 
 	// === Layout Offsets (Clean Math) ===
 	InternalPaddingHeight = 2 // Standard internal vertical padding
-	InternalPaddingWidth  = 2 // Standard internal horizontal padding
 	FooterHeight          = 1 // Application-wide footer height (keybindings)
 	DividerHeight         = 1 // Horizontal/Vertical divider line
 
 	// === Graph Configuration ===
-	GraphAxisWidth  = 10
-	GraphStatsWidth = 18
-	GraphHeadroom   = 1.1 // Scale max speed by 110% for visual headroom
+	GraphAxisWidth      = 10
+	GraphStatsWidth     = 18
+	GraphHeadroom       = 1.1                     // Scale max speed by 110% for visual headroom
+	GraphUpdateInterval = 1000 * time.Millisecond // Interval at which the speed history is updated
+	GraphHistoryPoints  = 60                      // 60 points * 1s = 60s of history
 
 	// === Input Dimensions ===
 	InputWidth        = 40
 	MinSettingsInputW = 8
 	MaxSettingsInputW = 48
-
-	// === Channel Buffers ===
-	ProgressChannelBuffer = types.ProgressChannelBuffer
-
-	// === Units ===
-	KB = types.KB
-	MB = types.MB
-	GB = types.GB
 )

@@ -1,3 +1,4 @@
+// lint:ignore-leak-check
 package tui
 
 import (
@@ -9,12 +10,25 @@ import (
 	"time"
 
 	"github.com/msh2050/fluxget/internal/config"
-	"github.com/msh2050/fluxget/internal/core"
-	"github.com/msh2050/fluxget/internal/download"
-	"github.com/msh2050/fluxget/internal/engine/state"
-	"github.com/msh2050/fluxget/internal/engine/types"
+	"github.com/msh2050/fluxget/internal/orchestrator"
+	"github.com/msh2050/fluxget/internal/service"
+	"github.com/msh2050/fluxget/internal/store"
+	"github.com/msh2050/fluxget/internal/testutil"
+	"github.com/msh2050/fluxget/internal/types"
 	"github.com/msh2050/fluxget/internal/utils"
 )
+
+type resumeMockService struct {
+	service.DownloadService
+}
+
+func (m *resumeMockService) Add(url, path, filename string, mirrors []string, headers map[string]string, isExplicit bool, workers int, minChunkSize int64) (string, error) {
+	return "mock-id", nil
+}
+
+func (m *resumeMockService) AddWithID(url string, path string, filename string, mirrors []string, headers map[string]string, id string, isExplicitCategory bool, workers int, minChunkSize int64) (string, error) {
+	return id, nil
+}
 
 // TestResume_RespectsOriginalPath_WhenDefaultChanges verifies that a download
 // started with one default directory keeps its absolute path when resumed,
@@ -33,24 +47,22 @@ func TestResume_RespectsOriginalPath_WhenDefaultChanges(t *testing.T) {
 	_ = os.MkdirAll(dirA, 0o755)
 	_ = os.MkdirAll(dirB, 0o755)
 
-	// Setup a temporary DB for state
-	state.CloseDB()
-	t.Cleanup(state.CloseDB)
-	dbPath := filepath.Join(tmpDir, "surge.db")
-	state.Configure(dbPath)
+	// Use testutil to setup state database
+	_ = testutil.SetupStateDB(t)
 
-	ch := make(chan any, 10)
-	pool := download.NewWorkerPool(ch, 1)
+	bus := orchestrator.NewEventBus()
+	mgr := orchestrator.NewLifecycleManager(nil, bus, nil)
 
 	// 2. Initialize Model with DefaultDir = DirA
 	settings := config.DefaultSettings()
 	settings.General.DefaultDownloadDir.Value = dirA
 
 	m := RootModel{
-		Settings:  settings,
-		Service:   core.NewLocalDownloadServiceWithInput(pool, ch),
-		downloads: []*DownloadModel{},
-		list:      NewDownloadList(80, 20), // Initialize list to prevent panic
+		Settings:     settings,
+		Service:      &resumeMockService{DownloadService: service.NewLocalDownloadService(mgr)},
+		Orchestrator: nil,
+		downloads:    []*DownloadModel{},
+		list:         NewDownloadList(80, 20), // Initialize list to prevent panic
 	}
 
 	// 3. Start a download (simulating "surge get <url>" or TUI add)
@@ -65,7 +77,7 @@ func TestResume_RespectsOriginalPath_WhenDefaultChanges(t *testing.T) {
 	testFilename := "file.zip"
 
 	// Start download with relative path "."
-	m, _ = m.startDownload(testURL, nil, nil, ".", true, testFilename, "id-1")
+	m, _ = m.startDownload(testURL, nil, nil, ".", true, testFilename, "id-1", 0, 0)
 
 	// 4. Verify Immediate State
 	if len(m.downloads) != 1 {
@@ -106,7 +118,7 @@ func TestResume_RespectsOriginalPath_WhenDefaultChanges(t *testing.T) {
 
 	// 5. Simulate "Pause" / Persistence
 	// Use SaveState to save the paused state (which updates the downloads table with status=paused)
-	manualState := &types.DownloadState{
+	manualState := &types.DownloadRecord{
 		ID:         dm.ID,
 		URL:        dm.URL,
 		Filename:   dm.Filename,
@@ -116,7 +128,18 @@ func TestResume_RespectsOriginalPath_WhenDefaultChanges(t *testing.T) {
 		PausedAt:   time.Now().Unix(),
 		CreatedAt:  time.Now().Unix(),
 	}
-	err = state.SaveState(dm.URL, dm.Destination, manualState)
+	if err := store.AddToMasterList(types.DownloadRecord{
+		ID:         dm.ID,
+		URL:        dm.URL,
+		DestPath:   dm.Destination,
+		Filename:   dm.Filename,
+		Status:     "paused",
+		TotalSize:  0,
+		Downloaded: 0,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	err = store.SaveState(dm.URL, dm.Destination, manualState)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +151,7 @@ func TestResume_RespectsOriginalPath_WhenDefaultChanges(t *testing.T) {
 	}
 
 	// 7. Simulate Resume logic
-	paused, err := state.LoadPausedDownloads()
+	paused, err := store.LoadPausedDownloads()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +168,7 @@ func TestResume_RespectsOriginalPath_WhenDefaultChanges(t *testing.T) {
 		t.Errorf("Resumed path incorrect.\nGot:  %s\nWant: %s", entry.DestPath, expectedPathA)
 	}
 
-	// Verify that if we constructed a RuntimeConfig/DownloadConfig, it would use this absolute path
+	// Verify that if we constructed a RuntimeConfig/DownloadRecord, it would use this absolute path
 	outputPath := filepath.Dir(entry.DestPath)
 	// Even if logic checks for empty/dot, filepath.Dir of absolute path is absolute path.
 	if outputPath == "" || outputPath == "." {

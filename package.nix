@@ -1,43 +1,60 @@
 {
   lib,
-  buildGoModule,
-  src,
-  version,
+  stdenvNoCC,
+  fetchurl,
 }:
-buildGoModule {
+let
+  release = builtins.fromJSON (builtins.readFile ./nix/release.json);
+  inherit (release) version;
+  archives = {
+    x86_64-linux = "linux_amd64";
+    aarch64-linux = "linux_arm64";
+    x86_64-darwin = "darwin_amd64";
+    aarch64-darwin = "darwin_arm64";
+  };
+  system = stdenvNoCC.hostPlatform.system;
+in
+stdenvNoCC.mkDerivation {
   pname = "surge";
-  inherit version src;
+  inherit version;
 
-  vendorHash = "sha256-tXJUr/URQZC+tNq+HOIuinaqbeElJMPWQH/MG1rY80I=";
+  src = fetchurl {
+    url = "https://github.com/SurgeDM/Surge/releases/download/v${version}/Surge_${version}_${archives.${system}}.tar.gz";
+    hash = release.hashes.${system};
+  };
 
-  subPackages = ["."];
+  sourceRoot = ".";
+  dontConfigure = true;
+  dontBuild = true;
+  dontStrip = true;
+  dontPatchELF = true;
 
-  ldflags = [
-    "-s"
-    "-w"
-    "-X main.version=${version}"
-  ];
-
-  postInstall = ''
-    ln -s Surge $out/bin/surge
+  installPhase = ''
+    runHook preInstall
+    install -Dm755 surge "$out/bin/surge"
+    # Case-insensitive macOS stores already resolve both executable names.
+    if [ ! -e "$out/bin/Surge" ]; then
+      ln -s surge "$out/bin/Surge"
+    fi
+    install -Dm644 LICENSE "$out/share/licenses/surge/LICENSE"
+    runHook postInstall
   '';
 
   doInstallCheck = true;
   installCheckPhase = ''
-    $out/bin/Surge --version
-    $out/bin/surge --version
-  '';
-
-  # Tests write to $HOME/.config; redirect to a writable tmpdir.
-  preCheck = ''
-    export HOME=$TMPDIR
+    runHook preInstallCheck
+    test "$("$out/bin/surge" --version)" = "Surge v${version}"
+    test "$("$out/bin/Surge" --version)" = "Surge v${version}"
+    runHook postInstallCheck
   '';
 
   meta = {
     description = "Blazing fast TUI download manager built in Go";
     homepage = "https://github.com/SurgeDM/Surge";
+    changelog = "https://github.com/SurgeDM/Surge/releases/tag/v${version}";
     license = lib.licenses.mit;
     mainProgram = "surge";
-    platforms = lib.platforms.linux ++ lib.platforms.darwin;
+    sourceProvenance = [ lib.sourceTypes.binaryNativeCode ];
+    platforms = builtins.attrNames archives;
   };
 }

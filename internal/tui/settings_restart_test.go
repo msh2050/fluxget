@@ -54,7 +54,7 @@ func TestDefensiveSnapshotting(t *testing.T) {
 		Settings: config.DefaultSettings(),
 		state:    SettingsState,
 	}
-	m.keys = Keys
+	m.keys = config.DefaultKeyMap()
 
 	// 1. baseline is missing
 	if m.SettingsBaseline != nil {
@@ -72,12 +72,16 @@ func TestDefensiveSnapshotting(t *testing.T) {
 }
 
 func TestBaselineCleanup(t *testing.T) {
+	configHome := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", configHome)
+	t.Setenv("APPDATA", configHome)
+
 	m := RootModel{
 		Settings:         config.DefaultSettings(),
 		SettingsBaseline: config.DefaultSettings(),
 		state:            SettingsState,
 	}
-	m.keys = Keys
+	m.keys = config.DefaultKeyMap()
 
 	// 1. Exit settings using the 'Close' key (e.g. 'esc')
 	msg := tea.KeyPressMsg{Code: tea.KeyEscape}

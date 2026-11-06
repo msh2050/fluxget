@@ -5,191 +5,195 @@ const FLUXGET_PORT = 1700;
 const BASE_URL     = `http://127.0.0.1:${FLUXGET_PORT}`;
 
 // File extensions FluxGet intercepts from the browser's own downloader.
-// Matches IDM's default intercept list from the decompiled IDMNetMon analysis.
+// IDM's default list (no still images — "Save image as…" stays in the browser).
 const INTERCEPT_EXTS = new Set([
-  "zip","rar","7z","gz","tar","bz2","xz","zst","cab","iso","img","dmg",
-  "exe","msi","deb","rpm","pkg","apk","appimage",
-  "mp4","mkv","avi","mov","flv","wmv","webm","m4v","ts","mpeg","mpg","3gp","ogv",
-  "mp3","aac","flac","ogg","opus","wav","m4a","wma",
-  "pdf","doc","docx","xls","xlsx","ppt","pptx","odt","ods",
-  "jpg","jpeg","png","gif","webp","bmp","tiff","svg",
+  "zip","rar","7z","gz","tgz","tar","bz2","xz","zst","lz","lzh","cab","arj","iso","img","dmg","bin",
+  "exe","msi","msu","deb","rpm","pkg","apk","xapk","appimage","flatpak","snap",
+  "mp4","mkv","avi","mov","flv","wmv","webm","m4v","ts","mpeg","mpg","3gp","ogv","rm","rmvb","asf","qt",
+  "mp3","aac","flac","ogg","opus","wav","m4a","wma","aif","ra","mpa",
+  "pdf","doc","docx","xls","xlsx","ppt","pptx","pps","odt","ods","epub",
+  "tif","tiff","torrent",
   "m3u8","mpd",
 ]);
 
 // MIME types that always go to FluxGet (never let browser handle them)
-const INTERCEPT_MIME = /^(video\/|audio\/|application\/(zip|x-rar|x-7z|octet-stream|x-iso9660|vnd\.android|x-deb|x-rpm|x-msdownload|x-apple-diskimage|x-mpegurl|dash\+xml)|image\/(?!webp))/i;
+const INTERCEPT_MIME = /^(video\/|audio\/|application\/(zip|x-zip-compressed|x-rar|vnd\.rar|x-7z|x-iso9660|vnd\.android|x-deb|vnd\.debian|x-rpm|x-msdownload|x-msi|x-apple-diskimage|x-mpegurl|vnd\.apple\.mpegurl|dash\+xml|x-tar|gzip|x-gzip|x-bzip2|x-xz|zstd|pdf))/i;
+
+// Don't intercept tiny files (icons, small JSON/CSV exports) when the size is known.
+const MIN_INTERCEPT_BYTES = 512 * 1024;
 
 // Video MIME types captured from network (not intercepted as downloads, but shown as button)
 const VIDEO_MIME_RE = /^(video|audio)\/|application\/(x-mpegurl|vnd\.apple\.mpegurl|dash\+xml|vnd\.ms-sstr\+xml)/i;
 const VIDEO_EXT_RE  = /\.(mp4|webm|mkv|m3u8|mpd|flv|avi|mov|m4v|m4a|mp3|ogg|opus)(\?|#|$)/i;
 // HLS/DASH manifest paths that don't use standard extensions (IDMNetMon pattern: ^/playlist/\w+/|^/hls/)
-const MANIFEST_PATH_RE = /\/(playlist|master|index|manifest|stream)(\.m3u8|\.mpd)?(\?|$)/i;
+const MANIFEST_PATH_RE = /\/(playlist|master|manifest|chunklist)[^/]*?\.(m3u8|mpd)(\?|$)|\/(hls|dash)\/[^?]*\.(m3u8|mpd)(\?|$)/i;
 
-// Skip individual adaptive segments — matches IDMNetMon's segment skip logic:
-//  • .ts/.m4s/.cmfa/.cmfv/.fmp4 (common HLS/DASH chunk extensions)
-//  • YouTube CDN: M4S in /avf/ or /sep/ path + filename starts "segment-"
-//  • YouTube CDN: MP4 in /avf/ or /parcel/ path
-//  • /api/manifest/init_segment (YouTube DASH init)
-const SKIP_FRAG_RE = /\.(ts|m4s|cmfa|cmfv|fmp4)(\?|#|$)/i;
+// Skip individual adaptive segments — IDMNetMon's segment skip logic.
+const SKIP_FRAG_RE = /\.(ts|m4s|cmfa|cmfv|fmp4|aac|vtt|webvtt|key)(\?|#|$)/i;
 
 function isYouTubeCDNFragment(url) {
   const u = url.toLowerCase();
-  // M4S segments in YouTube's adaptive paths
   if (u.includes(".m4s") && (u.includes("/avf/") || u.includes("/sep/"))) return true;
-  // MP4 chunks in adaptive fragmented paths
   const path = u.split("?")[0];
   if (path.endsWith(".mp4") && (u.includes("/avf/") || u.includes("/parcel/"))) return true;
-  // YouTube DASH init segment
   if (u.includes("/api/manifest/init_segment")) return true;
+  // googlevideo videoplayback range requests are SABR/DASH fragments, not files
+  if (u.includes("googlevideo.com/videoplayback")) return true;
   return false;
 }
 
-// IDMNetMon site dispatch table (exact order from decompiled IDMNetMon.dll lines 35974-36059):
-//  1. application/vnd.lumberjack.manifest  → Lumberjack handler
-//  2. MPD extension                         → DASH handler
-//  3. youtube.com / youtube-nocookie.com / googlevideo.com /
-//     drive.google.com / docs.google.com / youtube.googleapis.com → YouTubeParser
-//  4. facebook.com / workplace.com          → FacebookParser
-//  5. vimeo.com                             → VimeoParser
-//  6. instagram.com                         → InstagramParser
-//  7. ok.ru / mycdn.me                      → OKParser
-//  8. hydrax.to (/playlist/ or /hls/ path) → HydraxParser
-//  9. Generic fallback
-//
-// CDN domains (direct media — not page-level parsers, use native downloader):
-//  fbcdn.net, vimeocdn.com, *-vimeo.akamaized.net, *-adaptive.akamaized.net,
-//  cdninstagram.com, vkuser.net, *-hls-media.sndcdn.com
-
-// KNOWN_VIDEO_HOSTS: page-level hosts where we trigger video extraction.
-// CDN domains are intentionally excluded — those serve direct URLs, not pages.
+// IDMNetMon site dispatch table order (decompiled IDMNetMon.dll 35974-36059):
+// Lumberjack → MPD → YouTube → Facebook → Vimeo → Instagram → OK/mycdn → Hydrax → generic.
 const KNOWN_VIDEO_HOSTS = [
-  // Google / YouTube
   "youtube.com", "youtu.be", "youtube-nocookie.com",
-  "googlevideo.com", "youtube.googleapis.com",
-  "drive.google.com", "docs.google.com",
-  // Facebook / Meta
+  "youtube.googleapis.com", "drive.google.com", "docs.google.com",
   "facebook.com", "workplace.com", "fb.watch",
-  // Instagram
   "instagram.com",
-  // Vimeo
   "vimeo.com",
-  // ok.ru / VK ecosystem
-  "ok.ru", "mycdn.me", "vk.com", "vkuser.net",
-  // SoundCloud (CDN: *.sndcdn.com)
-  "soundcloud.com", "sndcdn.com",
-  // Hydrax
+  "ok.ru", "mycdn.me", "vk.com", "vkvideo.ru",
+  "soundcloud.com",
   "hydrax.to",
-  // Udemy (uses HLS: \.(m3u8|mpd)(\?|$))
   "udemy.com",
-  // Twitch (Twitch uses HLS: ^/playlist/\w+/(\d+)|^/hls/\w+/\w+)
-  "twitch.tv", "twitch.com",
-  // Others commonly intercepted by IDM / yt-dlp
+  "twitch.tv",
   "dailymotion.com", "tiktok.com",
-  "twitter.com", "x.com", "t.co",
+  "twitter.com", "x.com",
   "reddit.com",
-  "bilibili.com", "bilivideo.com",
-  "nicovideo.jp", "dmc.nico",
+  "bilibili.com", "bilibili.tv",
+  "nicovideo.jp",
   "bandcamp.com",
   "rumble.com",
   "odysee.com",
-  "peertube.social",
   "streamable.com",
   "mixcloud.com",
-  // Yandex (strm.yandex.ru)
-  "yandex.ru", "yandex.com",
+  "kick.com",
+  "yandex.ru", "yandex.com", "dzen.ru",
+  "rutube.ru",
+  "9gag.com", "imgur.com", "pinterest.com", "linkedin.com", "tumblr.com",
 ];
 
-// ── State ─────────────────────────────────────────────────────────────────────
-// tabId → [{ url, type, size, ts, quality }]  captured network videos
-const capturedVideos = new Map();
+// ── Per-tab state (persisted: the MV3 worker is killed after ~30 s idle) ─────
+// tab → { captured: [{url,type,size,ts,referer,hasSubs}], page: {hls,dash,formats,title,videoId,pageUrl} }
+const tabCache = new Map();
+const MAX_CAPTURED = 60;
 
-// tabId → { dashUrl, hlsUrl, formats, title }  from document.js
-const pageVideoData  = new Map();
+async function getTab(tabId) {
+  if (tabId == null || tabId < 0) return { captured: [], page: null };
+  if (tabCache.has(tabId)) return tabCache.get(tabId);
+  let st = { captured: [], page: null };
+  try {
+    const key = `tab_${tabId}`;
+    const got = await chrome.storage.session.get(key);
+    if (got[key]) st = got[key];
+  } catch {}
+  tabCache.set(tabId, st);
+  return st;
+}
 
-// hostname → cookie string captured live from onBeforeSendHeaders.
-// Mirrors IDM's approach: intercept the actual Cookie headers the browser sends
-// for CDN segment requests (e.g. lh3.googleusercontent.com) as the video plays,
-// so FluxGet can use authentic Google/CDN session cookies for downloading.
+const saveTimers = new Map();
+function saveTab(tabId) {
+  if (tabId == null || tabId < 0) return;
+  clearTimeout(saveTimers.get(tabId));
+  saveTimers.set(tabId, setTimeout(() => {
+    saveTimers.delete(tabId);
+    const st = tabCache.get(tabId);
+    if (!st) return;
+    // Formats carry long signed URLs; keep the stored copy bounded.
+    chrome.storage.session.set({ [`tab_${tabId}`]: st }).catch(() => {});
+  }, 300));
+}
+
+async function clearTab(tabId) {
+  tabCache.set(tabId, { captured: [], page: null });
+  try { await chrome.storage.session.remove(`tab_${tabId}`); } catch {}
+}
+
+async function addCaptured(tabId, entry) {
+  const st = await getTab(tabId);
+  const existing = st.captured.find(v => v.url === entry.url);
+  if (existing) {
+    Object.assign(existing, Object.fromEntries(Object.entries(entry).filter(([, v]) => v)));
+  } else {
+    st.captured.push(entry);
+    if (st.captured.length > MAX_CAPTURED) st.captured.splice(0, st.captured.length - MAX_CAPTURED);
+  }
+  saveTab(tabId);
+  updateTabBadge(tabId, st);
+}
+
+// hostname → Cookie header captured live from onBeforeSendHeaders.
 const capturedDomainCookies = new Map();
 
 // Settings (loaded from chrome.storage.local)
 let settings = {
-  interceptDownloads: true,  // intercept browser file downloads
-  autoDownloadVideo: false,  // auto-send video without prompt
+  interceptDownloads: true,
+  autoDownloadVideo: false,
   port: FLUXGET_PORT,
   destDir: "",
 };
 
 // ── Quality picker builder (IDM-style) ───────────────────────────────────────
-// Builds a deduplicated list of quality options from ytInitialPlayerResponse formats.
-// Each entry has: label, height, codec, videoUrl, audioUrl, ytFormat (fallback)
+// Each entry: label, height, codec, type, maxHeight (for /stream), and the
+// direct formats to use when YouTube exposed un-ciphered URLs.
 function buildPickerOptions(formats) {
-  const videoByHeight = new Map();  // height → best video format
+  const videoByHeight = new Map();
   let bestAudio = null;
-
   for (const f of formats) {
-    const mime = f.mimeType || "";
-    if (f.height > 0) {
-      const existing = videoByHeight.get(f.height);
-      const better = !existing
-        || (f.url && !existing.url)               // prefer direct URL
-        || (f.url && existing.url && (f.bitrate || 0) > (existing.bitrate || 0));
-      if (better) videoByHeight.set(f.height, f);
+    const mime = (f.mimeType || "").toLowerCase();
+    if (f.height > 0 && mime.startsWith("video/")) {
+      const cur = videoByHeight.get(f.height);
+      const score = x => (x.url ? 1e12 : 0) + (x.progressive ? 0 : 1e11) + (x.bitrate || 0);
+      if (!cur || score(f) > score(cur)) videoByHeight.set(f.height, f);
     } else if (mime.startsWith("audio/")) {
-      if (!bestAudio || (f.bitrate || 0) > (bestAudio.bitrate || 0)) bestAudio = f;
+      const better = !bestAudio || (!!f.url && !bestAudio.url) || (!!f.url === !!bestAudio.url && (f.bitrate || 0) > (bestAudio.bitrate || 0));
+      if (better) bestAudio = f;
     }
   }
-
   const codec = f => {
     const m = (f.mimeType || "").toLowerCase();
-    if (m.includes("mp4") || m.includes("avc") || m.includes("h.264")) return "MP4";
-    if (m.includes("webm") || m.includes("vp9") || m.includes("vp8")) return "WebM";
-    if (m.includes("av01") || m.includes("av1")) return "AV1";
+    if (m.includes("av01")) return "AV1";
+    if (m.includes("vp9") || m.includes("vp09") || m.includes("webm")) return "VP9";
+    if (m.includes("avc") || m.includes("mp4")) return "H.264";
     return "";
   };
-
-  const ytFmt = (height) =>
-    `bestvideo[height<=${height}]+bestaudio/bestvideo[height<=${height}]+bestaudio/best[height<=${height}]`;
-
   const options = [];
-  const sorted = [...videoByHeight.entries()].sort((a, b) => b[0] - a[0]);
-
-  for (const [height, f] of sorted) {
-    const label = f.quality || `${height}p`;
+  for (const [height, f] of [...videoByHeight.entries()].sort((a, b) => b[0] - a[0])) {
+    // Direct when this height is muxed, or when both video+audio URLs are known.
+    const direct = !!f.url && (f.progressive || !!bestAudio?.url);
     options.push({
-      label,
-      height,
-      codec:    codec(f),
-      videoUrl: f.url || "",
-      audioUrl: bestAudio?.url || "",
-      ytFormat: f.url ? "" : ytFmt(height),
-      type:     "video",
+      label: f.quality || `${height}p`,
+      height, maxHeight: height, type: "video",
+      codec: codec(f),
+      size: (f.contentLength || 0) + (f.progressive ? 0 : (bestAudio?.contentLength || 0)),
+      direct,
     });
   }
-
-  // Audio only
   if (bestAudio) {
-    const audioBitrate = bestAudio.bitrate ? Math.round(bestAudio.bitrate / 1000) + "k" : "";
-    const audioCodec   = (bestAudio.mimeType || "").toLowerCase().includes("opus") ? "Opus" : "AAC";
+    const kbps = bestAudio.bitrate ? Math.round(bestAudio.bitrate / 1000) + "k" : "";
     options.push({
-      label:    `Audio only${audioBitrate ? " " + audioBitrate : ""}`,
-      height:   0,
-      codec:    audioCodec,
-      videoUrl: "",
-      audioUrl: bestAudio.url || "",
-      ytFormat: bestAudio.url ? "" : "bestaudio/best",
-      type:     "audio",
+      label: `Audio only${kbps ? " " + kbps : ""}`,
+      height: 0, maxHeight: 0, type: "audio", audioOnly: true,
+      codec: (bestAudio.mimeType || "").toLowerCase().includes("opus") ? "Opus" : "AAC",
+      size: bestAudio.contentLength || 0,
+      direct: !!bestAudio.url,
     });
   }
-
   return options;
 }
 
 // ── Icon / badge ──────────────────────────────────────────────────────────────
+let backendUp = false;
 function setConnected(ok) {
+  backendUp = ok;
   chrome.action.setBadgeText({ text: ok ? "" : "OFF" });
   chrome.action.setBadgeBackgroundColor({ color: ok ? "#1a7f3c" : "#c0392b" });
-  chrome.action.setTitle({ title: ok ? "FluxGet (connected)" : "FluxGet (not running — start fluxget --port 1700)" });
+  chrome.action.setTitle({ title: ok ? "FluxGet (connected)" : "FluxGet (not running — start: fluxget server start)" });
+}
+
+function updateTabBadge(tabId, st) {
+  if (!backendUp) return;
+  const n = (st.captured || []).length + (st.page && (st.page.hls || st.page.dash || (st.page.formats || []).length) ? 1 : 0);
+  chrome.action.setBadgeText({ tabId, text: n ? String(Math.min(n, 99)) : "" }).catch(() => {});
+  chrome.action.setBadgeBackgroundColor({ tabId, color: "#0070c8" }).catch(() => {});
 }
 
 // ── Health check ──────────────────────────────────────────────────────────────
@@ -211,251 +215,212 @@ async function apiPost(path, body) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(8000),
+      signal: AbortSignal.timeout(10000),
     });
-    setConnected(r.ok);
-    return r.ok ? r.json().catch(() => ({})) : null;
+    setConnected(true);
+    if (!r.ok) {
+      const msg = (await r.text().catch(() => "")).trim();
+      notify("FluxGet", `Request failed (${r.status})${msg ? ": " + msg.slice(0, 160) : ""}`);
+      return null;
+    }
+    return r.json().catch(() => ({}));
   } catch (_) {
     setConnected(false);
     return null;
   }
 }
 
-// Regular file download → /download (multi-connection HTTP engine)
-function sendDownload(url, filename, headers) {
-  return apiPost("/download", { url, filename: filename || "", headers: headers || {}, skip_approval: true });
-}
-
-// getCookiesForURL returns the browser's Cookie header string for a given URL.
-// Uses the url parameter (not domain) so parent-domain cookies are included.
+// getCookiesForURL returns the browser's Cookie header for a URL (includes
+// parent-domain and partitioned cookies the page would send).
 async function getCookiesForURL(url) {
   try {
     const cookies = await chrome.cookies.getAll({ url });
-    if (cookies.length === 0) return "";
     return cookies.map(c => `${c.name}=${c.value}`).join("; ");
   } catch {
     return "";
   }
 }
 
-// sniffHLSSegmentCookies fetches an HLS manifest in the browser's authenticated
-// context (credentials:include), follows one level of indirection for master→media
-// playlists, discovers the domain(s) hosting actual video segments, and returns
-// browser cookies for those domains. This handles CDNs like lh3.googleusercontent.com
-// where segments are on a different host than the manifest.
-async function sniffHLSSegmentCookies(manifestUrl) {
-  const baseHost = new URL(manifestUrl).hostname;
-  const seen = new Set([baseHost]);
-  const cookieParts = [];
+async function headersFor(url, referer) {
+  const h = {};
+  if (referer) h.Referer = referer;
+  try {
+    const host = new URL(url).hostname;
+    const cookie = capturedDomainCookies.get(host) || await getCookiesForURL(url);
+    if (cookie) h.Cookie = cookie;
+  } catch {}
+  h["User-Agent"] = navigator.userAgent;
+  return h;
+}
 
-  const collectCookiesFor = async (segUrl) => {
+// Regular file download → /download (multi-connection HTTP engine)
+async function sendDownload(url, filename, referer) {
+  const headers = await headersFor(url, referer);
+  return apiPost("/download", { url, filename: filename || "", headers, skip_approval: true });
+}
+
+// sniffSegmentCookies fetches a manifest in the browser's authenticated
+// context, follows one master→media hop and returns cookies for the segment
+// host(s) when they differ from the manifest host (e.g. googleusercontent CDNs).
+async function sniffSegmentCookies(manifestUrl) {
+  const seen = new Set([new URL(manifestUrl).hostname]);
+  const parts = [];
+  const collect = async (u) => {
     try {
-      const h = new URL(segUrl).hostname;
+      const h = new URL(u).hostname;
       if (seen.has(h)) return;
       seen.add(h);
-      // Prefer live-captured headers (exact cookies browser sent while playing)
-      const live = capturedDomainCookies.get(h);
-      if (live) { cookieParts.push(live); return; }
-      // Fallback: chrome.cookies API (works for non-third-party cookies)
-      const c = await getCookiesForURL(segUrl);
-      if (c) cookieParts.push(c);
+      const c = capturedDomainCookies.get(h) || await getCookiesForURL(u);
+      if (c) parts.push(c);
     } catch {}
   };
-
-  const firstNonCommentURL = (text, base) => {
+  const firstURL = (text, base) => {
     for (const line of text.split("\n")) {
       const t = line.trim();
       if (!t || t.startsWith("#")) continue;
-      try { return t.startsWith("http") ? t : new URL(t, base).href; } catch {}
+      try { return new URL(t, base).href; } catch {}
     }
     return null;
   };
-
   try {
-    const r = await fetch(manifestUrl, { credentials: "include", cache: "force-cache" });
+    const r = await fetch(manifestUrl, { credentials: "include", signal: AbortSignal.timeout(8000) });
     if (!r.ok) return "";
-    const text = await r.text();
-    const firstUrl = firstNonCommentURL(text, manifestUrl);
-    if (!firstUrl) return "";
-
-    if (/\.m3u8(\?|#|$)/i.test(firstUrl)) {
-      // Master playlist — follow the first variant to find segment domain
-      await collectCookiesFor(firstUrl);
-      try {
-        const vr = await fetch(firstUrl, { credentials: "include", cache: "force-cache" });
-        if (vr.ok) {
-          const segUrl = firstNonCommentURL(await vr.text(), firstUrl);
-          if (segUrl) await collectCookiesFor(segUrl);
-        }
-      } catch {}
-    } else {
-      // Already a segment URL
-      await collectCookiesFor(firstUrl);
+    const first = firstURL(await r.text(), manifestUrl);
+    if (!first) return "";
+    await collect(first);
+    if (/\.m3u8(\?|#|$)/i.test(first)) {
+      const vr = await fetch(first, { credentials: "include", signal: AbortSignal.timeout(8000) });
+      if (vr.ok) {
+        const seg = firstURL(await vr.text(), first);
+        if (seg) await collect(seg);
+      }
     }
   } catch {}
-
-  return cookieParts.join("; ");
+  return parts.join("; ");
 }
 
-// Video / stream → /stream (uses FluxGet's native HLS/DASH engine or yt-dlp fallback)
-// Cookie strategy (mirrors IDM's onBeforeSendHeaders approach):
-//  1. Live-captured cookies from onBeforeSendHeaders (most accurate — includes
-//     partitioned/SameSite cookies the chrome.cookies API misses)
-//  2. Fallback: chrome.cookies.getAll({url}) for both manifest and segment domains
-// The user must play the video for a few seconds so the browser makes real
-// requests to the CDN and we can capture the authenticated Cookie headers.
-async function sendStream(url, title, headers, formats, extra) {
-  const allHeaders = { ...(headers || {}) };
-  const cookieParts = [];
-
-  // Manifest domain cookies — try live capture first, then cookies API
-  try {
-    const manifestHost = new URL(url).hostname;
-    const live = capturedDomainCookies.get(manifestHost);
-    if (live) {
-      cookieParts.push(live);
-    } else {
-      const c = await getCookiesForURL(url);
-      if (c) cookieParts.push(c);
-    }
-  } catch {}
-
-  // Segment domain cookies (may differ from manifest domain, e.g. turbosplayer CDN)
+// Video / stream → /stream (native HLS/DASH engine, yt-dlp fallback).
+// opts: { referer, pageUrl, formats, maxHeight, audioOnly, subtitles, ytFormat }
+async function sendStream(url, title, opts = {}) {
+  const headers = await headersFor(url, opts.referer);
   if (isManifestURL(url)) {
-    const segCookie = await sniffHLSSegmentCookies(url);
-    if (segCookie) cookieParts.push(segCookie);
+    const seg = await sniffSegmentCookies(url);
+    if (seg) headers.Cookie = headers.Cookie ? `${headers.Cookie}; ${seg}` : seg;
   }
-
-  if (cookieParts.length > 0) allHeaders.Cookie = cookieParts.join("; ");
-  return apiPost("/stream", { url, title: title || "", headers: allHeaders, formats: formats || [], ...(extra || {}) });
+  const body = {
+    url,
+    title: title || "",
+    headers,
+    formats: opts.formats || [],
+    pageUrl: opts.pageUrl || "",
+  };
+  if (opts.maxHeight) body.maxHeight = opts.maxHeight;
+  if (opts.audioOnly) body.audioOnly = true;
+  if (opts.subtitles) body.subtitles = true;
+  if (opts.ytFormat) body.ytFormat = opts.ytFormat;
+  if (settings.destDir) body.path = settings.destDir;
+  return apiPost("/stream", body);
 }
 
-// Subtitles only → /stream with subtitles:true. The backend reads the HLS
-// master's #EXT-X-MEDIA subtitle renditions (or a direct .vtt) and writes .srt.
-async function sendSubtitles(url, title, headers) {
-  return sendStream(url, title, headers || {}, [], { subtitles: true });
-}
-
-// Resolve the best URL to pull subtitles from: the HLS master is where subtitle
-// renditions are declared, so prefer it over DASH and direct video.
-function subtitleSourceURL(tabId, fallback) {
-  const pd = tabId != null ? pageVideoData.get(tabId) : null;
-  if (pd?.hls) return pd.hls;
-  const captured = getBestCaptured(tabId);
-  if (captured && isManifestURL(captured)) return captured;
-  if (pd?.dash) return pd.dash;
-  return captured || fallback || "";
+// Resolve the best URL to pull subtitles from: the HLS master is where
+// subtitle renditions are declared.
+async function subtitleSourceURL(tabId, fallback) {
+  const st = await getTab(tabId);
+  if (st.page?.hls) return st.page.hls;
+  const withSubs = st.captured.find(v => v.hasSubs);
+  if (withSubs) return withSubs.url;
+  const best = bestCaptured(st);
+  if (best && isManifestURL(best.url)) return best.url;
+  return best?.url || fallback || "";
 }
 
 // ── Notification helper ───────────────────────────────────────────────────────
 function notify(title, message) {
-  chrome.notifications.create({
-    type: "basic",
-    iconUrl: "icons/icon48.png",
-    title,
-    message,
-  });
+  chrome.notifications.create({ type: "basic", iconUrl: "icons/icon48.png", title, message });
 }
 
 // ── chrome.downloads interception (THE KEY IDM FEATURE) ──────────────────────
-// When the browser starts any download, we cancel it immediately and route
-// to FluxGet. This gives us multi-connection speed + resume capability.
-chrome.downloads.onCreated.addListener((item) => {
+// URLs we hand back to the browser after FluxGet refused/was unreachable —
+// never intercept those a second time.
+const passThrough = new Set();
+
+chrome.downloads.onCreated.addListener(async (item) => {
   if (!settings.interceptDownloads) return;
+  const url = item.finalUrl || item.url || "";
+  if (!/^https?:/i.test(url)) return;              // blob:, data:, file:, extension pages
+  if (passThrough.delete(url) || passThrough.delete(item.url)) return;
+  if (item.byExtensionId === chrome.runtime.id) return;
+  if (item.totalBytes > 0 && item.totalBytes < MIN_INTERCEPT_BYTES) return;
 
-  // Skip downloads that look internal / extension-initiated
-  if (!item.url || item.url.startsWith("blob:") || item.url.startsWith("data:")) return;
-  if (!item.url.startsWith("http")) return;
-
-  // Decide whether to intercept based on MIME or file extension
   const mime = (item.mime || "").toLowerCase();
-  const ext  = (item.filename || item.url).split("?")[0].split(".").pop().toLowerCase();
+  const name = (item.filename || url.split("?")[0]).split(/[\\/]/).pop();
+  const ext  = name.includes(".") ? name.split(".").pop().toLowerCase() : "";
+  if (!(INTERCEPT_MIME.test(mime) || INTERCEPT_EXTS.has(ext))) return;
 
-  const shouldIntercept = INTERCEPT_MIME.test(mime) || INTERCEPT_EXTS.has(ext);
-  if (!shouldIntercept) return;
+  // Never swallow a download when FluxGet is down.
+  if (!backendUp && !(await ping())) return;
 
-  const filename = item.filename
-    ? item.filename.split(/[\\/]/).pop()
-    : item.url.split("/").pop().split("?")[0] || "download";
+  // Cancel the browser download; FluxGet takes it from here.
+  try { await chrome.downloads.cancel(item.id); } catch {}
+  chrome.downloads.erase({ id: item.id }).catch(() => {});
 
-  // Cancel the browser download immediately
-  chrome.downloads.cancel(item.id, () => {
-    chrome.downloads.erase({ id: item.id });
-  });
+  const referer = item.referrer || "";
+  const filename = name || "download";
+  const res = (VIDEO_EXT_RE.test(filename) || VIDEO_MIME_RE.test(mime) || isManifestURL(url))
+    ? await sendStream(url, filename, { referer })
+    : await sendDownload(url, filename, referer);
 
-  // Build Referer header — CDNs return 403 without it.
-  // chrome.downloads gives us item.referrer (the page URL) directly.
-  // Fall back to the captured webRequest referer if item.referrer is empty.
-  const tabId = item.tabId >= 0 ? item.tabId : null;
-  const captured = tabId != null ? (capturedVideos.get(tabId) || []) : [];
-  const capEntry = captured.find(v => v.url === item.url);
-  const referer  = item.referrer || capEntry?.referer || "";
-  const dlHeaders = referer ? { Referer: referer } : {};
-
-  // Route to the right FluxGet endpoint
-  if (VIDEO_EXT_RE.test(filename) || VIDEO_MIME_RE.test(mime) || isManifestURL(item.url)) {
-    sendStream(item.url, filename, dlHeaders);
+  if (res) {
+    notify("FluxGet", `Downloading: ${filename}`);
   } else {
-    sendDownload(item.url, filename, dlHeaders);
+    // FluxGet rejected it or went away mid-flight: give it back to the browser.
+    passThrough.add(url);
+    chrome.downloads.download({ url, filename: filename.replace(/[\\/:*?"<>|]/g, "_") }).catch(() => passThrough.delete(url));
   }
-
-  notify("FluxGet", `Downloading: ${filename}`);
 });
 
 // ── Network video capture (like IDM's socket-level monitor) ──────────────────
-// Watches all HTTP responses and captures video/stream URLs seen in network traffic.
 chrome.webRequest.onResponseStarted.addListener(
   (details) => {
     if (details.tabId < 0) return;
     const url = details.url;
-
-    // Skip individual segments — we want the manifest, not 6000 .ts chunks.
-    // SKIP_FRAG_RE catches .ts/.m4s extension chunks.
-    // isYouTubeCDNFragment() matches IDMNetMon's exact M4S/MP4 segment skip logic
-    // (M4S in /avf/ or /sep/ paths + segment- prefix; MP4 in /avf/ or /parcel/ paths).
     if (SKIP_FRAG_RE.test(url) || isYouTubeCDNFragment(url)) return;
-
-    // Skip YouTube internal UI/API paths — not real video content
-    if (/youtube\.com\/s\//.test(url)) return;
+    if (/youtube\.com\/(s|api|youtubei)\//.test(url)) return;
 
     const hdrs = details.responseHeaders || [];
-    const ct   = (hdrs.find(h => h.name.toLowerCase() === "content-type") || {}).value || "";
-    const cl   = parseInt((hdrs.find(h => h.name.toLowerCase() === "content-length") || {}).value || "0");
+    const hv = n => (hdrs.find(h => h.name.toLowerCase() === n) || {}).value || "";
+    const ct = hv("content-type");
+    let size = parseInt(hv("content-length") || "0", 10) || 0;
+    const cr = hv("content-range");
+    if (cr && cr.includes("/")) size = parseInt(cr.split("/").pop(), 10) || size;
 
-    if (!VIDEO_MIME_RE.test(ct) && !VIDEO_EXT_RE.test(url) && !MANIFEST_PATH_RE.test(url)) return;
+    const isManifest = isManifestURL(url) || /mpegurl|dash\+xml/i.test(ct) || MANIFEST_PATH_RE.test(url);
+    const isMedia = VIDEO_MIME_RE.test(ct) || VIDEO_EXT_RE.test(url);
+    if (!isManifest && !isMedia) return;
+    // Ignore tiny media responses (preview sprites, ad pings, beacons).
+    if (!isManifest && size > 0 && size < 300 * 1024) return;
 
-    // Capture the document URL as Referer — CDNs like streamruby block without it
-    const referer = details.documentUrl || details.initiator || "";
-
-    const list = capturedVideos.get(details.tabId) || [];
-    if (!list.find(v => v.url === url)) {
-      list.push({ url, type: ct, size: cl, ts: Date.now(), referer });
-      if (list.length > 50) list.splice(0, list.length - 50);
-    }
-    capturedVideos.set(details.tabId, list);
+    addCaptured(details.tabId, {
+      url, type: ct, size, ts: Date.now(),
+      referer: details.documentUrl || details.initiator || "",
+    });
   },
   { urls: ["<all_urls>"], types: ["media", "xmlhttprequest", "other"] },
   ["responseHeaders"]
 );
 
-// Live capture of CDN request cookies — mirrors IDM's onBeforeSendHeaders approach.
-// As the browser plays a video it fetches HLS/DASH segments; we intercept those
-// requests and store the Cookie header per-hostname so FluxGet can use the exact
-// same authenticated headers when it downloads the same segments later.
-// Requires "extraHeaders" to access the Cookie header (Chrome MV3 observational mode).
+// Live capture of CDN request cookies (IDM's onBeforeSendHeaders approach):
+// includes partitioned/SameSite cookies chrome.cookies can't see.
 chrome.webRequest.onBeforeSendHeaders.addListener(
   (details) => {
     if (details.tabId < 0) return;
     try {
-      const cookieHdr = (details.requestHeaders || []).find(
-        h => h.name.toLowerCase() === "cookie"
-      );
-      if (cookieHdr?.value) {
-        const host = new URL(details.url).hostname;
-        capturedDomainCookies.set(host, cookieHdr.value);
-        // Persist to session storage so the cookie survives MV3 service worker suspension.
-        chrome.storage.session.set({ [`cdncookie_${host}`]: cookieHdr.value }).catch(() => {});
-      }
+      const cookieHdr = (details.requestHeaders || []).find(h => h.name.toLowerCase() === "cookie");
+      if (!cookieHdr?.value) return;
+      const host = new URL(details.url).hostname;
+      if (capturedDomainCookies.get(host) === cookieHdr.value) return; // unchanged: no storage write
+      capturedDomainCookies.set(host, cookieHdr.value);
+      chrome.storage.session.set({ [`cdncookie_${host}`]: cookieHdr.value }).catch(() => {});
     } catch {}
   },
   { urls: ["<all_urls>"], types: ["media", "xmlhttprequest", "other"] },
@@ -463,29 +428,30 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
 );
 
 chrome.tabs.onRemoved.addListener(id => {
-  capturedVideos.delete(id);
-  pageVideoData.delete(id);
+  tabCache.delete(id);
+  chrome.storage.session.remove(`tab_${id}`).catch(() => {});
 });
 chrome.tabs.onUpdated.addListener((id, info) => {
-  if (info.status === "loading") {
-    capturedVideos.delete(id);
-    pageVideoData.delete(id);
-  }
+  // A new page load invalidates captured media. (Stale YouTube SPA data is
+  // additionally guarded by freshPage()'s videoId check.)
+  if (info.status === "loading") clearTab(id);
 });
 
 // ── URL resolution helpers ────────────────────────────────────────────────────
-function getBestCaptured(tabId) {
-  const list = capturedVideos.get(tabId) || [];
+function bestCaptured(st) {
+  const list = st.captured || [];
   if (!list.length) return null;
-  // Prefer manifest URLs (m3u8/mpd) over raw MP4 chunks
-  const manifests = list.filter(v => isManifestURL(v.url) || /mpegurl|dash\+xml/i.test(v.type));
-  if (manifests.length) return manifests[manifests.length - 1].url;
-  // Otherwise pick the largest file
-  return [...list].sort((a, b) => (b.size || 0) - (a.size || 0))[0].url;
+  const manifests = list.filter(v => isManifestURL(v.url) || /mpegurl|dash\+xml/i.test(v.type || ""));
+  if (manifests.length) {
+    // A master playlist (declares variants/subtitles) beats a media playlist.
+    const master = [...manifests].reverse().find(v => v.isMaster || v.hasSubs);
+    return master || manifests[manifests.length - 1];
+  }
+  return [...list].sort((a, b) => (b.size || 0) - (a.size || 0))[0];
 }
 
 function isManifestURL(url) {
-  return /\.(m3u8|mpd)(\?|#|$)/i.test(url);
+  return /\.(m3u8|mpd)(\?|#|$)/i.test(url || "");
 }
 
 function isKnownVideoHost(url) {
@@ -495,221 +461,226 @@ function isKnownVideoHost(url) {
   } catch (_) { return false; }
 }
 
-function resolveVideoUrl(msg, sender) {
-  const tabId  = sender.tab?.id;
-  const tabUrl = sender.tab?.url || "";
+function youTubeVideoId(url) {
+  try {
+    const u = new URL(url);
+    if (u.hostname === "youtu.be") return u.pathname.slice(1);
+    if (u.pathname.startsWith("/shorts/")) return u.pathname.split("/")[2] || "";
+    return u.searchParams.get("v") || "";
+  } catch { return ""; }
+}
 
-  // 1. BEST: DASH/HLS manifest captured from document.js (ytInitialPlayerResponse)
-  const pd = tabId != null ? pageVideoData.get(tabId) : null;
-  if (pd?.dash) return pd.dash;
-  if (pd?.hls)  return pd.hls;
-
-  // 2. Network-captured manifest/video URL
-  if (tabId != null) {
-    const captured = getBestCaptured(tabId);
-    if (captured) return captured;
+// Page data is only trusted when it belongs to the video the tab shows now
+// (YouTube is an SPA: the tab URL changes without a reload).
+function freshPage(st, tabUrl) {
+  const pd = st.page;
+  if (!pd) return null;
+  if (pd.videoId) {
+    const vid = youTubeVideoId(tabUrl);
+    if (vid && vid !== pd.videoId) return null;
   }
+  return pd;
+}
 
-  // 3. Known platform page → pass to yt-dlp fallback in the backend
-  if (isKnownVideoHost(tabUrl)) return tabUrl;
+// Unified "download the video on this tab" routing.
+async function downloadVideoOnTab(tab, opts = {}) {
+  const tabId = tab?.id;
+  const tabUrl = tab?.url || "";
+  const title = opts.title || tab?.title || "";
+  const st = await getTab(tabId);
+  const pd = freshPage(st, tabUrl);
+  const common = { pageUrl: tabUrl, maxHeight: opts.maxHeight || 0, audioOnly: !!opts.audioOnly };
 
-  // 4. Explicit URL from message, or iframe src
-  return msg.url || tabUrl;
+  // 1. YouTube & friends: page data from the player response.
+  if (pd && ((pd.formats || []).some(f => f.url) || pd.hls || pd.dash)) {
+    const hasDirect = (pd.formats || []).some(f => f.url);
+    if (hasDirect) return sendStream(pd.hls || pd.dash || tabUrl, title, { ...common, formats: pd.formats });
+    if (pd.hls) return sendStream(pd.hls, title, common);
+  }
+  // 2. Platform page yt-dlp understands (ciphered YouTube formats, Vimeo, X…).
+  if (isKnownVideoHost(tabUrl)) return sendStream(tabUrl, title, common);
+  // 3. Captured manifest / media from the network.
+  const cap = bestCaptured(st);
+  if (cap) return sendStream(cap.url, title, { ...common, referer: cap.referer || tabUrl });
+  // 4. Explicit element source.
+  if (opts.srcUrl && /^https?:/i.test(opts.srcUrl)) return sendStream(opts.srcUrl, title, { ...common, referer: tabUrl });
+
+  notify("FluxGet", "No stream detected yet — start playing the video, then try again.");
+  return null;
 }
 
 // ── Context menus ─────────────────────────────────────────────────────────────
 chrome.runtime.onInstalled.addListener(() => {
   chrome.contextMenus.removeAll(() => {
-    chrome.contextMenus.create({ id: "fg_link",       title: "⬇ Download link with FluxGet",               contexts: ["link"] });
-    chrome.contextMenus.create({ id: "fg_video",      title: "⬇ Download video with FluxGet",              contexts: ["video", "audio"] });
-    chrome.contextMenus.create({ id: "fg_page_video", title: "⬇ Download video on this page (FluxGet)",    contexts: ["page"] });
-    chrome.contextMenus.create({ id: "fg_subtitles",  title: "⬇ Download subtitles only (SRT)",            contexts: ["video", "audio", "page"] });
-    chrome.contextMenus.create({ id: "fg_selection",  title: "⬇ Download selected URL with FluxGet",       contexts: ["selection"] });
-    chrome.contextMenus.create({ id: "fg_open_ui",    title: "🖥 Open FluxGet dashboard",                  contexts: ["action"] });
+    chrome.contextMenus.create({ id: "fg_link",       title: "⬇ Download link with FluxGet",            contexts: ["link"] });
+    chrome.contextMenus.create({ id: "fg_video",      title: "⬇ Download video with FluxGet",           contexts: ["video", "audio"] });
+    chrome.contextMenus.create({ id: "fg_page_video", title: "⬇ Download video on this page (FluxGet)", contexts: ["page"] });
+    chrome.contextMenus.create({ id: "fg_audio",      title: "♪ Download audio only (FluxGet)",         contexts: ["video", "audio", "page"] });
+    chrome.contextMenus.create({ id: "fg_subtitles",  title: "⬇ Download subtitles only (SRT)",         contexts: ["video", "audio", "page"] });
+    chrome.contextMenus.create({ id: "fg_selection",  title: "⬇ Download selected URL with FluxGet",    contexts: ["selection"] });
+    chrome.contextMenus.create({ id: "fg_open_ui",    title: "Open FluxGet dashboard",                       contexts: ["action"] });
   });
 });
 
-chrome.contextMenus.onClicked.addListener((info, tab) => {
+chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   const tabId = tab?.id;
+  const ref = tab?.url || "";
   switch (info.menuItemId) {
-    case "fg_link": {
-      const url = info.linkUrl || "";
-      if (!url) return;
-      const pageRef = tab?.url ? { Referer: tab.url } : {};
-      if (isManifestURL(url) || isKnownVideoHost(url)) {
-        sendStream(url, url.split("/").pop().split("?")[0] || "video", pageRef);
+    case "fg_link":
+    case "fg_selection": {
+      const url = (info.menuItemId === "fg_link" ? info.linkUrl : (info.selectionText || "").trim()) || "";
+      if (!/^https?:\/\//i.test(url)) return;
+      const name = decodeURIComponent(url.split("?")[0].split("/").pop() || "") || "file";
+      if (isManifestURL(url) || isKnownVideoHost(url) || VIDEO_EXT_RE.test(url)) {
+        sendStream(url, name, { referer: ref, pageUrl: isKnownVideoHost(url) ? url : "" });
       } else {
-        sendDownload(url, url.split("/").pop().split("?")[0] || "file", pageRef);
+        sendDownload(url, name, ref);
       }
       break;
     }
-    case "fg_video": {
-      const url = getBestCaptured(tabId) || info.srcUrl || info.pageUrl || tab?.url;
-      sendStream(url, tab?.title || "");
+    case "fg_video":
+    case "fg_page_video":
+      downloadVideoOnTab(tab, { srcUrl: info.srcUrl });
       break;
-    }
+    case "fg_audio":
+      downloadVideoOnTab(tab, { srcUrl: info.srcUrl, audioOnly: true });
+      break;
     case "fg_subtitles": {
-      const url = subtitleSourceURL(tabId, info.srcUrl || tab?.url || "");
+      const url = await subtitleSourceURL(tabId, info.srcUrl || ref);
       if (!url) { notify("FluxGet", "No subtitle source detected yet. Play the video, then try again."); break; }
-      sendSubtitles(url, tab?.title || "", tab?.url ? { Referer: tab.url } : {});
-      break;
-    }
-    case "fg_page_video": {
-      const pd  = tabId != null ? pageVideoData.get(tabId) : null;
-      const url = (pd?.dash || pd?.hls) || getBestCaptured(tabId) || tab?.url;
-      sendStream(url, tab?.title || "", {}, pd?.formats);
-      break;
-    }
-    case "fg_selection": {
-      const url = (info.selectionText || "").trim();
-      if (!url.startsWith("http")) return;
-      const pageRef = tab?.url ? { Referer: tab.url } : {};
-      isKnownVideoHost(url) || isManifestURL(url)
-        ? sendStream(url, "", pageRef)
-        : sendDownload(url, url.split("/").pop().split("?")[0] || "file", pageRef);
+      sendStream(url, tab?.title || "", { referer: ref, subtitles: true });
       break;
     }
     case "fg_open_ui": {
-      chrome.storage.local.get("fluxget_settings", (res) => {
-        const token = (res.fluxget_settings || {}).token || "";
-        const url   = token ? `${BASE_URL}/ui?token=${token}` : `${BASE_URL}/ui`;
-        chrome.tabs.create({ url });
-      });
+      const res = await chrome.storage.local.get("fluxget_settings");
+      const token = (res.fluxget_settings || {}).token || "";
+      chrome.tabs.create({ url: token ? `${BASE_URL}/ui?token=${encodeURIComponent(token)}` : `${BASE_URL}/ui` });
       break;
     }
   }
 });
 
-// ── Messages from content.js ──────────────────────────────────────────────────
+// ── HLS master inspection (fetched here: content scripts are CORS-bound) ─────
+async function inspectHLS(url) {
+  try {
+    const r = await fetch(url, { credentials: "include", signal: AbortSignal.timeout(8000) });
+    const body = await r.text();
+    if (!body.includes("#EXT-X-STREAM-INF")) return { variants: [], hasSubs: /\.vtt/i.test(body) };
+    const variants = [];
+    let pending = null;
+    for (const raw of body.split("\n")) {
+      const l = raw.trim();
+      if (l.startsWith("#EXT-X-STREAM-INF:")) {
+        pending = {
+          bandwidth: parseInt((l.match(/BANDWIDTH=(\d+)/) || [])[1] || "0", 10),
+          height: parseInt((l.match(/RESOLUTION=\d+x(\d+)/i) || [])[1] || "0", 10),
+        };
+      } else if (pending && l && !l.startsWith("#")) {
+        variants.push(pending);
+        pending = null;
+      }
+    }
+    // One entry per height (highest bandwidth).
+    const byH = new Map();
+    for (const v of variants) {
+      const cur = byH.get(v.height);
+      if (!cur || v.bandwidth > cur.bandwidth) byH.set(v.height, v);
+    }
+    return {
+      variants: [...byH.values()].sort((a, b) => b.height - a.height || b.bandwidth - a.bandwidth),
+      hasSubs: /#EXT-X-MEDIA:[^\n]*TYPE=SUBTITLES/i.test(body),
+    };
+  } catch {
+    return { variants: [], hasSubs: false };
+  }
+}
+
+// ── Messages from content.js / popup ──────────────────────────────────────────
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  const tabId = sender.tab?.id;
+  const tabId = msg.tabId ?? sender.tab?.id;
+  // Messages that claim page data must come from our own content script.
+  const fromContent = sender.id === chrome.runtime.id && !!sender.tab;
 
-  // document.js → content.js → background: YouTube player data
-  if (msg.action === "yt_player" && tabId != null) {
-    pageVideoData.set(tabId, {
-      dash:    msg.dash    || "",
-      hls:     msg.hls     || "",
-      formats: msg.formats || [],
-      title:   msg.title   || "",
-    });
-    const pickerOptions = buildPickerOptions(msg.formats || []);
-    chrome.tabs.sendMessage(tabId, {
-      action:  "video_qualities",
-      options: pickerOptions,
-      title:   msg.title,
-    }).catch(() => {});
-    return;
-  }
-
-  // content.js requests quality data on load (fixes race condition)
-  if (msg.action === "get_quality_data") {
-    const pd = tabId != null ? pageVideoData.get(tabId) : null;
-    sendResponse({
-      options: pd ? buildPickerOptions(pd.formats || []) : [],
-      title:   pd?.title || "",
-    });
-    return true;
-  }
-
-  // document.js intercepted a manifest (fetch/XHR)
-  if (msg.action === "manifest_intercepted" && tabId != null) {
-    const existing = capturedVideos.get(tabId) || [];
-    if (!existing.find(v => v.url === msg.url)) {
-      existing.push({ url: msg.url, type: msg.contentType || "", size: 0, ts: Date.now() });
-      capturedVideos.set(tabId, existing);
+  (async () => {
+    switch (msg.action) {
+      case "yt_player": {
+        if (!fromContent) return;
+        const st = await getTab(tabId);
+        st.page = {
+          hls: msg.hls || "", dash: msg.dash || "",
+          formats: (msg.formats || []).slice(0, 80),
+          title: msg.title || "", videoId: msg.videoId || "", pageUrl: sender.tab.url || "",
+        };
+        saveTab(tabId);
+        updateTabBadge(tabId, st);
+        chrome.tabs.sendMessage(tabId, {
+          action: "video_qualities",
+          options: buildPickerOptions(st.page.formats),
+          title: st.page.title,
+          videoId: st.page.videoId,
+        }, { frameId: sender.frameId }).catch(() => {});
+        return;
+      }
+      case "get_quality_data": {
+        const st = await getTab(tabId);
+        const pd = freshPage(st, sender.tab?.url || "");
+        sendResponse({ options: pd ? buildPickerOptions(pd.formats || []) : [], title: pd?.title || "", videoId: pd?.videoId || "" });
+        return;
+      }
+      case "manifest_intercepted": {
+        if (!fromContent || !/^https?:/i.test(msg.url || "")) return;
+        addCaptured(tabId, {
+          url: msg.url, type: msg.contentType || "", size: 0, ts: Date.now(),
+          referer: sender.tab.url || "", hasSubs: !!msg.hasSubs,
+        });
+        return;
+      }
+      case "inspect_hls": {
+        sendResponse(await inspectHLS(msg.url));
+        return;
+      }
+      case "download_video": {
+        downloadVideoOnTab(sender.tab, { title: msg.title });
+        return;
+      }
+      case "download_quality": {
+        // User picked a quality in the floating panel.
+        const tab = sender.tab;
+        if (msg.manifestUrl) {
+          sendStream(msg.manifestUrl, msg.title || tab?.title || "", {
+            referer: tab?.url || "", pageUrl: tab?.url || "",
+            maxHeight: msg.maxHeight || 0, audioOnly: !!msg.audioOnly,
+          });
+        } else {
+          downloadVideoOnTab(tab, { title: msg.title, maxHeight: msg.maxHeight || 0, audioOnly: !!msg.audioOnly });
+        }
+        return;
+      }
+      case "download_subtitles": {
+        const url = msg.url || await subtitleSourceURL(tabId, sender.tab?.url || "");
+        if (!url) { notify("FluxGet", "No subtitle source detected yet. Play the video for a few seconds, then try again."); return; }
+        sendStream(url, msg.title || sender.tab?.title || "", { referer: sender.tab?.url || "", subtitles: true });
+        return;
+      }
+      case "download": {
+        if (/^https?:/i.test(msg.url || "")) sendDownload(msg.url, msg.filename || "", msg.referer || sender.tab?.url || "");
+        return;
+      }
+      case "send_stream": { // popup → explicit stream with options
+        const r = await sendStream(msg.url, msg.title || "", msg.opts || {});
+        sendResponse({ ok: !!r });
+        return;
+      }
+      case "get_captured": {
+        const st = await getTab(tabId);
+        const tab = msg.tabId != null ? await chrome.tabs.get(msg.tabId).catch(() => null) : sender.tab;
+        sendResponse({ captured: st.captured, pageData: freshPage(st, tab?.url || ""), backendUp });
+        return;
+      }
     }
-    return;
-  }
-
-  // Content.js floating button clicked → unified routing
-  if (msg.action === "download_video") {
-    const tabUrl  = sender.tab?.url || "";
-    const title   = sender.tab?.title || msg.title || "";
-    const pd      = tabId != null ? pageVideoData.get(tabId) : null;
-
-    // Priority 1: YouTube adaptive — direct CDN URLs + ffmpeg mux
-    if (pd && pd.formats && pd.formats.length > 0 && (pd.dash || pd.hls)) {
-      sendStream(pd.dash || pd.hls, title, {}, pd.formats);
-      return;
-    }
-    // Priority 2: Captured HLS/DASH manifest from network
-    const captured = getBestCaptured(tabId);
-    if (captured && isManifestURL(captured)) {
-      const referer = (capturedVideos.get(tabId) || []).find(v => v.url === captured)?.referer || "";
-      sendStream(captured, title, referer ? { Referer: referer } : {});
-      return;
-    }
-    // Priority 3: Captured direct video URL
-    if (captured) {
-      const referer = (capturedVideos.get(tabId) || []).find(v => v.url === captured)?.referer || "";
-      sendStream(captured, title, referer ? { Referer: referer } : {});
-      return;
-    }
-    // Priority 4: Known yt-dlp platform page
-    if (isKnownVideoHost(tabUrl)) {
-      sendStream(tabUrl, title, {});
-      return;
-    }
-    // Priority 5: YouTube DASH/HLS manifest without formats
-    if (pd && (pd.dash || pd.hls)) {
-      sendStream(pd.dash || pd.hls, title, {});
-      return;
-    }
-    // No stream found — notify user to use popup
-    notify("FluxGet", "No stream detected yet. Open the FluxGet popup after the video starts playing.");
-    return;
-  }
-
-  // Content.js: user picked a specific quality from IDM-style picker
-  if (msg.action === "download_quality") {
-    const pd = tabId != null ? pageVideoData.get(tabId) : null;
-    if (msg.videoUrl && msg.audioUrl) {
-      // Both direct URLs available — native adaptive mux
-      sendStream(msg.pageUrl || (pd?.dash || ""), msg.title || "", {}, msg.formats || []);
-    } else if (msg.videoUrl) {
-      // Pre-muxed direct URL (e.g. 720p MP4 combined)
-      sendStream(msg.videoUrl, msg.title || "", {});
-    } else if (msg.ytFormat) {
-      // No direct URL — use yt-dlp with specific format selector
-      const pageUrl = msg.pageUrl || sender.tab?.url || "";
-      apiPost("/stream", {
-        url:      pageUrl,
-        title:    msg.title || "",
-        ytFormat: msg.ytFormat,
-      });
-    }
-    return;
-  }
-
-  // Content.js / context menu: download only subtitle tracks as .srt
-  if (msg.action === "download_subtitles") {
-    const title = msg.title || sender.tab?.title || "";
-    const url   = msg.url || subtitleSourceURL(tabId, sender.tab?.url || "");
-    if (!url) {
-      notify("FluxGet", "No subtitle source detected yet. Play the video for a few seconds, then try again.");
-      return;
-    }
-    const referer = (capturedVideos.get(tabId) || []).find(v => v.url === url)?.referer || sender.tab?.url || "";
-    sendSubtitles(url, title, referer ? { Referer: referer } : {});
-    return;
-  }
-
-  // Generic file download from content.js
-  if (msg.action === "download") {
-    sendDownload(msg.url, msg.filename || "", msg.headers || {});
-    return;
-  }
-
-  // Popup: get list of captured videos for current tab
-  // msg.tabId must be provided by the popup (sender.tab is undefined for popups)
-  if (msg.action === "get_captured") {
-    const lookupId = msg.tabId ?? tabId;
-    sendResponse({
-      captured: capturedVideos.get(lookupId) || [],
-      pageData: pageVideoData.get(lookupId) || null,
-    });
-    return true;
-  }
+  })();
+  // Keep the channel open for the async sendResponse callers.
+  return ["get_quality_data", "inspect_hls", "get_captured", "send_stream"].includes(msg.action);
 });
 
 // ── Keepalive / health ────────────────────────────────────────────────────────
@@ -726,13 +697,9 @@ chrome.storage.onChanged.addListener((changes) => {
   if (changes.fluxget_settings) Object.assign(settings, changes.fluxget_settings.newValue || {});
 });
 
-// Restore CDN cookies captured before the service worker was last suspended.
-// MV3 service workers lose in-memory Maps on suspension; chrome.storage.session
-// persists for the browser session so we get the cookies back on next wake.
+// Restore CDN cookies captured before the service worker was suspended.
 chrome.storage.session.get(null).then(all => {
   for (const [k, v] of Object.entries(all)) {
-    if (k.startsWith("cdncookie_") && v) {
-      capturedDomainCookies.set(k.slice("cdncookie_".length), v);
-    }
+    if (k.startsWith("cdncookie_") && v) capturedDomainCookies.set(k.slice("cdncookie_".length), v);
   }
 }).catch(() => {});

@@ -7,11 +7,11 @@ import (
 	"time"
 
 	"github.com/msh2050/fluxget/internal/config"
-	"github.com/msh2050/fluxget/internal/core"
-	"github.com/msh2050/fluxget/internal/download"
-	"github.com/msh2050/fluxget/internal/engine/state"
-	"github.com/msh2050/fluxget/internal/engine/types"
-	"github.com/msh2050/fluxget/internal/processing"
+	"github.com/msh2050/fluxget/internal/orchestrator"
+	"github.com/msh2050/fluxget/internal/service"
+	"github.com/msh2050/fluxget/internal/store"
+	"github.com/msh2050/fluxget/internal/testutil"
+	"github.com/msh2050/fluxget/internal/types"
 )
 
 // TestTUI_Startup_HandlesResume verifies that TUI initialization handles resume logic correctly
@@ -33,11 +33,11 @@ func TestTUI_Startup_HandlesResume(t *testing.T) {
 	seedDownload(t, testID, testURL, testDest, "queued")
 
 	// 3. Initialize TUI Model (Simulate StartTUI)
-	progressChan := make(chan any, 10)
-	pool := download.NewWorkerPool(progressChan, 3)
+	bus := orchestrator.NewEventBus()
+	mgr := orchestrator.NewLifecycleManager(nil, bus, nil)
 
 	// PASSING noResume=false (default)
-	m := InitialRootModel(1700, "test-version", core.NewLocalDownloadServiceWithInput(pool, progressChan), processing.NewLifecycleManager(nil, nil), false)
+	m := InitialRootModel(1700, "test-version", service.NewLocalDownloadService(mgr), mgr, nil, false)
 
 	// 4. Verify Download is Active in Model
 	// InitialRootModel loads downloads and should set paused=false for "queued" items
@@ -82,10 +82,10 @@ func TestTUI_Startup_LoadsCompletedTiming(t *testing.T) {
 	const timeTakenMs = int64(2500)
 	const avgSpeed = float64(2 * 1024 * 1024) // 2 MB/s
 
-	if err := state.AddToMasterList(types.DownloadEntry{
+	if err := store.AddToMasterList(types.DownloadRecord{
 		ID:         testID,
 		URL:        testURL,
-		URLHash:    state.URLHash(testURL),
+		URLHash:    "dummy-hash",
 		DestPath:   testDest,
 		Filename:   filepath.Base(testDest),
 		Status:     "completed",
@@ -97,9 +97,9 @@ func TestTUI_Startup_LoadsCompletedTiming(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	progressChan := make(chan any, 10)
-	pool := download.NewWorkerPool(progressChan, 3)
-	m := InitialRootModel(1700, "test-version", core.NewLocalDownloadServiceWithInput(pool, progressChan), processing.NewLifecycleManager(nil, nil), false)
+	bus := orchestrator.NewEventBus()
+	mgr := orchestrator.NewLifecycleManager(nil, bus, nil)
+	m := InitialRootModel(1700, "test-version", service.NewLocalDownloadService(mgr), mgr, nil, false)
 
 	var found *DownloadModel
 	for _, d := range m.downloads {
@@ -135,20 +135,19 @@ func TestTUI_Startup_LoadsErroredDownloadsIntoDoneTab(t *testing.T) {
 	testID := "tui-error-id"
 	testURL := "http://example.com/error.bin"
 	testDest := filepath.Join(tmpDir, "error.bin")
-	if err := state.AddToMasterList(types.DownloadEntry{
+	if err := store.AddToMasterList(types.DownloadRecord{
 		ID:       testID,
 		URL:      testURL,
-		URLHash:  state.URLHash(testURL),
 		DestPath: testDest,
 		Filename: filepath.Base(testDest),
 		Status:   "error",
+		Error:    "connection reset by peer",
 	}); err != nil {
 		t.Fatal(err)
 	}
 
-	progressChan := make(chan any, 10)
-	pool := download.NewWorkerPool(progressChan, 3)
-	m := InitialRootModel(1700, "test-version", core.NewLocalDownloadServiceWithInput(pool, progressChan), processing.NewLifecycleManager(nil, nil), false)
+	mgr := orchestrator.NewLifecycleManager(nil, nil, nil)
+	m := InitialRootModel(1700, "test-version", service.NewLocalDownloadService(mgr), mgr, nil, false)
 
 	var found *DownloadModel
 	for _, d := range m.downloads {
@@ -159,10 +158,55 @@ func TestTUI_Startup_LoadsErroredDownloadsIntoDoneTab(t *testing.T) {
 	}
 	if found == nil {
 		t.Fatal("TUI Model failed to load errored download")
-		return
 	}
 	if !found.done {
 		t.Fatal("expected errored download to appear in done tab")
+	}
+	if found.err == nil {
+		t.Fatal("expected errored download to retain its error")
+	}
+	if found.err.Error() != "connection reset by peer" {
+		t.Errorf("error = %q, want %q", found.err.Error(), "connection reset by peer")
+	}
+}
+
+func TestTUI_Startup_UsesFallbackForErroredDownloadWithoutMessage(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "surge-tui-error-fallback-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	setupTestEnv(t, tmpDir)
+
+	const testID = "tui-error-fallback-id"
+	if err := store.AddToMasterList(types.DownloadRecord{
+		ID:       testID,
+		Filename: "error.bin",
+		Status:   "error",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	bus := orchestrator.NewEventBus()
+	mgr := orchestrator.NewLifecycleManager(nil, bus, nil)
+	m := InitialRootModel(1700, "test-version", service.NewLocalDownloadService(mgr), mgr, nil, false)
+
+	var found *DownloadModel
+	for _, d := range m.downloads {
+		if d.ID == testID {
+			found = d
+			break
+		}
+	}
+	if found == nil {
+		t.Fatal("TUI Model failed to load errored download")
+	}
+	if found.err == nil {
+		t.Fatal("expected fallback error")
+	}
+	if found.err.Error() != "download failed" {
+		t.Errorf("error = %q, want %q", found.err.Error(), "download failed")
 	}
 }
 
@@ -184,15 +228,11 @@ func setupTestEnv(t *testing.T, tmpDir string) {
 	}
 
 	// Configure DB
-	dbPath := filepath.Join(surgeDir, "state", "surge.db")
-	_ = os.MkdirAll(filepath.Dir(dbPath), 0o755)
-	state.CloseDB()
-	t.Cleanup(state.CloseDB)
-	state.Configure(dbPath)
+	_ = testutil.SetupStateDB(t)
 }
 
 func seedDownload(t *testing.T, id, url, dest, status string) {
-	manualState := &types.DownloadState{
+	manualState := &types.DownloadRecord{
 		ID:         id,
 		URL:        url,
 		Filename:   filepath.Base(dest),
@@ -202,10 +242,18 @@ func seedDownload(t *testing.T, id, url, dest, status string) {
 		PausedAt:   0,
 		CreatedAt:  time.Now().Unix(),
 	}
-	if err := state.SaveState(url, dest, manualState); err != nil {
+	if err := store.AddToMasterList(types.DownloadRecord{
+		ID:         id,
+		URL:        url,
+		DestPath:   dest,
+		Filename:   filepath.Base(dest),
+		Status:     status,
+		TotalSize:  1000,
+		Downloaded: 0,
+	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := state.UpdateStatus(id, status); err != nil {
+	if err := store.SaveState(url, dest, manualState); err != nil {
 		t.Fatal(err)
 	}
 }

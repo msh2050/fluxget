@@ -5,6 +5,7 @@ vi.mock('wxt/utils/define-background', () => ({
 }));
 
 import { __test__ } from '../entrypoints/background';
+import type { DownloadStatus } from '../entrypoints/popup/store/types';
 
 function createDeferred<T>() {
   let resolve!: (value: T) => void;
@@ -16,12 +17,20 @@ function createDeferred<T>() {
 
 describe('background auth persistence', () => {
   const storageGet = vi.fn();
+  const setBadgeText = vi.fn();
+  const setBadgeBackgroundColor = vi.fn();
 
   beforeEach(() => {
     __test__.resetState();
     storageGet.mockReset();
+    setBadgeText.mockReset();
+    setBadgeBackgroundColor.mockReset();
 
     (globalThis as typeof globalThis & { browser: unknown }).browser = {
+      action: {
+        setBadgeText,
+        setBadgeBackgroundColor,
+      },
       storage: {
         local: {
           get: storageGet,
@@ -29,6 +38,22 @@ describe('background auth persistence', () => {
         },
       },
     } as unknown;
+  });
+
+  it('shows the number of queued, paused, and downloading items on the toolbar badge', () => {
+    __test__.syncActiveDownloadBadge([
+      { id: 'queued', status: 'queued' },
+      { id: 'paused', status: 'paused' },
+      { id: 'downloading', status: 'downloading' },
+      { id: 'completed', status: 'completed' },
+      { id: 'error', status: 'error' },
+    ] as DownloadStatus[]);
+
+    expect(setBadgeText).toHaveBeenLastCalledWith({ text: '3' });
+    expect(setBadgeBackgroundColor).toHaveBeenLastCalledWith({ color: '#2563EB' });
+
+    __test__.updateActiveDownloadBadge('complete', { DownloadID: 'queued' });
+    expect(setBadgeText).toHaveBeenLastCalledWith({ text: '2' });
   });
 
   afterEach(() => {
@@ -159,5 +184,67 @@ describe('background auth persistence', () => {
       sawUnauthorized: true,
       sawReachable: true,
     });
+  });
+});
+
+describe('testConnection message handler', () => {
+  it('reports invalid_token when server mode is local and token is wrong', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url === 'http://127.0.0.1:1700/health') {
+        return new Response(JSON.stringify({ mode: 'local' }), { status: 200 });
+      }
+      if (url === 'http://127.0.0.1:1700/list') {
+        return new Response('Unauthorized', { status: 401 });
+      }
+      throw new Error('connection refused');
+    }));
+
+    const result = await __test__.handleMessage({
+      type: 'testConnection',
+      url: 'http://127.0.0.1:1700',
+      token: 'bad-token'
+    });
+
+    expect(result).toEqual({ ok: false, error: 'invalid_token' });
+  });
+
+  it('reports invalid_token_service when server mode is service and token is wrong', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url === 'http://127.0.0.1:1700/health') {
+        return new Response(JSON.stringify({ mode: 'service' }), { status: 200 });
+      }
+      if (url === 'http://127.0.0.1:1700/list') {
+        return new Response('Unauthorized', { status: 401 });
+      }
+      throw new Error('connection refused');
+    }));
+
+    const result = await __test__.handleMessage({
+      type: 'testConnection',
+      url: 'http://127.0.0.1:1700',
+      token: 'bad-token'
+    });
+
+    expect(result).toEqual({ ok: false, error: 'invalid_token_service' });
+  });
+
+  it('returns mode on successful connection', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url === 'http://127.0.0.1:1700/health') {
+        return new Response(JSON.stringify({ mode: 'local' }), { status: 200 });
+      }
+      if (url === 'http://127.0.0.1:1700/list') {
+        return new Response('[]', { status: 200 });
+      }
+      throw new Error('connection refused');
+    }));
+
+    const result = await __test__.handleMessage({
+      type: 'testConnection',
+      url: 'http://127.0.0.1:1700',
+      token: 'good-token'
+    });
+
+    expect(result).toEqual({ ok: true, url: 'http://127.0.0.1:1700', mode: 'local' });
   });
 });

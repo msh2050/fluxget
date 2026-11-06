@@ -2,12 +2,37 @@ package config
 
 import (
 	"encoding/json"
+	"math"
 	"os"
 	"path/filepath"
+	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
+	"unicode"
+
+	"github.com/msh2050/fluxget/internal/utils"
 )
+
+func TestSettingsLabelsUseSentenceCase(t *testing.T) {
+	words := regexp.MustCompile(`[A-Za-z]+`)
+	allowed := map[string]bool{"URL": true, "DNS": true, "EMA": true, "Chrome": true, "Firefox": true}
+	for category, settings := range GetSettingsMetadata() {
+		for _, setting := range settings {
+			parts := words.FindAllString(setting.Label, -1)
+			if len(parts) == 0 || !unicode.IsUpper(rune(parts[0][0])) {
+				t.Errorf("%s/%s: label %q should start with a capital letter", category, setting.Key, setting.Label)
+				continue
+			}
+			for _, word := range parts[1:] {
+				if unicode.IsUpper(rune(word[0])) && !allowed[word] {
+					t.Errorf("%s/%s: label %q has unexpected capitalized word %q", category, setting.Key, setting.Label, word)
+				}
+			}
+		}
+	}
+}
 
 func TestDefaultSettings(t *testing.T) {
 	settings := DefaultSettings()
@@ -80,6 +105,15 @@ func TestDefaultSettings(t *testing.T) {
 		if Resolve[float64](settings.Performance.SpeedEmaAlpha) < 0 || Resolve[float64](settings.Performance.SpeedEmaAlpha) > 1 {
 			t.Errorf("SpeedEmaAlpha should be between 0 and 1, got: %f", Resolve[float64](settings.Performance.SpeedEmaAlpha))
 		}
+		if got := Resolve[time.Duration](settings.Performance.AdaptiveConcurrencyInterval); got != 0 {
+			t.Errorf("AdaptiveConcurrencyInterval = %v, want 0", got)
+		}
+		if err := settings.Performance.AdaptiveConcurrencyInterval.Validate(time.Duration(0)); err != nil {
+			t.Errorf("AdaptiveConcurrencyInterval should allow 0: %v", err)
+		}
+		if err := settings.Performance.AdaptiveConcurrencyInterval.Validate(500 * time.Millisecond); err == nil {
+			t.Error("AdaptiveConcurrencyInterval should reject sub-second values")
+		}
 	})
 
 	// Verify Extension settings
@@ -99,6 +133,46 @@ func TestDefaultSettings(t *testing.T) {
 	})
 }
 
+func TestNormalizeValuesRejectsFractionalTypeInt(t *testing.T) {
+	settings := DefaultSettings()
+	settings.Network.MaxConnectionsPerDownload.Value = 3.5
+
+	if err := settings.NormalizeValues(); err == nil {
+		t.Fatal("expected fractional TypeInt value to be rejected")
+	}
+
+	settings.Network.MaxConnectionsPerDownload.Value = 3.0
+	if err := settings.NormalizeValues(); err != nil {
+		t.Fatalf("integral float TypeInt value was rejected: %v", err)
+	}
+	if got := settings.Network.MaxConnectionsPerDownload.Value; got != 3 {
+		t.Fatalf("normalized TypeInt value = %#v, want 3", got)
+	}
+}
+
+func TestValidateStrictDefersCategoryFilesystemChecks(t *testing.T) {
+	filePath := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(filePath, []byte("file"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	for _, test := range []struct {
+		name string
+		path string
+	}{
+		{name: "missing", path: filepath.Join(t.TempDir(), "missing")},
+		{name: "file", path: filePath},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			settings := DefaultSettings()
+			settings.Categories.Categories = []Category{{Name: "Test", Pattern: ".*", Path: test.path}}
+			if err := settings.ValidateStrict(true); err != nil {
+				t.Fatalf("filesystem checks should happen when downloading: %v", err)
+			}
+		})
+	}
+}
+
 func TestDefaultSettings_Consistency(t *testing.T) {
 	s1 := DefaultSettings()
 	s2 := DefaultSettings()
@@ -109,6 +183,106 @@ func TestDefaultSettings_Consistency(t *testing.T) {
 
 	if Resolve[int](s1.Network.MaxConnectionsPerDownload) != Resolve[int](s2.Network.MaxConnectionsPerDownload) {
 		t.Error("Default settings should be consistent")
+	}
+}
+
+func TestDefaultSettings_Validation(t *testing.T) {
+	settings := DefaultSettings()
+	for _, cat := range settings.CategoriesList {
+		for _, s := range cat.Settings {
+			if s.ValidateFunc != nil {
+				if err := s.ValidateFunc(s.DefaultValue); err != nil {
+					t.Errorf("Validation failed for default value of %s: %v", s.Key, err)
+				}
+				if err := s.ValidateFunc(s.Value); err != nil {
+					t.Errorf("Validation failed for current value of %s: %v", s.Key, err)
+				}
+			}
+		}
+	}
+}
+
+// TestEveryValidatorIsInCategoriesList prevents a setting from being defined with a
+// ValidateFunc but accidentally omitted from initializeCategoriesList, which would
+// silently skip validation on startup.
+func TestEveryValidatorIsInCategoriesList(t *testing.T) {
+	settings := DefaultSettings()
+
+	var allSettings []*Setting
+	var collect func(v reflect.Value)
+	collect = func(v reflect.Value) {
+		switch v.Kind() {
+		case reflect.Pointer:
+			if v.IsNil() {
+				return
+			}
+			if v.Type() == reflect.TypeOf((*Setting)(nil)) {
+				allSettings = append(allSettings, v.Interface().(*Setting))
+				return
+			}
+			collect(v.Elem())
+		case reflect.Struct:
+			for i := range v.NumField() {
+				collect(v.Field(i))
+			}
+		case reflect.Slice:
+			for i := range v.Len() {
+				collect(v.Index(i))
+			}
+		}
+	}
+	collect(reflect.ValueOf(settings))
+
+	validated := make(map[*Setting]struct{})
+	for _, s := range allSettings {
+		if s != nil && s.ValidateFunc != nil {
+			validated[s] = struct{}{}
+		}
+	}
+
+	inCategories := make(map[*Setting]struct{})
+	for _, cat := range settings.CategoriesList {
+		for _, s := range cat.Settings {
+			if s != nil {
+				inCategories[s] = struct{}{}
+			}
+		}
+	}
+
+	for s := range validated {
+		if _, ok := inCategories[s]; !ok {
+			t.Errorf("Setting %q has a ValidateFunc but is missing from CategoriesList", s.Key)
+		}
+	}
+}
+
+func TestDisplayCategoriesCoverSettings(t *testing.T) {
+	settings := DefaultSettings()
+	seen := map[string]bool{}
+	for _, category := range CategoryOrder() {
+		entries := GetSettingsMetadata()[category]
+		if len(entries) == 0 {
+			t.Errorf("display category %s is empty", category)
+		}
+		for _, entry := range entries {
+			if seen[entry.Key] {
+				t.Errorf("setting %s appears more than once", entry.Key)
+			}
+			seen[entry.Key] = true
+			if settings.FindSetting(category, entry.Key) == nil {
+				t.Errorf("cannot find %s in %s", entry.Key, category)
+			}
+		}
+	}
+	for _, category := range settings.CategoriesList {
+		for _, setting := range category.Settings {
+			if setting.Key != "dial_hedge_count" && !seen[setting.Key] {
+				t.Errorf("setting %s is missing from display", setting.Key)
+			}
+		}
+	}
+	if seen["dial_hedge_count"] {
+		t.Error("deprecated dial hedge count is visible")
 	}
 }
 
@@ -124,8 +298,8 @@ func TestGetSettingsPath(t *testing.T) {
 		t.Errorf("Settings path should be under surge dir. Path: %s, SurgeDir: %s", path, surgeDir)
 	}
 
-	if !strings.HasSuffix(path, "settings.json") {
-		t.Errorf("Settings path should end with 'settings.json', got: %s", path)
+	if !strings.HasSuffix(path, "settings.toml") {
+		t.Errorf("Settings path should end with 'settings.toml', got: %s", path)
 	}
 }
 
@@ -143,8 +317,8 @@ func TestSaveAndLoadSettings(t *testing.T) {
 	original.Network.MaxConnectionsPerDownload.Value = 16
 	original.Network.MaxConcurrentDownloads.Value = 7
 	original.Network.UserAgent.Value = "TestAgent/1.0"
-	original.Network.MinChunkSize.Value = int64(1 * MB)
-	original.Network.WorkerBufferSize.Value = 256 * KB
+	original.Network.MinChunkSize.Value = int64(1 * utils.MiB)
+	original.Network.WorkerBufferSize.Value = 256 * utils.KiB
 	original.Network.DialHedgeCount.Value = 6
 	original.Performance.MaxTaskRetries.Value = 5
 	original.Performance.SlowWorkerThreshold.Value = 0.5
@@ -219,6 +393,7 @@ func TestLoadSettings_CorruptedJSON(t *testing.T) {
 
 func TestToRuntimeConfig(t *testing.T) {
 	settings := DefaultSettings()
+	settings.Performance.AdaptiveConcurrencyInterval.Value = 0 * time.Second
 	runtime := settings.ToRuntimeConfig()
 
 	if runtime == nil {
@@ -227,6 +402,9 @@ func TestToRuntimeConfig(t *testing.T) {
 
 	if runtime.MaxConnectionsPerDownload != Resolve[int](settings.Network.MaxConnectionsPerDownload) {
 		t.Error("MaxConnectionsPerDownload not correctly mapped")
+	}
+	if runtime.IsAdaptiveConcurrencyEnabled() || runtime.GetAdaptiveConcurrencyInterval() != 0 {
+		t.Error("AdaptiveConcurrencyInterval not correctly mapped")
 	}
 }
 
@@ -273,10 +451,14 @@ func TestSettingsJSON_Serialization(t *testing.T) {
 }
 
 func TestSaveSettings_RealFunction(t *testing.T) {
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	tmpDir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", tmpDir)
+	t.Setenv("APPDATA", tmpDir)
 	original := DefaultSettings()
 	original.Network.MaxConnectionsPerDownload.Value = 48
 	original.General.AutoResume.Value = true
+	original.General.Theme.Value = ThemeDark
+	original.General.TransparentBackground.Value = true
 
 	err := SaveSettings(original)
 	if err != nil {
@@ -293,6 +475,12 @@ func TestSaveSettings_RealFunction(t *testing.T) {
 	}
 	if !Resolve[bool](loaded.General.AutoResume) {
 		t.Error("AutoResume should be true")
+	}
+	if Resolve[int](loaded.General.Theme) != ThemeDark || !Resolve[bool](loaded.General.TransparentBackground) {
+		t.Error("appearance settings did not survive save and load")
+	}
+	if loaded.FindSetting("Appearance", "theme") != loaded.FindSetting("General", "theme") {
+		t.Error("legacy general lookup must address the appearance setting")
 	}
 }
 
@@ -382,5 +570,187 @@ func TestResolveGeneric(t *testing.T) {
 	s.Performance.SlowWorkerGracePeriod.Value = "15s"
 	if val := Resolve[time.Duration](s.Performance.SlowWorkerGracePeriod); val != 15*time.Second {
 		t.Errorf("Resolve[time.Duration] got %v, want 15s", val)
+	}
+}
+
+func TestCategorySettings_UnmarshalJSON(t *testing.T) {
+	tests := []struct {
+		name        string
+		json        string
+		wantErr     bool
+		assertState func(t *testing.T, cs *CategorySettings)
+	}{
+		{
+			name:    "Old array format",
+			json:    `[{"name": "Videos", "pattern": ".*\\.mp4"}]`,
+			wantErr: false,
+			assertState: func(t *testing.T, cs *CategorySettings) {
+				if len(cs.Categories) != 1 {
+					t.Fatalf("Expected 1 category, got %d", len(cs.Categories))
+				}
+				if cs.Categories[0].Name != "Videos" {
+					t.Errorf("Expected 'Videos', got '%s'", cs.Categories[0].Name)
+				}
+			},
+		},
+		{
+			name:    "New struct format",
+			json:    `{"category_enabled": true, "categories": [{"name": "Documents", "pattern": ".*\\.pdf"}]}`,
+			wantErr: false,
+			assertState: func(t *testing.T, cs *CategorySettings) {
+				if len(cs.Categories) != 1 {
+					t.Fatalf("Expected 1 category, got %d", len(cs.Categories))
+				}
+				if cs.Categories[0].Name != "Documents" {
+					t.Errorf("Expected 'Documents', got '%s'", cs.Categories[0].Name)
+				}
+				if cs.CategoryEnabled == nil {
+					t.Fatalf("Expected CategoryEnabled to be non-nil")
+				}
+				if Resolve[bool](cs.CategoryEnabled) != true {
+					t.Errorf("Expected CategoryEnabled to be true")
+				}
+			},
+		},
+		{
+			name:    "Null value",
+			json:    `null`,
+			wantErr: false,
+			assertState: func(t *testing.T, cs *CategorySettings) {
+				if len(cs.Categories) != 0 {
+					t.Errorf("Expected 0 categories, got %d", len(cs.Categories))
+				}
+			},
+		},
+		{
+			name:    "Empty array",
+			json:    `[]`,
+			wantErr: false,
+			assertState: func(t *testing.T, cs *CategorySettings) {
+				if len(cs.Categories) != 0 {
+					t.Errorf("Expected 0 categories, got %d", len(cs.Categories))
+				}
+			},
+		},
+		{
+			name:        "Invalid JSON array",
+			json:        `[{"name": "Videos"`,
+			wantErr:     true,
+			assertState: nil,
+		},
+		{
+			name:        "Invalid JSON object",
+			json:        `{"categories": [{"name": "Videos"}`,
+			wantErr:     true,
+			assertState: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var cs CategorySettings
+			err := json.Unmarshal([]byte(tt.json), &cs)
+
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("Unmarshal() error = %v, wantErr %v", err, tt.wantErr)
+			}
+
+			if !tt.wantErr && tt.assertState != nil {
+				tt.assertState(t, &cs)
+			}
+		})
+	}
+}
+
+func TestCategorySettings_UnmarshalJSON_BackwardCompatibility(t *testing.T) {
+	// Test the old array format
+	oldJSON := []byte(`[
+		{"name": "Videos", "pattern": ".*\\.mp4"},
+		{"name": "Music", "pattern": ".*\\.mp3"}
+	]`)
+
+	var cs CategorySettings
+	err := json.Unmarshal(oldJSON, &cs)
+	if err != nil {
+		t.Fatalf("Failed to unmarshal old array format: %v", err)
+	}
+
+	if len(cs.Categories) != 2 {
+		t.Fatalf("Expected 2 categories, got %d", len(cs.Categories))
+	}
+	if cs.Categories[0].Name != "Videos" {
+		t.Errorf("Expected first category to be 'Videos', got '%s'", cs.Categories[0].Name)
+	}
+
+	// Test the new struct format
+	newJSON := []byte(`{
+		"category_enabled": true,
+		"categories": [
+			{"name": "Documents", "pattern": ".*\\.pdf"}
+		]
+	}`)
+
+	fullJSON := []byte(`{
+		"categories": ` + string(newJSON) + `
+	}`)
+
+	s := DefaultSettings()
+	err = json.Unmarshal(fullJSON, s)
+	if err != nil {
+		t.Fatalf("Failed to unmarshal new struct format: %v", err)
+	}
+
+	if len(s.Categories.Categories) != 1 {
+		t.Fatalf("Expected 1 category, got %d", len(s.Categories.Categories))
+	}
+	if s.Categories.Categories[0].Name != "Documents" {
+		t.Errorf("Expected 'Documents', got '%s'", s.Categories.Categories[0].Name)
+	}
+	if !Resolve[bool](s.Categories.CategoryEnabled) {
+		t.Errorf("Expected category_enabled to be true")
+	}
+
+	// Test full settings with old format
+	fullOldJSON := []byte(`{
+		"categories": ` + string(oldJSON) + `
+	}`)
+
+	s2 := DefaultSettings()
+	err = json.Unmarshal(fullOldJSON, s2)
+	if err != nil {
+		t.Fatalf("Failed to unmarshal full old format: %v", err)
+	}
+
+	if len(s2.Categories.Categories) != 2 {
+		t.Fatalf("Expected 2 categories, got %d", len(s2.Categories.Categories))
+	}
+	if s2.Categories.Categories[0].Name != "Videos" {
+		t.Errorf("Expected 'Videos', got '%s'", s2.Categories.Categories[0].Name)
+	}
+	// CategoryEnabled should remain default (false)
+	if Resolve[bool](s2.Categories.CategoryEnabled) {
+		t.Errorf("Expected category_enabled to remain false")
+	}
+}
+
+func TestClonePreservesEmptyCategories(t *testing.T) {
+	for _, categories := range [][]Category{nil, {}} {
+		settings := DefaultSettings()
+		settings.Categories.Categories = categories
+		if got := settings.Clone().Categories.Categories; !reflect.DeepEqual(got, categories) {
+			t.Fatalf("Clone categories = %#v, want %#v", got, categories)
+		}
+	}
+}
+
+func TestNormalizeValuesRejectsInvalidIntegers(t *testing.T) {
+	for _, setting := range []string{"max_connections_per_host", "min_chunk_size"} {
+		for _, value := range []float64{1048576.5, math.NaN(), math.Inf(1), math.Ldexp(1, 63)} {
+			settings := DefaultSettings()
+			settings.FindSetting("Network", setting).Value = value
+			if err := settings.NormalizeValues(); err == nil {
+				t.Fatalf("%s accepted %v", setting, value)
+			}
+		}
 	}
 }

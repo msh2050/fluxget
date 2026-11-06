@@ -1100,7 +1100,14 @@ function renderView() {
     case 'settings':  content = renderSettings(); break;
     default: content = renderDashboard();
   }
+  // The scroll container (.fg-content) is recreated on every render, so keep
+  // its scroll position when re-rendering the same view (progress ticks).
+  const prev = main.querySelector('.fg-content');
+  const keepScroll = prev && main.dataset.view === state.view ? prev.scrollTop : 0;
   main.innerHTML = content;
+  main.dataset.view = state.view;
+  const next = main.querySelector('.fg-content');
+  if (next && keepScroll) next.scrollTop = keepScroll;
 
   if (state.view === 'dashboard') {
     renderSpeedGraph('speed-graph');
@@ -1111,6 +1118,9 @@ function renderView() {
 let renderQueued = false;
 function scheduleRender() {
   if (renderQueued) return;
+  // Settings don't depend on download events; re-rendering would wipe
+  // whatever the user is typing.
+  if (state.view === 'settings') return;
   renderQueued = true;
   requestAnimationFrame(() => {
     renderQueued = false;
@@ -1143,6 +1153,16 @@ function renderTitlebar() {
    SSE
 ═══════════════════════════════════════════════════════════ */
 function connectSSE() {
+  // SSE payloads use snake_case JSON (types.DownloadEvent). Expose the
+  // PascalCase aliases the render code below was written against.
+  const sse = raw => {
+    const d = JSON.parse(raw);
+    return Object.assign({
+      DownloadID: d.download_id, Downloaded: d.downloaded, Total: d.total,
+      Speed: d.speed, ActiveConnections: d.connections, AvgSpeed: d.avg_speed,
+      DestPath: d.dest_path, Filename: d.filename, URL: d.url, Err: d.error,
+    }, d);
+  };
   const es = new EventSource('/events');
 
   es.onopen = () => {
@@ -1157,7 +1177,7 @@ function connectSSE() {
   };
 
   es.addEventListener('progress', e => {
-    const d = JSON.parse(e.data);
+    const d = sse(e.data);
     const dl = state.downloads[d.DownloadID];
     if (dl) {
       dl.downloaded = d.Downloaded;
@@ -1177,7 +1197,7 @@ function connectSSE() {
   });
 
   es.addEventListener('started', e => {
-    const d = JSON.parse(e.data);
+    const d = sse(e.data);
     state.downloads[d.DownloadID] = {
       id: d.DownloadID,
       url: d.URL,
@@ -1197,7 +1217,7 @@ function connectSSE() {
   });
 
   es.addEventListener('complete', e => {
-    const d = JSON.parse(e.data);
+    const d = sse(e.data);
     if (state.downloads[d.DownloadID]) {
       state.downloads[d.DownloadID].status = 'done';
       state.downloads[d.DownloadID].speed = 0;
@@ -1208,7 +1228,7 @@ function connectSSE() {
   });
 
   es.addEventListener('error', e => {
-    const d = JSON.parse(e.data);
+    const d = sse(e.data);
     if (state.downloads[d.DownloadID]) {
       state.downloads[d.DownloadID].status = 'error';
       state.downloads[d.DownloadID].error = d.Err || 'Download failed';
@@ -1217,7 +1237,7 @@ function connectSSE() {
   });
 
   es.addEventListener('paused', e => {
-    const d = JSON.parse(e.data);
+    const d = sse(e.data);
     if (state.downloads[d.DownloadID]) {
       state.downloads[d.DownloadID].status = 'paused';
       state.downloads[d.DownloadID].speed = 0;
@@ -1226,7 +1246,7 @@ function connectSSE() {
   });
 
   es.addEventListener('resumed', e => {
-    const d = JSON.parse(e.data);
+    const d = sse(e.data);
     if (state.downloads[d.DownloadID]) {
       state.downloads[d.DownloadID].status = 'downloading';
     }
@@ -1234,7 +1254,7 @@ function connectSSE() {
   });
 
   es.addEventListener('queued', e => {
-    const d = JSON.parse(e.data);
+    const d = sse(e.data);
     state.downloads[d.DownloadID] = {
       id: d.DownloadID,
       url: d.URL,
@@ -1254,7 +1274,7 @@ function connectSSE() {
   });
 
   es.addEventListener('removed', e => {
-    const d = JSON.parse(e.data);
+    const d = sse(e.data);
     delete state.downloads[d.DownloadID];
     scheduleRender();
   });
@@ -1361,7 +1381,7 @@ function toggleSetting(key, el) {
 
 async function loadSettings() {
   try {
-    const r = await fetch('/settings');
+    const r = await fetch('/gui/settings');
     if (!r.ok) return;
     const data = await r.json();
     Object.assign(state.settings, data);
@@ -1385,7 +1405,7 @@ async function saveSettings() {
   s.port          = parseInt(document.getElementById('s-port')?.value) || s.port;
 
   try {
-    const r = await fetch('/settings', {
+    const r = await fetch('/gui/settings', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
       body: JSON.stringify(s),

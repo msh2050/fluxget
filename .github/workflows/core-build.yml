@@ -10,19 +10,34 @@ on:
   pull_request:
     branches:
       - main
-    paths-ignore:
-      - "extension/**"
 
 permissions:
   contents: write
+  pull-requests: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      core: ${{ steps.filter.outputs.core }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            core:
+              - '!extension/**'
+              - '**'
+
   test:
     name: Test and Check (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.core == 'true' || github.event_name != 'pull_request'
     strategy:
       fail-fast: false
       matrix:
@@ -33,36 +48,82 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.25.0"
+          go-version: "1.26.0"
           check-latest: false
       - name: Install gotestsum
         run: go install gotest.tools/gotestsum@latest
       - name: Build
         shell: bash
         run: go build -v ./...
+
       - name: Test
         shell: bash
         run: |
           cover_arg=""
           if [ "$RUNNER_OS" = "Linux" ]; then
-            cover_arg="-- -coverprofile=coverage.out"
+            cover_arg="-coverprofile=coverage.out"
           fi
-          gotestsum --junitfile test-results.xml --format testdox $cover_arg ./...
-      - name: Upload Test Results
-        uses: actions/upload-artifact@v4
-        if: always()
+          gotestsum --junitfile test-results.xml --format testdox -- -race $cover_arg ./...
+      - name: Comment Test Failures
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
         with:
-          name: test-results-${{ matrix.os }}
-          path: test-results.xml
-          retention-days: 7
+          script: |
+            const fs = require('fs');
+            const signature = '<!-- core-build-test-failures-${{ matrix.os }} -->';
+            
+            // 1. Delete previous comments
+            try {
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+              });
+              
+              for (const comment of comments) {
+                if (comment.user?.type === 'Bot' && comment.body.includes(signature)) {
+                  await github.rest.issues.deleteComment({
+                    comment_id: comment.id,
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                  });
+                }
+              }
+            } catch (err) {
+              core.warning(`Could not delete old comments: ${err.message}`);
+            }
+
+            // 2. Post new comment if there are failures
+            if (!fs.existsSync('test-results.xml')) return;
+            const content = fs.readFileSync('test-results.xml', 'utf8');
+            const regex = /<testcase classname="([^"]+)" name="([^"]+)"[^>]*>\s*<(?:failure|error)/g;
+            let match;
+            const failures = [];
+            while ((match = regex.exec(content)) !== null) {
+              failures.push(`- **${match[1]}**: \`${match[2]}\``);
+            }
+            if (failures.length > 0) {
+              const body = `${signature}\n### ❌ Test Failures on \`${{ matrix.os }}\`\n` + failures.join('\n');
+              try {
+                await github.rest.issues.createComment({
+                  issue_number: context.issue.number,
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  body: body
+                });
+              } catch (err) {
+                // Fork PRs have a read-only token; log but don't fail the step.
+                core.warning(`Could not post comment (fork PR?): ${err.message}`);
+              }
+            }
       - name: Upload coverage reports to Codecov
         uses: codecov/codecov-action@v5
         if: matrix.os == 'ubuntu-latest' && success() && hashFiles('coverage.out') != ''
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
 
-  release:
-    name: Release
+  prepare-unix-release:
+    name: Prepare Unix Release
     runs-on: ubuntu-latest
     needs: test
     # Extra guard: only core tags (v*), never extension tags (ext-v*)
@@ -75,14 +136,159 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.25.0"
-      - name: Run GoReleaser
+          go-version: "1.26.0"
+      - name: Prepare Linux release artifacts
         uses: goreleaser/goreleaser-action@v6
         with:
           distribution: goreleaser-pro
           version: latest
-          args: release --clean
+          args: release --clean --split --skip=chocolatey
+        env:
+          GGOOS: linux
+          GORELEASER_KEY: ${{ secrets.GORELEASER_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+
+      - name: Save Linux release artifacts
+        shell: bash
+        run: mv dist/linux "$RUNNER_TEMP/goreleaser-linux"
+
+      - name: Prepare macOS release artifacts
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser-pro
+          version: latest
+          args: release --clean --split --skip=chocolatey
+        env:
+          GGOOS: darwin
+          GORELEASER_KEY: ${{ secrets.GORELEASER_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+
+      - name: Combine Unix release artifacts
+        shell: bash
+        run: |
+          mv dist/darwin "$RUNNER_TEMP/goreleaser-darwin"
+          mkdir -p dist
+          mv "$RUNNER_TEMP/goreleaser-linux" dist/linux
+          mv "$RUNNER_TEMP/goreleaser-darwin" dist/darwin
+
+      - name: Upload GoReleaser artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: goreleaser-dist-unix
+          path: dist
+
+      - name: Upload GoReleaser extra files
+        uses: actions/upload-artifact@v4
+        with:
+          name: goreleaser-extra
+          path: .goreleaser-extra/*.zip
+          include-hidden-files: true
+
+  publish-windows-release:
+    name: Publish Windows Release
+    runs-on: windows-latest
+    needs: prepare-unix-release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.0"
+      - name: Prepare Windows and Chocolatey artifacts
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser-pro
+          version: latest
+          args: release --clean --split --skip=before
+        env:
+          GGOOS: windows
+          GORELEASER_KEY: ${{ secrets.GORELEASER_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Save Windows release artifacts
+        shell: bash
+        run: mv dist/windows "$RUNNER_TEMP/goreleaser-windows"
+      - name: Download Unix release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: goreleaser-dist-unix
+          path: dist
+      - name: Download GoReleaser extra files
+        uses: actions/download-artifact@v4
+        with:
+          name: goreleaser-extra
+          path: .goreleaser-extra
+      - name: Combine Windows release artifacts
+        shell: bash
+        run: mv "$RUNNER_TEMP/goreleaser-windows" dist/windows
+      - name: Merge and publish GoReleaser release
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser-pro
+          version: latest
+          args: continue --merge
         env:
           GORELEASER_KEY: ${{ secrets.GORELEASER_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+          CHOCOLATEY_API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
+
+  appimage:
+    name: Package AppImage
+    runs-on: ubuntu-latest
+    needs: publish-windows-release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download GoReleaser artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: goreleaser-dist-unix
+          path: dist
+
+      - name: Package AppImage
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary=$(find dist -type f -name surge -path '*linux*amd64*' -print -quit)
+          test -n "$binary"
+          chmod +x "$binary"
+          curl -L --fail --retry 3 --output appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
+          curl -L --fail --retry 3 --output runtime-x86_64 \
+            https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64
+          printf '%s\n' \
+            'ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0  appimagetool' \
+            '2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d  runtime-x86_64' \
+            | sha256sum --check --strict
+          chmod +x appimagetool
+          ./scripts/package-appimage.sh "$binary" AppDir
+          ARCH=x86_64 ./appimagetool --appimage-extract-and-run \
+            --runtime-file runtime-x86_64 \
+            -u 'gh-releases-zsync|SurgeDM|Surge|latest|Surge_*_linux_x86_64.AppImage.zsync' \
+            AppDir "Surge_${GITHUB_REF_NAME#v}_linux_x86_64.AppImage"
+
+      - name: Verify AppImage
+        shell: bash
+        run: |
+          set -euo pipefail
+          appimage="Surge_${GITHUB_REF_NAME#v}_linux_x86_64.AppImage"
+          test -s "$appimage" && test -s "$appimage.zsync"
+          "./$appimage" --appimage-extract >/dev/null
+          test -x squashfs-root/AppRun
+          test -f squashfs-root/surge.desktop
+          test -f squashfs-root/surge.png
+
+      - name: Upload AppImage
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          appimage="Surge_${GITHUB_REF_NAME#v}_linux_x86_64.AppImage"
+          gh release upload "$GITHUB_REF_NAME" "$appimage" "$appimage.zsync" --clobber

@@ -7,14 +7,37 @@ import (
 	"time"
 
 	"github.com/msh2050/fluxget/internal/config"
-	"github.com/msh2050/fluxget/internal/processing"
+	"github.com/msh2050/fluxget/internal/orchestrator"
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/msh2050/fluxget/internal/tui/colors"
+	"github.com/msh2050/fluxget/internal/types"
 )
 
 var ansiEscapeRE = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+func TestDownloadDirectoryUsesDestinationPathFormat(t *testing.T) {
+	for _, tt := range []struct{ destination, want string }{
+		{`C:\Users\Alice\Downloads\file.zip`, `C:\Users\Alice\Downloads`},
+		{`C:\file.zip`, `C:\`},
+		{`C:/file.zip`, `C:/`},
+		{`C:/Users/Alice/file.zip`, `C:/Users/Alice`},
+		{`C:\Users/Alice\file.zip`, `C:\Users/Alice`},
+		{`\\server\share\file.zip`, `\\server\share`},
+		{`//server/share/file.zip`, `//server/share`},
+		{"/home/alice/Downloads/file.zip", "/home/alice/Downloads"},
+		{"/file.zip", "/"},
+		{`/home/alice/a\b/file.zip`, `/home/alice/a\b`},
+		{"file.zip", "."},
+	} {
+		t.Run(tt.destination, func(t *testing.T) {
+			if got := downloadDirectory(tt.destination); got != tt.want {
+				t.Fatalf("directory = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
 
 func TestFormatDurationForUI(t *testing.T) {
 	tests := []struct {
@@ -33,7 +56,8 @@ func TestFormatDurationForUI(t *testing.T) {
 		{"23h59m59s", 23*time.Hour + 59*time.Minute + 59*time.Second, "23:59:59"},
 		{"1 day", 24 * time.Hour, "1d"},
 		{"1d 5h", 29 * time.Hour, "1d 5h"},
-		{"30+ days", 31 * 24 * time.Hour, "∞"},
+		{"30 days", 30 * 24 * time.Hour, "30d"},
+		{"30+ days", 31 * 24 * time.Hour, "31d"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -42,6 +66,44 @@ func TestFormatDurationForUI(t *testing.T) {
 				t.Errorf("formatDurationForUI(%v) = %q, want %q", tt.dur, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestRenderHeaderBox_LocalModeHidesServerAddressAndStatusDot(t *testing.T) {
+	InitializeTUI()
+
+	m := RootModel{
+		ServerPort: 0,
+		ServerHost: "127.0.0.1",
+		IsRemote:   false,
+	}
+
+	plain := ansiEscapeRE.ReplaceAllString(m.renderHeaderBox(60, 8), "")
+	if !strings.Contains(plain, "Local mode") {
+		t.Fatalf("expected Local mode banner, got %q", plain)
+	}
+	if strings.Contains(plain, "127.0.0.1:0") {
+		t.Fatalf("unexpected server address in local no-server mode: %q", plain)
+	}
+	if strings.Contains(plain, "●") {
+		t.Fatalf("unexpected status dot in local no-server mode: %q", plain)
+	}
+}
+
+func TestRenderHeaderBox_CompactLocalModeStaysEmptyWhenServerDisabled(t *testing.T) {
+	InitializeTUI()
+
+	m := RootModel{
+		ServerPort: 0,
+		IsRemote:   false,
+	}
+
+	plain := ansiEscapeRE.ReplaceAllString(m.renderHeaderBox(24, 6), "")
+	if strings.Contains(plain, "127.0.0.1:0") {
+		t.Fatalf("unexpected compact server address in no-server mode: %q", plain)
+	}
+	if strings.Contains(plain, "●") {
+		t.Fatalf("unexpected compact status dot in no-server mode: %q", plain)
 	}
 }
 
@@ -64,6 +126,7 @@ func TestGetDownloadStatus(t *testing.T) {
 			name: "Resuming State",
 			model: &DownloadModel{
 				resuming: true,
+				started:  true,
 			},
 			expected: "⠋ Resuming...",
 		},
@@ -92,7 +155,7 @@ func TestGetDownloadStatus(t *testing.T) {
 }
 
 func TestView_DashboardFitsViewportWithoutTopCutoff(t *testing.T) {
-	m := InitialRootModel(1701, "test-version", nil, processing.NewLifecycleManager(nil, nil), false)
+	m := InitialRootModel(1701, "test-version", nil, orchestrator.NewLifecycleManager(nil, nil, nil), nil, false)
 
 	cases := []struct {
 		width  int
@@ -130,7 +193,7 @@ func TestView_DashboardFitsViewportWithoutTopCutoff(t *testing.T) {
 }
 
 func TestView_QuitConfirmContainsButtons(t *testing.T) {
-	m := InitialRootModel(1701, "test-version", nil, processing.NewLifecycleManager(nil, nil), false)
+	m := InitialRootModel(1701, "test-version", nil, orchestrator.NewLifecycleManager(nil, nil, nil), nil, false)
 	m.state = QuitConfirmState
 	m.width = 120
 	m.height = 35
@@ -148,7 +211,7 @@ func TestView_QuitConfirmContainsButtons(t *testing.T) {
 }
 
 func TestView_QuitConfirmShowsActiveDownloadDetail(t *testing.T) {
-	m := InitialRootModel(1701, "test-version", nil, processing.NewLifecycleManager(nil, nil), false)
+	m := InitialRootModel(1701, "test-version", nil, orchestrator.NewLifecycleManager(nil, nil, nil), nil, false)
 	m.state = QuitConfirmState
 	m.width = 120
 	m.height = 35
@@ -163,7 +226,7 @@ func TestView_QuitConfirmShowsActiveDownloadDetail(t *testing.T) {
 }
 
 func TestView_QuitConfirmNoFocusedRendersCorrectly(t *testing.T) {
-	m := InitialRootModel(1701, "test-version", nil, processing.NewLifecycleManager(nil, nil), false)
+	m := InitialRootModel(1701, "test-version", nil, orchestrator.NewLifecycleManager(nil, nil, nil), nil, false)
 	m.state = QuitConfirmState
 	m.quitConfirmFocused = 1
 	m.width = 120
@@ -176,15 +239,59 @@ func TestView_QuitConfirmNoFocusedRendersCorrectly(t *testing.T) {
 }
 
 func TestView_QuitConfirmTinyTerminalDoesNotPanic(t *testing.T) {
-	m := InitialRootModel(1701, "test-version", nil, processing.NewLifecycleManager(nil, nil), false)
+	m := InitialRootModel(1701, "test-version", nil, orchestrator.NewLifecycleManager(nil, nil, nil), nil, false)
 	m.state = QuitConfirmState
 	m.width = 10
 	m.height = 5
 	_ = m.View()
 }
 
+func TestView_CompactQuitConfirmPreservesCopyAndFocus(t *testing.T) {
+	for _, size := range []struct{ width, height int }{{40, 5}, {20, 5}, {20, 1}} {
+		m := InitialRootModel(1701, "test-version", nil, orchestrator.NewLifecycleManager(nil, nil, nil), nil, false)
+		m.state = QuitConfirmState
+		m.width, m.height = size.width, size.height
+		yesFocused := m.View().Content
+		plain := ansiEscapeRE.ReplaceAllString(yesFocused, "")
+		for _, label := range []string{"Yep!", "Nope"} {
+			if !strings.Contains(plain, label) {
+				t.Fatalf("expected %q at %dx%d, got %q", label, m.width, m.height, plain)
+			}
+		}
+		if m.width == 40 && !strings.Contains(plain, "Are you sure you want to quit?") {
+			t.Fatalf("expected full confirmation message, got %q", plain)
+		}
+		m.quitConfirmFocused = 1
+		if yesFocused == m.View().Content {
+			t.Fatalf("selection must change visibly at %dx%d", m.width, m.height)
+		}
+	}
+}
+
+func TestView_RemoveConfirmTruncatesUTF8FilenameSafely(t *testing.T) {
+	m := InitialRootModel(1701, "test-version", nil, orchestrator.NewLifecycleManager(nil, nil, nil), nil, false)
+	m.state = RemoveConfirmState
+	m.removeTargetID = "id-1"
+	m.width = 120
+	m.height = 35
+	m.downloads = []*DownloadModel{
+		{ID: "id-1", Filename: "日本語日本語日本語日本語日本語日本語.zip", paused: true},
+	}
+
+	plain := ansiEscapeRE.ReplaceAllString(m.View().Content, "")
+	if strings.Contains(plain, "\uFFFD") {
+		t.Fatalf("expected UTF-8 filename truncation without replacement characters, got:\n%s", plain)
+	}
+	if !strings.Contains(plain, "File: 日本語") {
+		t.Fatalf("expected filename prefix in remove confirmation, got:\n%s", plain)
+	}
+	if !strings.Contains(plain, "\u2026") {
+		t.Fatalf("expected truncated filename ellipsis, got:\n%s", plain)
+	}
+}
+
 func TestView_SettingsTinyTerminalDoesNotPanic(t *testing.T) {
-	m := InitialRootModel(1701, "test-version", nil, processing.NewLifecycleManager(nil, nil), false)
+	m := InitialRootModel(1701, "test-version", nil, orchestrator.NewLifecycleManager(nil, nil, nil), nil, false)
 	m.state = SettingsState
 	m.width = 20
 	m.height = 8
@@ -196,7 +303,7 @@ func TestView_SettingsTinyTerminalDoesNotPanic(t *testing.T) {
 }
 
 func TestView_SettingsNoLineExceedsTerminalWidth(t *testing.T) {
-	m := InitialRootModel(1701, "test-version", nil, processing.NewLifecycleManager(nil, nil), false)
+	m := InitialRootModel(1701, "test-version", nil, orchestrator.NewLifecycleManager(nil, nil, nil), nil, false)
 	m.state = SettingsState
 
 	sizes := []struct{ width, height int }{
@@ -228,7 +335,7 @@ func TestView_SettingsResizeSequenceKeepsSelectedVisible(t *testing.T) {
 	selectedRow := len(metadata) - 1
 	selectedLabel := metadata[selectedRow].Label
 
-	m := InitialRootModel(1701, "test-version", nil, processing.NewLifecycleManager(nil, nil), false)
+	m := InitialRootModel(1701, "test-version", nil, orchestrator.NewLifecycleManager(nil, nil, nil), nil, false)
 	m.state = SettingsState
 	m.SettingsActiveTab = 0
 	m.SettingsSelectedRow = selectedRow
@@ -256,7 +363,7 @@ func TestView_SettingsResizeSequenceKeepsSelectedVisible(t *testing.T) {
 }
 
 func TestView_SettingsEditModeNarrowWidthNoOverflow(t *testing.T) {
-	m := InitialRootModel(1701, "test-version", nil, processing.NewLifecycleManager(nil, nil), false)
+	m := InitialRootModel(1701, "test-version", nil, orchestrator.NewLifecycleManager(nil, nil, nil), nil, false)
 	m.state = SettingsState
 	m.width = 55
 	m.height = 16
@@ -273,97 +380,16 @@ func TestView_SettingsEditModeNarrowWidthNoOverflow(t *testing.T) {
 	}
 }
 
-func TestView_CategoryManagerNoLineExceedsTerminalWidth(t *testing.T) {
-	m := InitialRootModel(1701, "test-version", nil, processing.NewLifecycleManager(nil, nil), false)
-	m.state = CategoryManagerState
-
-	sizes := []struct{ width, height int }{
-		{120, 35},
-		{92, 24},
-		{72, 18},
-		{80, 24},
-		{50, 14},
-	}
-
-	for _, tc := range sizes {
-		m.width = tc.width
-		m.height = tc.height
-
-		for i, line := range strings.Split(m.View().Content, "\n") {
-			if lipgloss.Width(line) > tc.width {
-				t.Fatalf("category manager line %d exceeds width at %dx%d: got width %d", i, tc.width, tc.height, lipgloss.Width(line))
-			}
-		}
-	}
-}
-
-func TestView_CategoryManagerResizeSequenceKeepsSelectedVisible(t *testing.T) {
-	settings := config.DefaultSettings()
-	if len(settings.Categories.Categories) == 0 {
-		t.Fatal("expected default categories")
-	}
-
-	selectedCursor := len(settings.Categories.Categories) - 1
-	selectedLabel := settings.Categories.Categories[selectedCursor].Name
-
-	m := InitialRootModel(1701, "test-version", nil, processing.NewLifecycleManager(nil, nil), false)
-	m.state = CategoryManagerState
-	m.Settings = settings
-	m.catMgrCursor = selectedCursor
-
-	sequence := []struct{ width, height int }{
-		{120, 35},
-		{76, 18},
-		{80, 24},
-		{100, 30},
-	}
-
-	for _, tc := range sequence {
-		updated, _ := m.Update(tea.WindowSizeMsg{Width: tc.width, Height: tc.height})
-		m = updated.(RootModel)
-		m.state = CategoryManagerState
-
-		plain := ansiEscapeRE.ReplaceAllString(m.View().Content, "")
-		if strings.TrimSpace(plain) == "" {
-			t.Fatalf("empty category manager view after resize to %dx%d", tc.width, tc.height)
-		}
-		if !strings.Contains(plain, selectedLabel) {
-			t.Fatalf("selected category label %q not visible after resize to %dx%d", selectedLabel, tc.width, tc.height)
-		}
-	}
-}
-
-func TestView_CategoryManagerEditModeNarrowWidthNoOverflow(t *testing.T) {
-	m := InitialRootModel(1701, "test-version", nil, processing.NewLifecycleManager(nil, nil), false)
-	m.state = CategoryManagerState
-	m.width = 55
-	m.height = 16
-	m.catMgrEditing = true
-	m.catMgrCursor = 0
-	m.catMgrEditField = 2
-	m.catMgrInputs[0].SetValue(strings.Repeat("n", 80))
-	m.catMgrInputs[1].SetValue(strings.Repeat("d", 120))
-	m.catMgrInputs[2].SetValue(strings.Repeat("p", 200))
-	m.catMgrInputs[3].SetValue(strings.Repeat("C:/very/long/path/", 12))
-	m.updateCategoryInputWidthsForViewport()
-
-	for i, line := range strings.Split(m.View().Content, "\n") {
-		if lipgloss.Width(line) > m.width {
-			t.Fatalf("category edit line %d exceeds width at %dx%d: got width %d", i, m.width, m.height, lipgloss.Width(line))
-		}
-	}
-}
-
 func TestView_NetworkActivityShowsFiveAxisLabelsWhenTall(t *testing.T) {
-	m := InitialRootModel(1701, "test-version", nil, processing.NewLifecycleManager(nil, nil), false)
+	m := InitialRootModel(1701, "test-version", nil, orchestrator.NewLifecycleManager(nil, nil, nil), nil, false)
 	m.width = 140
 	m.height = 40
 
 	view := m.View()
 	plain := ansiEscapeRE.ReplaceAllString(view.Content, "")
 
-	if !strings.Contains(plain, "0.8 MB/s") || !strings.Contains(plain, "0.2 MB/s") {
-		t.Fatalf("expected 5-axis labels (including 0.8 and 0.2 MB/s), got:\n%s", plain)
+	if !strings.Contains(plain, "781 KiB/s") || !strings.Contains(plain, "195 KiB/s") {
+		t.Fatalf("expected 5-axis labels (including 781 KiB/s and 195 KiB/s), got:\n%s", plain)
 	}
 }
 
@@ -392,7 +418,7 @@ func BenchmarkCachedLogo(b *testing.B) {
 /____/\__,_/_/   \__, /\___/
                 /____/       `
 
-	m := InitialRootModel(1701, "test-version", nil, processing.NewLifecycleManager(nil, nil), false)
+	m := InitialRootModel(1701, "test-version", nil, orchestrator.NewLifecycleManager(nil, nil, nil), nil, false)
 	// Pre-warm cache
 	gradientLogo := ApplyGradient(logoText, colors.Pink(), colors.Magenta())
 	m.logoCache = lipgloss.NewStyle().Render(gradientLogo)
@@ -410,7 +436,7 @@ func BenchmarkCachedLogo(b *testing.B) {
 // Tests for issue #252: TUI layout breakage on non-standard terminal sizes
 
 func TestView_NoLineExceedsTerminalWidth(t *testing.T) {
-	m := InitialRootModel(1701, "test-version", nil, processing.NewLifecycleManager(nil, nil), false)
+	m := InitialRootModel(1701, "test-version", nil, orchestrator.NewLifecycleManager(nil, nil, nil), nil, false)
 
 	sizes := []struct{ width, height int }{
 		{160, 40}, // full layout
@@ -439,7 +465,7 @@ func TestView_NoBoxCorruptionAtNarrowWidths(t *testing.T) {
 		"╭╭", "╮╮", "╰╰", "╯╯", // doubled corners
 	}
 
-	m := InitialRootModel(1701, "test-version", nil, processing.NewLifecycleManager(nil, nil), false)
+	m := InitialRootModel(1701, "test-version", nil, orchestrator.NewLifecycleManager(nil, nil, nil), nil, false)
 
 	sizes := []struct{ width, height int }{
 		{160, 40},
@@ -463,7 +489,7 @@ func TestView_NoBoxCorruptionAtNarrowWidths(t *testing.T) {
 }
 
 func TestView_RightColumnHiddenAtNarrowWidth(t *testing.T) {
-	m := InitialRootModel(1701, "test-version", nil, processing.NewLifecycleManager(nil, nil), false)
+	m := InitialRootModel(1701, "test-version", nil, orchestrator.NewLifecycleManager(nil, nil, nil), nil, false)
 	m.width = 60
 	m.height = 20
 
@@ -480,7 +506,7 @@ func TestView_RightColumnHiddenAtNarrowWidth(t *testing.T) {
 }
 
 func TestView_LogoHiddenAtNarrowWidth(t *testing.T) {
-	m := InitialRootModel(1701, "test-version", nil, processing.NewLifecycleManager(nil, nil), false)
+	m := InitialRootModel(1701, "test-version", nil, orchestrator.NewLifecycleManager(nil, nil, nil), nil, false)
 	m.width = 60
 	m.height = 24
 
@@ -495,7 +521,7 @@ func TestView_LogoHiddenAtNarrowWidth(t *testing.T) {
 }
 
 func TestView_FooterHidesHelpTextAtNarrowWidth(t *testing.T) {
-	m := InitialRootModel(1701, "test-version", nil, processing.NewLifecycleManager(nil, nil), false)
+	m := InitialRootModel(1701, "test-version", nil, orchestrator.NewLifecycleManager(nil, nil, nil), nil, false)
 	m.width = 40
 	m.height = 24
 
@@ -513,7 +539,7 @@ func TestView_FooterHidesHelpTextAtNarrowWidth(t *testing.T) {
 }
 
 func TestView_TerminalTooSmallMessage(t *testing.T) {
-	m := InitialRootModel(1701, "test-version", nil, processing.NewLifecycleManager(nil, nil), false)
+	m := InitialRootModel(1701, "test-version", nil, orchestrator.NewLifecycleManager(nil, nil, nil), nil, false)
 
 	sizes := []struct{ width, height int }{
 		{40, 10},
@@ -533,7 +559,7 @@ func TestView_TerminalTooSmallMessage(t *testing.T) {
 }
 
 func TestHelpModal_RendersAndClosesOnEsc(t *testing.T) {
-	m := InitialRootModel(1701, "test-version", nil, processing.NewLifecycleManager(nil, nil), false)
+	m := InitialRootModel(1701, "test-version", nil, orchestrator.NewLifecycleManager(nil, nil, nil), nil, false)
 	m.width = 120
 	m.height = 40
 	m.state = HelpModalState
@@ -554,7 +580,7 @@ func TestHelpModal_RendersAndClosesOnEsc(t *testing.T) {
 }
 
 func TestView_DoesNotPanicAtExtremeSizes(t *testing.T) {
-	m := InitialRootModel(1701, "test-version", nil, processing.NewLifecycleManager(nil, nil), false)
+	m := InitialRootModel(1701, "test-version", nil, orchestrator.NewLifecycleManager(nil, nil, nil), nil, false)
 
 	extremeSizes := []struct{ width, height int }{
 		{40, 12},  // very narrow and short
@@ -569,5 +595,298 @@ func TestView_DoesNotPanicAtExtremeSizes(t *testing.T) {
 		m.height = tc.height
 		// Should not panic
 		_ = m.View()
+	}
+}
+
+// --- Footer status bar tests ---
+
+// footerLine extracts the plain-text last line of the dashboard view.
+func footerLine(m RootModel) string {
+	plain := ansiEscapeRE.ReplaceAllString(m.View().Content, "")
+	trimmed := strings.TrimRight(plain, "\r\n")
+	lines := strings.Split(trimmed, "\n")
+	if len(lines) == 0 {
+		return ""
+	}
+	return strings.TrimRight(lines[len(lines)-1], "\r")
+}
+
+func TestFooter_GlyphsAlwaysPresent(t *testing.T) {
+	InitializeTUI()
+	m := InitialRootModel(1701, "1.2.3", nil, orchestrator.NewLifecycleManager(nil, nil, nil), nil, false)
+	m.width = 120
+	m.height = 35
+
+	last := footerLine(m)
+	for _, glyph := range []string{"\u2B07", "\u26A1", "\u23fb"} {
+		if !strings.Contains(last, glyph) {
+			t.Errorf("footer missing glyph %q, got: %q", glyph, last)
+		}
+	}
+}
+
+func TestFooter_VersionShown(t *testing.T) {
+	InitializeTUI()
+	m := InitialRootModel(1701, "9.8.7", nil, orchestrator.NewLifecycleManager(nil, nil, nil), nil, false)
+	m.width = 120
+	m.height = 35
+
+	last := footerLine(m)
+	if !strings.Contains(last, "v9.8.7") {
+		t.Errorf("footer should contain version string v9.8.7, got: %q", last)
+	}
+}
+
+func TestFooter_IdleSpeedShowsZero(t *testing.T) {
+	InitializeTUI()
+	// No active downloads \u2192 speed should render as "0 B/s"
+	m := InitialRootModel(1701, "1.0.0", nil, orchestrator.NewLifecycleManager(nil, nil, nil), nil, false)
+	m.width = 120
+	m.height = 35
+
+	last := footerLine(m)
+	if !strings.Contains(last, "0 B/s") {
+		t.Errorf("footer should show '0 B/s' when idle, got: %q", last)
+	}
+}
+
+func TestFooter_ActiveSpeedShowsMBps(t *testing.T) {
+	InitializeTUI()
+	m := InitialRootModel(1701, "1.0.0", nil, orchestrator.NewLifecycleManager(nil, nil, nil), nil, false)
+	m.width = 120
+	m.height = 35
+	// Inject an active download at 2.5 MB/s (in bytes/s)
+	m.downloads = []*DownloadModel{
+		{Speed: 2.5 * 1024 * 1024},
+	}
+	m.cachedTotalSpeed = int64(2.5 * 1024 * 1024)
+
+	last := footerLine(m)
+	if !strings.Contains(last, "MiB/s") {
+		t.Errorf("footer should show MiB/s for active download, got: %q", last)
+	}
+	if !strings.Contains(last, "2.5") {
+		t.Errorf("footer should show 2.5 MiB/s, got: %q", last)
+	}
+}
+
+func TestFooter_ActiveSpeedShowsKBps(t *testing.T) {
+	InitializeTUI()
+	m := InitialRootModel(1701, "1.0.0", nil, orchestrator.NewLifecycleManager(nil, nil, nil), nil, false)
+	m.width = 120
+	m.height = 35
+	// 512 KB/s = 0.5 MB/s \u2192 should render as KB/s
+	m.downloads = []*DownloadModel{
+		{Speed: 512 * 1024},
+	}
+	m.cachedTotalSpeed = 512 * 1024
+
+	last := footerLine(m)
+	if !strings.Contains(last, "KiB/s") {
+		t.Errorf("footer should show KiB/s for sub-MiB/s speed, got: %q", last)
+	}
+}
+
+func TestFooter_ZeroRateLimitShowsInfinity(t *testing.T) {
+	InitializeTUI()
+	m := InitialRootModel(1701, "1.0.0", nil, orchestrator.NewLifecycleManager(nil, nil, nil), nil, false)
+	m.width = 120
+	m.height = 35
+	// Default settings have no global rate limit \u2192 \u221E
+	m.Settings = config.DefaultSettings()
+
+	last := footerLine(m)
+	if !strings.Contains(last, "\u221E") {
+		t.Errorf("footer should show \u221E when rate limit is 0, got: %q", last)
+	}
+}
+
+func TestFooter_GlobalRateLimitShown(t *testing.T) {
+	InitializeTUI()
+	m := InitialRootModel(1701, "1.0.0", nil, orchestrator.NewLifecycleManager(nil, nil, nil), nil, false)
+	m.width = 120
+	m.height = 35
+
+	settings := config.DefaultSettings()
+	settings.Network.GlobalRateLimit.Value = "2mb" // 2 MB/s limit
+	m.Settings = settings
+
+	last := footerLine(m)
+	// FormatRateLimit(2_000_000) \u2192 "2.0 MB/s" or similar; just check the unit appears
+	if !strings.Contains(last, "/s") {
+		t.Errorf("footer should show rate limit with /s unit, got: %q", last)
+	}
+	// Not 0 when active limit is set
+}
+
+func TestFooter_HidesHelpAtNarrowWidth(t *testing.T) {
+	InitializeTUI()
+	// width=55: above MinTermWidth(45) so the real dashboard renders, but below
+	// the 60-char threshold where we drop help text from the footer.
+	m := InitialRootModel(1701, "1.0.0", nil, orchestrator.NewLifecycleManager(nil, nil, nil), nil, false)
+	m.width = 55
+	m.height = 24
+
+	last := footerLine(m)
+	// Speed/limit/version glyphs must still appear
+	for _, glyph := range []string{"\u2B07", "\u26A1", "\u23fb"} {
+		if !strings.Contains(last, glyph) {
+			t.Errorf("narrow footer missing glyph %q, got: %q", glyph, last)
+		}
+	}
+	// Help key text must be absent at this width
+	if strings.Contains(last, "enter") || strings.Contains(last, "tab") || strings.Contains(last, "del") {
+		t.Errorf("footer should hide help text at narrow width, got: %q", last)
+	}
+}
+
+func TestFooter_NoLineOverflowAtVariousSizes(t *testing.T) {
+	InitializeTUI()
+	sizes := []struct{ width, height int }{
+		{160, 40},
+		{120, 35},
+		{100, 24},
+		{80, 24},
+		{60, 20},
+	}
+	for _, tc := range sizes {
+		m := InitialRootModel(1701, "1.0.0", nil, orchestrator.NewLifecycleManager(nil, nil, nil), nil, false)
+		m.width = tc.width
+		m.height = tc.height
+		for i, line := range strings.Split(m.View().Content, "\n") {
+			if w := lipgloss.Width(line); w > tc.width {
+				t.Errorf("line %d overflows at %dx%d: width=%d", i, tc.width, tc.height, w)
+			}
+		}
+	}
+}
+
+func TestView_ETAFlickerBug(t *testing.T) {
+	InitializeTUI()
+	m := InitialRootModel(1701, "1.0.0", nil, orchestrator.NewLifecycleManager(nil, nil, nil), nil, false)
+	m.width = 120
+	m.height = 35
+
+	d := &DownloadModel{
+		ID:         "flicker-test",
+		Filename:   "flicker.iso",
+		Total:      1000 * 1024 * 1024,
+		Downloaded: 500 * 1024 * 1024,
+		Speed:      10 * 1024 * 1024, // 10 MB/s
+	}
+	m.downloads = []*DownloadModel{d}
+	m.SelectedDownloadID = d.ID
+	m.activeTab = TabActive
+	m.UpdateListItems()
+
+	// Initial View should set the ETA cache to the raw ETA (500MB / 10MB/s = 50s)
+	// We do it once to initialize it.
+	d.UpdateETA()
+
+	if d.lastETA != 50*time.Second {
+		t.Fatalf("expected initial ETA to be 50s, got %v", d.lastETA)
+	}
+
+	// Now speed drastically drops to 1 MB/s (raw ETA becomes 500s)
+	d.Speed = 1 * 1024 * 1024
+
+	// Process ONE progress message (as it would happen every 150ms in reality)
+	d.UpdateETA()
+
+	// With EMA alpha = 0.02 on etaSpeed:
+	// d.etaSpeed = 0.02 * 1MB/s + 0.98 * 10MB/s = 9.82 MB/s
+	// ETA = 500MB / 9.82 MB/s = 50.916496945s
+	expectedSmoothed := time.Duration(50.916496945 * float64(time.Second))
+
+	// Use a small tolerance for floating point imprecision
+	diff := d.lastETA - expectedSmoothed
+	if diff < 0 {
+		diff = -diff
+	}
+	if diff > time.Millisecond {
+		t.Fatalf("expected ETA to be smoothed to %v, got %v", expectedSmoothed, d.lastETA)
+	}
+
+	// In the old bug, calling View() 10 times would instantly converge the ETA
+	// Let's call View() 10 times (simulating spinner ticks or terminal resizing)
+	snapshot := d.lastETA
+	for i := 0; i < 10; i++ {
+		m.View()
+	}
+
+	// Since View() should be side-effect free, lastETA should not change!
+	if d.lastETA != snapshot {
+		t.Fatalf("ETA drifted during View() calls! View() is causing side effects. Got: %v, Expected: %v", d.lastETA, snapshot)
+	}
+}
+
+func TestUpdateETA_ResetOnResume(t *testing.T) {
+	m := InitialRootModel(1701, "1.0.0", nil, orchestrator.NewLifecycleManager(nil, nil, nil), nil, false)
+
+	d := &DownloadModel{
+		ID:         "resume-test",
+		Filename:   "test.iso",
+		Total:      1000 * 1024 * 1024,
+		Downloaded: 500 * 1024 * 1024,
+		Speed:      10 * 1024 * 1024,
+	}
+	m.downloads = []*DownloadModel{d}
+
+	// 1. Initial speed
+	d.UpdateETA()
+	if !d.hasEtaSpeed || d.etaSpeed != 10*1024*1024 {
+		t.Fatalf("expected ETA speed to seed correctly")
+	}
+
+	// 2. Simulate pause and resume
+	m.updateEvents(types.DownloadEvent{Type: types.EventPaused, DownloadID: d.ID})
+	m.updateEvents(types.DownloadEvent{Type: types.EventResumed, DownloadID: d.ID})
+
+	if d.hasEtaSpeed || d.etaSpeed != 0 || d.lastETA != 0 {
+		t.Fatalf("expected EventResumed to wipe ETA state, got has=%v, speed=%v, eta=%v", d.hasEtaSpeed, d.etaSpeed, d.lastETA)
+	}
+
+	// 3. New speed on resume
+	d.Speed = 5 * 1024 * 1024
+	d.UpdateETA()
+	if d.etaSpeed != 5*1024*1024 {
+		t.Fatalf("expected ETA speed to re-seed entirely at new speed, got %v", d.etaSpeed)
+	}
+}
+
+func TestFileDetailsFieldOrder(t *testing.T) {
+	d := NewDownloadModel("id", "https://example.com/file", "file", 100)
+	d.Destination = "/tmp/file"
+	text := ansiEscapeRE.ReplaceAllString(renderFocusedDetails(d, 100, ""), "")
+	previous := -1
+	for _, label := range []string{"File:", "Path:", "ID:", "URL:"} {
+		index := strings.Index(text, label)
+		if index <= previous {
+			t.Fatalf("field %q out of order in details: %s", label, text)
+		}
+		previous = index
+	}
+}
+
+func TestFileDetailsTwoLinesAndNoKeyboardHints(t *testing.T) {
+	d := NewDownloadModel(strings.Repeat("i", 80), "https://example.com/"+strings.Repeat("u", 80), strings.Repeat("f", 80), 100)
+	d.Destination = "/tmp/" + strings.Repeat("p", 80) + "/file"
+	text := ansiEscapeRE.ReplaceAllString(renderFocusedDetails(d, 50, ""), "")
+	lines := strings.Split(text, "\n")
+	positions := make([]int, 0, 4)
+	for i, line := range lines {
+		for _, label := range []string{"File:", "Path:", "ID:", "URL:"} {
+			if strings.Contains(line, label) {
+				positions = append(positions, i)
+			}
+		}
+	}
+	if len(positions) != 4 || positions[1]-positions[0] != 2 || positions[2]-positions[1] != 2 || positions[3]-positions[2] != 2 {
+		t.Fatalf("expected two lines per field: %s", text)
+	}
+	for _, hint := range []string{"[o]", "[shift+o]", "[ctrl+y]", "[ctrl+i]"} {
+		if strings.Contains(text, hint) {
+			t.Fatalf("unexpected keyboard hint %q: %s", hint, text)
+		}
 	}
 }

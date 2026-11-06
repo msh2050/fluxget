@@ -1,0 +1,16 @@
+// lint:ignore-leak-check
+package tui
+
+import (
+	"go.uber.org/goleak"
+	"testing"
+)
+
+func TestMain(m *testing.M) {
+	goleak.VerifyTestMain(m,
+		goleak.IgnoreTopFunction("github.com/msh2050/fluxget/internal/orchestrator.(*EventBus).broadcastLoop"),
+		goleak.IgnoreTopFunction("github.com/msh2050/fluxget/internal/orchestrator.(*ProgressAggregator).reportProgressLoop"),
+		goleak.IgnoreTopFunction("sync.runtime_notifyListWait"),
+		goleak.IgnoreTopFunction("internal/poll.runtime_pollWait"),
+	)
+}

@@ -2,79 +2,95 @@ package cmd
 
 import (
 	"fmt"
+	"strings"
 
+	"github.com/msh2050/fluxget/internal/clioutput"
 	"github.com/msh2050/fluxget/internal/utils"
 	"github.com/spf13/cobra"
 )
 
-var addCmd = &cobra.Command{
-	Use:     "add [url]...",
-	Aliases: []string{"get"},
-	Short:   "Add a new download to the running Surge instance",
-	Long:    `Add one or more URLs to the download queue of a running Surge instance.`,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		//initializeGlobally is required to ensure that the config and logger are set up before we attempt to resolve the API connection or read the batch file.
-		if err := initializeGlobalState(); err != nil {
-			return err
-		}
+var addCmd = newAddCommand()
 
-		batchFile, _ := cmd.Flags().GetString("batch")
-		output, _ := cmd.Flags().GetString("output")
+func newAddCommand() *cobra.Command {
+	command := &cobra.Command{
+		Use: "add [url]...", Aliases: []string{"get"},
+		Short: "Add a new download to the running Surge instance",
+		Long:  "Add URLs to a running Surge instance and report acceptance receipts, not completed downloads.",
+		RunE:  runAdd,
+	}
+	command.Flags().StringP("batch", "b", "", "File containing URLs to download (one per line)")
+	command.Flags().StringP("output", "o", "", "Output directory (defaults to current working directory)")
+	command.Flags().Bool("confirm", false, "Request confirmation in the running TUI before starting downloads")
+	command.Flags().String("output-version", "", "Use a versioned JSON contract (supported: 1)")
+	command.SetFlagErrorFunc(func(_ *cobra.Command, err error) error {
+		return clioutput.NewError(clioutput.InvalidArguments, "Invalid command flags.", err)
+	})
+	return command
+}
 
-		var urls []string
-		urls = append(urls, args...)
-
-		// 2. URLs from batch file
-		if batchFile != "" {
-			fileUrls, err := utils.ReadURLsFromFile(batchFile)
-			if err != nil {
-				return fmt.Errorf("error reading batch file: %w", err)
-			}
-			urls = append(urls, fileUrls...)
-		}
-
-		if len(urls) == 0 {
-			_ = cmd.Help()
-			return nil
-		}
-
-		baseURL, token, err := resolveAPIConnection(true)
+func runAdd(cmd *cobra.Command, args []string) error {
+	version, _ := cmd.Flags().GetString("output-version")
+	if cmd.Flags().Changed("output-version") && version != "1" {
+		return clioutput.NewError(clioutput.InvalidArguments, "Only --output-version 1 is supported.", nil)
+	}
+	batchFile, _ := cmd.Flags().GetString("batch")
+	output, _ := cmd.Flags().GetString("output")
+	confirm, _ := cmd.Flags().GetBool("confirm")
+	urls := append([]string(nil), args...)
+	if batchFile != "" {
+		fileURLs, err := utils.ReadURLsFromFile(batchFile)
 		if err != nil {
-			return err
+			return clioutput.NewError(clioutput.InvalidArguments, "Could not read the batch URL file.", fmt.Errorf("error reading batch file: %w", err))
 		}
-		resolvedOutput := resolveClientOutputPath(output)
-
-		// Send downloads to server
-		count := 0
-		attempted := 0
-		for _, arg := range urls {
-			url, mirrors := ParseURLArg(arg)
-			if url == "" {
-				continue
-			}
-			attempted++
-			if err := sendToServer(url, mirrors, resolvedOutput, baseURL, token); err != nil {
-				fmt.Printf("Error adding %s: %v\n", url, err)
-				continue
-			}
-			count++
+		urls = append(urls, fileURLs...)
+	}
+	if len(urls) == 0 {
+		return clioutput.NewError(clioutput.InvalidArguments, "Provide at least one URL or a nonempty --batch file.", nil)
+	}
+	if err := initializeClientState(); err != nil {
+		return err
+	}
+	baseURL, token, err := resolveAPIConnection(true)
+	if err != nil {
+		return err
+	}
+	resolvedOutput := resolveClientOutputPath(output)
+	var items []submissionItem
+	if batchFile != "" && confirm {
+		items = collectConfirmedBatch(urls, resolvedOutput, baseURL, token)
+	} else {
+		items = collectSubmissions(urls, resolvedOutput, baseURL, token, confirm)
+	}
+	err = submissionFailure(items)
+	if version == "1" {
+		if err != nil {
+			return &commandResultError{result: clioutput.FailedItems("add", items, err), cause: err}
 		}
-
-		if count > 0 {
-			fmt.Printf("Successfully added %d downloads.\n", count)
-			return nil
+		return clioutput.WriteJSON(cmd.OutOrStdout(), clioutput.Success("add", items))
+	}
+	var text, diagnostics strings.Builder
+	for _, item := range items {
+		switch item.Status {
+		case "queued":
+			fmt.Fprintf(&text, "Input %d: queued %q\n", item.InputIndex, item.ID)
+		case "pending_approval":
+			fmt.Fprintf(&text, "Input %d: awaiting approval (request %q)\n", item.InputIndex, item.RequestID)
+		default:
+			fmt.Fprintf(&text, "Input %d: %s\n", item.InputIndex, item.Status)
 		}
-
-		if attempted > 0 {
-			return fmt.Errorf("failed to add any downloads")
+		if item.Error != nil {
+			fmt.Fprintf(&diagnostics, "Input %d: %s\n", item.InputIndex, item.Error.Message)
 		}
-
-		return fmt.Errorf("no valid URLs to add")
-	},
+	}
+	if writeErr := clioutput.WriteText(cmd.OutOrStdout(), text.String()); writeErr != nil {
+		return writeErr
+	}
+	if diagnostics.Len() > 0 {
+		if writeErr := clioutput.WriteText(cmd.ErrOrStderr(), diagnostics.String()); writeErr != nil {
+			return writeErr
+		}
+	}
+	return err
 }
 
-func init() {
-	rootCmd.AddCommand(addCmd)
-	addCmd.Flags().StringP("batch", "b", "", "File containing URLs to download (one per line)")
-	addCmd.Flags().StringP("output", "o", "", "Output directory (defaults to current working directory)")
-}
+func init() { rootCmd.AddCommand(addCmd) }

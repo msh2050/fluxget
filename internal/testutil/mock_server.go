@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/msh2050/fluxget/internal/engine/types"
+	"github.com/msh2050/fluxget/internal/utils"
 )
 
 // MockServer is a configurable HTTP test server for download testing.
@@ -21,16 +21,17 @@ type MockServer struct {
 	Server *httptest.Server
 
 	// Configuration
-	FileSize          int64         // Size of the served file
-	SupportsRanges    bool          // Whether to support HTTP Range requests
-	ContentType       string        // Content-Type header value
-	Filename          string        // Filename in Content-Disposition header
-	RandomData        bool          // If true, serve random data; otherwise serve zeros
-	Latency           time.Duration // Artificial latency per request
-	ByteLatency       time.Duration // Latency per byte (simulates slow connection)
-	FailAfterBytes    int64         // Fail connection after this many bytes (0 = no fail)
-	FailOnNthRequest  int           // Fail on Nth request (0 = don't fail)
-	MaxConcurrentReqs int           // Max concurrent requests (0 = unlimited)
+	FileSize          int64           // Size of the served file
+	SupportsRanges    bool            // Whether to support HTTP Range requests
+	ContentType       string          // Content-Type header value
+	Filename          string          // Filename in Content-Disposition header
+	RandomData        bool            // If true, serve random data; otherwise serve zeros
+	Latency           time.Duration   // Artificial latency per request
+	ByteLatency       time.Duration   // Latency per byte (simulates slow connection)
+	FailAfterBytes    int64           // Fail connection after this many bytes (0 = no fail)
+	FailOnNthRequest  int             // Fail on Nth request (0 = don't fail)
+	MaxConcurrentReqs int             // Max concurrent requests (0 = unlimited)
+	RequestStarted    chan<- struct{} // Optional notification when request handling begins
 
 	// Tracking
 	RequestCount   atomic.Int64
@@ -39,8 +40,11 @@ type MockServer struct {
 	RangeRequests  atomic.Int64
 	FullRequests   atomic.Int64
 	FailedRequests atomic.Int64
+	PeakRequests   atomic.Int64
 	requestCountMu sync.Mutex
 	internalReqNum int
+	connectionsMu  sync.Mutex
+	connections    map[string]struct{}
 
 	// Internal
 	data          []byte
@@ -127,10 +131,18 @@ func WithMaxConcurrentRequests(n int) MockServerOption {
 	}
 }
 
+// WithRequestStarted notifies ch when the server begins handling a request.
+// The notification is non-blocking, so callers should provide a buffered channel.
+func WithRequestStarted(ch chan<- struct{}) MockServerOption {
+	return func(m *MockServer) {
+		m.RequestStarted = ch
+	}
+}
+
 // NewMockServer creates a new mock HTTP server with the given options.
 func NewMockServer(opts ...MockServerOption) *MockServer {
 	m := &MockServer{
-		FileSize:       types.MB, // 1MB default
+		FileSize:       utils.MiB,
 		SupportsRanges: true,
 		ContentType:    "application/octet-stream",
 		Filename:       "testfile.bin",
@@ -155,7 +167,7 @@ func NewMockServer(opts ...MockServerOption) *MockServer {
 func NewMockServerT(t *testing.T, opts ...MockServerOption) *MockServer {
 	t.Helper()
 	m := &MockServer{
-		FileSize:       types.MB,
+		FileSize:       utils.MiB,
 		SupportsRanges: true,
 		ContentType:    "application/octet-stream",
 		Filename:       "testfile.bin",
@@ -195,9 +207,13 @@ func (m *MockServer) Reset() {
 	m.RangeRequests.Store(0)
 	m.FullRequests.Store(0)
 	m.FailedRequests.Store(0)
+	m.PeakRequests.Store(0)
 	m.requestCountMu.Lock()
 	m.internalReqNum = 0
 	m.requestCountMu.Unlock()
+	m.connectionsMu.Lock()
+	m.connections = nil
+	m.connectionsMu.Unlock()
 }
 
 // Stats returns a summary of server statistics.
@@ -208,6 +224,8 @@ func (m *MockServer) Stats() MockServerStats {
 		RangeRequests:  m.RangeRequests.Load(),
 		FullRequests:   m.FullRequests.Load(),
 		FailedRequests: m.FailedRequests.Load(),
+		PeakRequests:   m.PeakRequests.Load(),
+		TCPConnections: m.connectionCount(),
 	}
 }
 
@@ -218,16 +236,42 @@ type MockServerStats struct {
 	RangeRequests  int64
 	FullRequests   int64
 	FailedRequests int64
+	PeakRequests   int64
+	TCPConnections int64
+}
+
+func (m *MockServer) trackRequest(r *http.Request) {
+	active := m.ActiveRequests.Add(1)
+	for peak := m.PeakRequests.Load(); active > peak && !m.PeakRequests.CompareAndSwap(peak, active); peak = m.PeakRequests.Load() {
+	}
+	m.connectionsMu.Lock()
+	if m.connections == nil {
+		m.connections = make(map[string]struct{})
+	}
+	m.connections[r.RemoteAddr] = struct{}{}
+	m.connectionsMu.Unlock()
+}
+
+func (m *MockServer) connectionCount() int64 {
+	m.connectionsMu.Lock()
+	defer m.connectionsMu.Unlock()
+	return int64(len(m.connections))
 }
 
 func (m *MockServer) handleRequest(w http.ResponseWriter, r *http.Request) {
+	if m.RequestStarted != nil {
+		select {
+		case m.RequestStarted <- struct{}{}:
+		default:
+		}
+	}
 	if m.CustomHandler != nil {
 		m.CustomHandler(w, r)
 		return
 	}
 
 	m.RequestCount.Add(1)
-	m.ActiveRequests.Add(1)
+	m.trackRequest(r)
 	defer m.ActiveRequests.Add(-1)
 
 	// Track request number for fail-on-nth logic
@@ -296,14 +340,17 @@ func (m *MockServer) handleRequest(w http.ResponseWriter, r *http.Request) {
 	bytesWritten := int64(0)
 
 	// Write in chunks to support byte latency and fail-after-bytes
-	chunkSize := int64(32 * types.KB) // 32KB chunks
+	chunkSize := int64(32 * utils.KiB) // 32KB chunks
 	for bytesWritten < length {
 		// Check if we should fail (per-request byte count, not global)
 		// This allows retry logic to work - new requests can succeed
 		if m.FailAfterBytes > 0 && bytesWritten >= m.FailAfterBytes {
 			m.FailedRequests.Add(1)
-			// Abruptly close connection by not writing more
-			panic(http.ErrAbortHandler)
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			time.Sleep(10 * time.Millisecond)
+			return
 		}
 
 		remaining := length - bytesWritten
@@ -415,7 +462,7 @@ func NewStreamingMockServer(fileSize int64, opts ...MockServerOption) *Streaming
 	}
 
 	// Only allocate a small buffer for streaming
-	m.data = make([]byte, 64*types.KB) // 64KB buffer
+	m.data = make([]byte, 64*utils.KiB) // 64KB buffer
 	if m.RandomData {
 		_, _ = rand.Read(m.data)
 	}
@@ -440,7 +487,7 @@ func NewStreamingMockServerT(t *testing.T, fileSize int64, opts ...MockServerOpt
 		opt(m)
 	}
 
-	m.data = make([]byte, 64*types.KB)
+	m.data = make([]byte, 64*utils.KiB)
 	if m.RandomData {
 		_, _ = rand.Read(m.data)
 	}
@@ -452,8 +499,14 @@ func NewStreamingMockServerT(t *testing.T, fileSize int64, opts ...MockServerOpt
 
 func (s *StreamingMockServer) handleStreamingRequest(w http.ResponseWriter, r *http.Request) {
 	s.RequestCount.Add(1)
-	s.ActiveRequests.Add(1)
+	s.trackRequest(r)
 	defer s.ActiveRequests.Add(-1)
+	if s.RequestStarted != nil {
+		select {
+		case s.RequestStarted <- struct{}{}:
+		default:
+		}
+	}
 
 	// Track request number for fail-on-nth logic
 	s.requestCountMu.Lock()

@@ -1,10 +1,13 @@
 package tui
 
 import (
+	"context"
 	"os/exec"
 	"runtime"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/msh2050/fluxget/internal/selfupdate"
 	"github.com/msh2050/fluxget/internal/version"
 )
 
@@ -13,6 +16,18 @@ func checkForUpdateCmd(currentVersion string) tea.Cmd {
 	return func() tea.Msg {
 		info, _ := version.CheckForUpdate(currentVersion)
 		return UpdateCheckResultMsg{Info: info}
+	}
+}
+
+func selfUpdateCmd(currentVersion string) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+
+		info, err := selfupdate.Update(ctx, selfupdate.Options{
+			CurrentVersion: currentVersion,
+		})
+		return selfUpdateResultMsg{Info: info, err: err}
 	}
 }
 

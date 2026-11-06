@@ -5,6 +5,7 @@
 
 import { createSignal } from 'solid-js';
 import { MB } from '../lib/utils';
+import type { ServerProfile } from '../../../lib/storage';
 import type {
   DownloadStatus,
   HistoryEntry,
@@ -44,9 +45,10 @@ export function reconcileActiveDownloads(nextDownloads: DownloadStatus[]): void 
   setActiveDownloads((prevDownloads) => {
     const prevById = new Map(prevDownloads.map((download) => [download.id, download]));
     const merged = nextDownloads.map((download) => {
+      const normalized = { ...download, speed: download.speed / MB };
       const prev = prevById.get(download.id);
-      if (!prev) return download;
-      const next = { ...prev, ...download };
+      if (!prev) return normalized;
+      const next = { ...prev, ...normalized };
       return sameDownloadStatus(prev, next) ? prev : next;
     });
 
@@ -86,12 +88,24 @@ const [interceptEnabled, setInterceptEnabled] = createSignal(true);
 export { interceptEnabled, setInterceptEnabled };
 const [notificationsEnabled, setNotificationsEnabled] = createSignal(true);
 export { notificationsEnabled, setNotificationsEnabled };
+const [fallbackToBrowser, setFallbackToBrowser] = createSignal(true);
+export { fallbackToBrowser, setFallbackToBrowser };
+const [minFileSize, setMinFileSize] = createSignal(10);
+export { minFileSize, setMinFileSize };
+const [warnOnDuplicate, setWarnOnDuplicate] = createSignal(true);
+export { warnOnDuplicate, setWarnOnDuplicate };
 
-// Surge server URL for API requests
+// Surge server URL for API requests (resolved from the active server profile)
 const [serverUrl, setServerUrl] = createSignal('');
 export { serverUrl, setServerUrl };
 const [serverUrlLocked, setServerUrlLocked] = createSignal(false);
 export { serverUrlLocked, setServerUrlLocked };
+
+// Named server profiles and the active selection
+const [serverProfiles, setServerProfiles] = createSignal<ServerProfile[]>([]);
+export { serverProfiles, setServerProfiles };
+const [activeProfileId, setActiveProfileId] = createSignal('');
+export { activeProfileId, setActiveProfileId };
 
 const [authToken, setAuthToken] = createSignal('');
 export { authToken, setAuthToken };

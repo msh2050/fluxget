@@ -4,8 +4,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/msh2050/fluxget/internal/engine/state"
-	"github.com/msh2050/fluxget/internal/engine/types"
+	"github.com/msh2050/fluxget/internal/store"
+	"github.com/msh2050/fluxget/internal/types"
 	"github.com/msh2050/fluxget/internal/utils"
 )
 
@@ -19,24 +19,22 @@ func init() {
 	SuppressNotificationsInTests()
 }
 
-// SetupStateDB configures a fresh temp SQLite DB for tests that exercise state persistence.
+// SetupStateDB configures a fresh temp backend for tests that exercise state persistence.
 func SetupStateDB(t *testing.T) string {
 	t.Helper()
 
 	tempDir := t.TempDir()
-	state.CloseDB()
-	state.Configure(filepath.Join(tempDir, "surge.db"))
-	if _, err := state.GetDB(); err != nil {
-		t.Fatalf("failed to initialize db: %v", err)
-	}
-	t.Cleanup(state.CloseDB)
+	store.CloseDB()
+	store.Configure(filepath.Join(tempDir, "surge.db"))
+
+	t.Cleanup(store.CloseDB)
 	return tempDir
 }
 
-// SeedMasterList inserts a DownloadEntry into the master list for test setups.
-func SeedMasterList(t *testing.T, entry types.DownloadEntry) {
+// SeedMasterList inserts a DownloadRecord into the master list for test setups.
+func SeedMasterList(t *testing.T, entry types.DownloadRecord) {
 	t.Helper()
-	if err := state.AddToMasterList(entry); err != nil {
+	if err := store.AddToMasterList(entry); err != nil {
 		t.Fatalf("SeedMasterList failed: %v", err)
 	}
 }

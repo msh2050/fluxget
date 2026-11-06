@@ -1,8 +1,6 @@
 package tui
 
 import (
-	"fmt"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -19,6 +17,14 @@ import (
 type extensionTokenFlashFadeMsg struct{}
 
 func (m RootModel) updateSettings(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	if !m.SettingsIsEditing && (m.settingsSearchActive || msg.String() == "/" || key.Matches(msg, m.keys.Dashboard.Search)) {
+		model, cmd := m.updateSettingsSearch(msg)
+		next := model.(RootModel)
+		next.SettingsSelectedRow = 0
+		next.SettingsFocusedPane = 1
+		next.normalizeSettingsSelection()
+		return next, cmd
+	}
 	if m.SettingsBaseline == nil {
 		m.snapshotSettings()
 	}
@@ -30,8 +36,90 @@ func (m RootModel) updateSettings(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	if m.SettingsReadOnly && (m.SettingsIsEditing || key.Matches(msg, m.keys.Settings.Edit, m.keys.Settings.Reset, m.keys.Settings.ResetAll, m.keys.Settings.DeleteCategory, m.keys.Settings.Browse)) {
+		m.settingsError = "This daemon does not support editing settings"
+		return m, nil
+	}
+
 	// Handle editing mode first
 	if m.SettingsIsEditing {
+		typ := m.getCurrentSettingType()
+		if typ == config.TypeCustomCategory || typ == config.TypeCustomCategoryAdd {
+			if key.Matches(msg, m.keys.SettingsEditor.Cancel) {
+				m.SettingsIsEditing = false
+				m.catMgrInputs[m.catMgrEditField].Blur()
+				return m, nil
+			}
+			if key.Matches(msg, m.keys.SettingsEditor.Confirm) {
+				// Validate and save
+				cat := config.Category{
+					Name:        strings.TrimSpace(m.catMgrInputs[0].Value()),
+					Description: strings.TrimSpace(m.catMgrInputs[1].Value()),
+					Pattern:     strings.TrimSpace(m.catMgrInputs[2].Value()),
+					Path:        strings.TrimSpace(m.catMgrInputs[3].Value()),
+				}
+				if err := cat.Validate(); err != nil {
+					m.settingsError = err.Error()
+					return m, nil
+				}
+
+				if m.catMgrIsNew {
+					m.Settings.Categories.Categories = append(m.Settings.Categories.Categories, cat)
+					m.SettingsSelectedRow = m.getSettingsCount() - 2 // Select newly added category
+				} else {
+					settingKey := m.getCurrentSettingKey()
+					idx, _ := strconv.Atoi(strings.TrimPrefix(settingKey, "category_"))
+					if idx >= 0 && idx < len(m.Settings.Categories.Categories) {
+						m.Settings.Categories.Categories[idx] = cat
+					} else {
+						return m, nil
+					}
+				}
+
+				m.SettingsIsEditing = false
+				m.settingsError = ""
+				m.catMgrInputs[m.catMgrEditField].Blur()
+				return m, nil
+			}
+
+			// Navigation between fields
+			s := msg.String()
+
+			if m.catMgrEditField == 3 && key.Matches(msg, m.keys.Settings.Browse) {
+				if m.IsRemote {
+					m.settingsError = "Enter the category path on the server"
+					return m, nil
+				}
+				originalPath := strings.TrimSpace(m.catMgrInputs[3].Value())
+				browseDir := originalPath
+				if browseDir == "" {
+					browseDir = m.PWD
+				}
+				return m, m.openDirectoryPicker(FilePickerOriginCategory, originalPath, browseDir, false, true)
+			}
+
+			if s == "tab" || s == "down" {
+				m.catMgrInputs[m.catMgrEditField].Blur()
+				m.catMgrEditField = (m.catMgrEditField + 1) % 4
+				m.catMgrInputs[m.catMgrEditField].Focus()
+				return m, nil
+			}
+			if s == "shift+tab" || s == "up" {
+				m.catMgrInputs[m.catMgrEditField].Blur()
+				m.catMgrEditField = (m.catMgrEditField - 1 + 4) % 4
+				m.catMgrInputs[m.catMgrEditField].Focus()
+				return m, nil
+			}
+
+			// Pass to active input
+			var cmd tea.Cmd
+			m.catMgrInputs[m.catMgrEditField], cmd = m.catMgrInputs[m.catMgrEditField].Update(msg)
+			if m.settingsError != "" {
+				m.settingsError = ""
+			}
+			return m, cmd
+		}
+
 		if key.Matches(msg, m.keys.SettingsEditor.Cancel) {
 			// Cancel editing
 			m.SettingsIsEditing = false
@@ -39,17 +127,16 @@ func (m RootModel) updateSettings(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if key.Matches(msg, m.keys.SettingsEditor.Confirm) {
-			currentCategory := categories[m.SettingsActiveTab]
+			currentCategory := m.currentSettingsCategory()
 			settingKey := m.getCurrentSettingKey()
 			val := m.SettingsInput.Value()
 
-			if err := m.validateSetting(settingKey, val); err != nil {
+			if err := m.setSettingValue(currentCategory, settingKey, val); err != nil {
 				m.settingsError = err.Error()
 				utils.Debug("Settings Validation Error: %s = %s (%v)", settingKey, val, err)
 				return m, nil
 			}
 
-			_ = m.setSettingValue(currentCategory, settingKey, val)
 			m.SettingsIsEditing = false
 			m.settingsError = ""
 			m.SettingsInput.Blur()
@@ -70,8 +157,14 @@ func (m RootModel) updateSettings(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if key.Matches(msg, m.keys.Settings.Close) {
 		requiresRestart := m.checkRestartRequirement()
 		// Save settings and exit
-		_ = m.persistSettings()
-		if requiresRestart {
+		if err := m.persistSettings(); err != nil {
+			m.settingsError = "Failed to save settings: " + err.Error()
+			return m, nil
+		}
+		m.clearSettingsSearch()
+		if requiresRestart && m.IsRemote {
+			m.addLogEntry("Settings saved. Restart Surge on the server to apply restart-required changes.")
+		} else if requiresRestart {
 			m.state = RestartConfirmState
 			m.quitConfirmFocused = 0
 			return m, nil
@@ -80,12 +173,32 @@ func (m RootModel) updateSettings(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.SettingsBaseline = nil
 		return m, nil
 	}
+	if key.Matches(msg, m.keys.Settings.ReportBug) {
+		// Save settings and exit before going to bug report
+		if err := m.persistSettings(); err != nil {
+			m.settingsError = "Failed to save settings: " + err.Error()
+			return m, nil
+		}
+		m.SettingsBaseline = nil
+		m.clearSettingsSearch()
+
+		m.quitConfirmFocused = 0
+		m.bugReportIncludeSystemInfo = true
+		m.bugReportIncludeLatestLog = true
+		m.state = BugReportTargetState
+		return m, nil
+	}
+	if key.Matches(msg, m.keys.Settings.ResetAll) {
+		return m.requestSettingsConfirmation(settingsResetAll), nil
+	}
 	tabBindings := []key.Binding{
 		m.keys.Settings.Tab1,
 		m.keys.Settings.Tab2,
 		m.keys.Settings.Tab3,
 		m.keys.Settings.Tab4,
 		m.keys.Settings.Tab5,
+		m.keys.Settings.Tab6,
+		m.keys.Settings.Tab7,
 	}
 	for i, binding := range tabBindings {
 		if key.Matches(msg, binding) {
@@ -98,7 +211,12 @@ func (m RootModel) updateSettings(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	// Tab Navigation
+	// Category rows have their own controls. Numbered tab shortcuts remain
+	// available while left/right (and their configured aliases) are inactive.
+	if m.categoryListFocused() && key.Matches(msg, m.keys.Settings.NextTab, m.keys.Settings.PrevTab) {
+		return m, nil
+	}
+	// Tab Navigation (NextTab/PrevTab)
 	if key.Matches(msg, m.keys.Settings.NextTab) {
 		m.SettingsActiveTab = (m.SettingsActiveTab + 1) % categoryCount
 		m.SettingsSelectedRow = 0
@@ -112,8 +230,68 @@ func (m RootModel) updateSettings(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// Category order determines matching priority; move the selected rule with it.
+	if m.SettingsFocusedPane == 1 && m.settingsSearchQuery == "" && m.getCurrentSettingType() == config.TypeCustomCategory && key.Matches(msg, m.keys.Settings.MoveCategoryUp, m.keys.Settings.MoveCategoryDown) {
+		if m.SettingsReadOnly {
+			m.settingsError = "This daemon does not support editing settings"
+			return m, nil
+		}
+		idx, err := strconv.Atoi(strings.TrimPrefix(m.getCurrentSettingKey(), "category_"))
+		delta := 1
+		if key.Matches(msg, m.keys.Settings.MoveCategoryUp) {
+			delta = -1
+		}
+		next := idx + delta
+		cats := m.Settings.Categories.Categories
+		if err == nil && idx >= 0 && idx < len(cats) && next >= 0 && next < len(cats) {
+			cats[idx], cats[next] = cats[next], cats[idx]
+			m.SettingsSelectedRow += delta
+			m.settingsError = ""
+		}
+		return m, nil
+	}
+
+	// Up/Down navigation & pane switching between tabs and lists
+	if m.SettingsFocusedPane == 0 { // Tabs focused
+		if key.Matches(msg, m.keys.Settings.Down) {
+			m.SettingsFocusedPane = 1 // Focus settings list
+			m.SettingsSelectedRow = 0
+			m.settingsError = ""
+			return m, nil
+		}
+	} else { // List focused
+		if key.Matches(msg, m.keys.Settings.Up) {
+			if m.SettingsSelectedRow > 0 {
+				m.SettingsSelectedRow--
+				m.settingsError = ""
+			} else {
+				m.SettingsSelectedRow = m.getSettingsCount() - 1
+				m.settingsError = ""
+			}
+			return m, nil
+		}
+		if key.Matches(msg, m.keys.Settings.Down) {
+			maxRow := m.getSettingsCount() - 1
+			if m.SettingsSelectedRow < maxRow {
+				m.SettingsSelectedRow++
+				m.settingsError = ""
+			} else {
+				m.SettingsSelectedRow = 0
+				m.settingsError = ""
+			}
+			return m, nil
+		}
+	}
+
 	// Open file browser for default_download_dir or theme_path
 	if key.Matches(msg, m.keys.Settings.Browse) {
+		if m.IsRemote {
+			m.settingsError = "Enter the directory path on the server; browsing uses the local filesystem"
+			return m, nil
+		}
+		if m.SettingsFocusedPane == 0 {
+			return m, nil // Can't browse when tabs are focused
+		}
 		settingKey := m.getCurrentSettingKey()
 		switch settingKey {
 		case "default_download_dir":
@@ -144,36 +322,19 @@ func (m RootModel) updateSettings(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// Back tab - not currently bound, ignoring or could use Shift+Tab manual check if really needed
-	// For now, we rely on Tab (Browse) to cycle.
-
-	// Up/Down navigation
-	if key.Matches(msg, m.keys.Settings.Up) {
-		if m.SettingsSelectedRow > 0 {
-			m.SettingsSelectedRow--
-			m.settingsError = ""
-		}
-		return m, nil
-	}
-	if key.Matches(msg, m.keys.Settings.Down) {
-		maxRow := m.getSettingsCount() - 1
-		if m.SettingsSelectedRow < maxRow {
-			m.SettingsSelectedRow++
-			m.settingsError = ""
-		}
-		return m, nil
-	}
-
 	// Edit / Toggle
 	if key.Matches(msg, m.keys.Settings.Edit) {
-		// Categories tab → open Category Manager
-		if m.SettingsActiveTab < len(categories) && categories[m.SettingsActiveTab] == "Categories" {
-			m.catMgrCursor = 0
-			m.state = CategoryManagerState
+		if m.SettingsFocusedPane == 0 {
+			m.SettingsFocusedPane = 1
+			m.SettingsSelectedRow = 0
+			m.settingsError = ""
 			return m, nil
 		}
 
 		settingKey := m.getCurrentSettingKey()
+		if settingKey == "" {
+			return m, nil
+		}
 		// Prevent editing ignored settings
 		if settingKey == "max_global_connections" {
 			return m, nil
@@ -204,7 +365,7 @@ func (m RootModel) updateSettings(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 
 		if typ == "link" {
-			currentCategory := categories[m.SettingsActiveTab]
+			currentCategory := m.currentSettingsCategory()
 			values := m.getSettingsValues(currentCategory)
 			if url, ok := values[settingKey].(string); ok && url != "" {
 				_ = utils.OpenBrowser(url)
@@ -212,117 +373,58 @@ func (m RootModel) updateSettings(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-		currentCategory := categories[m.SettingsActiveTab]
-		if typ == "bool" {
+		currentCategory := m.currentSettingsCategory()
+		switch typ {
+		case "bool":
 			if err := m.setSettingValue(currentCategory, settingKey, ""); err != nil {
 				m.settingsError = err.Error()
 			}
-		} else {
+		case config.TypeCustomCategory, config.TypeCustomCategoryAdd:
+			m.SettingsIsEditing = true
+			m.catMgrEditField = 0 // start at Name
+
+			if typ == config.TypeCustomCategoryAdd {
+				m.catMgrIsNew = true
+				m.catMgrInputs[0].SetValue("")
+				m.catMgrInputs[1].SetValue("")
+				m.catMgrInputs[2].SetValue("")
+				m.catMgrInputs[3].SetValue("")
+			} else {
+				m.catMgrIsNew = false
+				if strings.HasPrefix(settingKey, "category_") {
+					idx, _ := strconv.Atoi(strings.TrimPrefix(settingKey, "category_"))
+					if idx >= 0 && idx < len(m.Settings.Categories.Categories) {
+						cat := m.Settings.Categories.Categories[idx]
+						m.catMgrInputs[0].SetValue(cat.Name)
+						m.catMgrInputs[1].SetValue(cat.Description)
+						m.catMgrInputs[2].SetValue(cat.Pattern)
+						m.catMgrInputs[3].SetValue(cat.Path)
+					}
+				}
+			}
+			m.catMgrInputs[0].Focus()
+		default:
 			// Enter edit mode
 			m.SettingsIsEditing = true
 			// Pre-fill with current value (without units)
 			values := m.getSettingsValues(currentCategory)
-			m.SettingsInput.SetValue(formatSettingValueForEdit(values[settingKey], typ, settingKey, false))
+			unit := config.UnitNone
+			if meta := m.getCurrentSettingMeta(); meta != nil {
+				unit = meta.Unit
+			}
+			m.SettingsInput.SetValue(formatSettingValueForEdit(values[settingKey], typ, unit, settingKey, false))
 			m.updateSettingsInputWidthForViewport()
 			m.SettingsInput.Focus()
 		}
 		return m, nil
 	}
 
-	// Reset
-	if key.Matches(msg, m.keys.Settings.Reset) {
-		settingKey := m.getCurrentSettingKey()
-		if settingKey == "max_global_connections" {
-			return m, nil
-		}
-
-		// Categories tab → 'Manage Categories' selected → confirm full reset
-		if m.SettingsActiveTab < len(categories) && categories[m.SettingsActiveTab] == "Categories" && settingKey == "category_enabled" {
-			m.state = CategoryResetConfirmState
-			m.quitConfirmFocused = 0
-			return m, nil
-		}
-
-		defaults := config.DefaultSettings()
-		currentCategory := categories[m.SettingsActiveTab]
-		if err := m.resetSettingToDefault(currentCategory, settingKey, defaults); err != nil {
-			m.settingsError = err.Error()
-			return m, nil
-		}
-		if settingKey == "theme" || settingKey == "theme_path" {
-			m.ApplyTheme(config.Resolve[int](m.Settings.General.Theme), config.Resolve[string](m.Settings.General.ThemePath))
-		}
-		return m, nil
+	if m.SettingsFocusedPane == 1 && key.Matches(msg, m.keys.Settings.DeleteCategory) {
+		return m.requestSettingsConfirmation(settingsDeleteCategory), nil
+	}
+	if m.SettingsFocusedPane == 1 && key.Matches(msg, m.keys.Settings.Reset) {
+		return m.requestSettingsConfirmation(settingsResetOne), nil
 	}
 
 	return m, nil
-}
-
-func (m *RootModel) validateSetting(key, value string) error {
-	trimmed := strings.TrimSpace(value)
-	switch key {
-	case "max_connections_per_host":
-		v, err := strconv.Atoi(trimmed)
-		if err != nil || v < 1 || v > 64 {
-			return fmt.Errorf("must be between 1 and 64")
-		}
-	case "max_concurrent_downloads", "max_concurrent_probes":
-		v, err := strconv.Atoi(trimmed)
-		if err != nil || v < 1 || v > 10 {
-			return fmt.Errorf("must be between 1 and 10")
-		}
-	case "min_chunk_size":
-		v, err := strconv.ParseFloat(trimmed, 64)
-		if err != nil || v < 0.1 {
-			return fmt.Errorf("must be at least 0.1 MB")
-		}
-	case "worker_buffer_size":
-		v, err := strconv.Atoi(trimmed)
-		if err != nil || v < 1 {
-			return fmt.Errorf("must be at least 1 KB")
-		}
-	case "dial_hedge_count":
-		v, err := strconv.Atoi(trimmed)
-		if err != nil || v < 0 || v > 16 {
-			return fmt.Errorf("must be between 0 and 16")
-		}
-	case "max_task_retries":
-		v, err := strconv.Atoi(trimmed)
-		if err != nil || v < 0 || v > 10 {
-			return fmt.Errorf("must be between 0 and 10")
-		}
-	case "slow_worker_threshold", "speed_ema_alpha":
-		v, err := strconv.ParseFloat(trimmed, 64)
-		if err != nil || v < 0.0 || v > 1.0 {
-			return fmt.Errorf("must be between 0.0 and 1.0")
-		}
-	case "slow_worker_grace_period", "stall_timeout":
-		if v, err := strconv.ParseFloat(trimmed, 64); err == nil {
-			if v < 0 {
-				return fmt.Errorf("must be non-negative")
-			}
-			return nil
-		}
-		if d, err := time.ParseDuration(trimmed); err != nil {
-			return fmt.Errorf("invalid duration (e.g. 5s or 5)")
-		} else if d < 0 {
-			return fmt.Errorf("must be non-negative")
-		}
-	case "log_retention_count":
-		v, err := strconv.Atoi(trimmed)
-		if err != nil || v < 1 || v > 100 {
-			return fmt.Errorf("must be between 1 and 100")
-		}
-	case "proxy_url":
-		if trimmed == "" {
-			return nil
-		}
-		u, err := url.Parse(trimmed)
-		if err != nil || u.Scheme == "" || u.Host == "" {
-			return fmt.Errorf("invalid URL (e.g. http://127.0.0.1:1080)")
-		}
-	case "custom_dns":
-		return config.ValidateDNSList(trimmed)
-	}
-	return nil
 }

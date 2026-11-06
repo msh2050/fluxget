@@ -1,5 +1,11 @@
 [colors]
 name = "Surge"
+graph = [
+    '#ab47bc', # Bottom
+    '#ba68c8',
+    '#ce93d8',
+    '#e1bee7', # Top
+]
 
 [colors.primary]
 background = '#282a36'
@@ -27,13 +33,16 @@ cyan =    '#8be9fd'
 white =   '#f8f8f2'
 
 # Standard Light
+[colors.light]
+graph = ['#5b259d', '#9934b5', '#b658c7', '#d99ce3']
+
 [colors.light.primary]
 background = "#ffffff"
 foreground = "#1a1a1a"
 accent = "#d10074"
 
 [colors.light.normal]
-black = "#d0d0d0"
+black = "#c6c6c6"
 red = "#d32f2f"
 green = "#2e7d32"
 yellow = "#f57c00"

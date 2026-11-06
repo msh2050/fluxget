@@ -1,0 +1,415 @@
+package scheduler
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/msh2050/fluxget/internal/probe"
+	"github.com/msh2050/fluxget/internal/progress"
+	"github.com/msh2050/fluxget/internal/store"
+	"github.com/msh2050/fluxget/internal/strategy/concurrent"
+	"github.com/msh2050/fluxget/internal/strategy/single"
+	"github.com/msh2050/fluxget/internal/types"
+	"github.com/msh2050/fluxget/internal/utils"
+)
+
+const terminalSendTimeout = 3 * time.Second
+
+// safeSendProgress sends msg on ch, recovering from panics caused by sending
+// on a closed channel (which can happen during shutdown).
+func safeSendProgress(ch chan<- types.DownloadEvent, msg types.DownloadEvent, doneCh <-chan struct{}) {
+	defer func() { _ = recover() }()
+	select {
+	case ch <- msg:
+		return
+	default:
+	}
+	timer := time.NewTimer(terminalSendTimeout)
+	defer timer.Stop()
+	select {
+	case ch <- msg:
+	case <-doneCh:
+	case <-timer.C:
+		utils.Debug("safeSendProgress: timed out delivering event %v", msg.Type)
+	}
+}
+
+// uniqueFilePath returns a unique file path by appending (1), (2), etc. if the file exists
+func uniqueFilePath(path string) string {
+	// Check if file exists (both final and incomplete)
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		if _, err := os.Stat(path + types.IncompleteSuffix); os.IsNotExist(err) {
+			return path // Neither exists, use original
+		}
+	}
+
+	// File exists, generate unique name
+	dir := filepath.Dir(path)
+	ext := filepath.Ext(path)
+	name := strings.TrimSuffix(filepath.Base(path), ext)
+
+	// Check if name already has a counter like "file(1)"
+	base := name
+	counter := 1
+
+	// Clean name to ensure parsing works even with trailing spaces
+	cleanName := strings.TrimSpace(name)
+	if len(cleanName) > 3 && cleanName[len(cleanName)-1] == ')' {
+		if openParen := strings.LastIndexByte(cleanName, '('); openParen != -1 {
+			// Try to parse number between parens
+			numStr := cleanName[openParen+1 : len(cleanName)-1]
+			if num, err := strconv.Atoi(numStr); err == nil && num > 0 {
+				base = cleanName[:openParen]
+				// Parsing "file (1)" -> "file " preserves original whitespace.
+				counter = num + 1
+			}
+		}
+	}
+
+	for i := 0; i < 100; i++ { // Try next 100 numbers
+		candidate := filepath.Join(dir, fmt.Sprintf("%s(%d)%s", base, counter+i, ext))
+		if _, err := os.Stat(candidate); os.IsNotExist(err) {
+			if _, err := os.Stat(candidate + types.IncompleteSuffix); os.IsNotExist(err) {
+				return candidate
+			}
+		}
+	}
+
+	// Fallback: if all 100 numbered candidates are taken, return an empty string so
+	// callers can detect the failure rather than silently receiving a conflicting path.
+	return ""
+}
+
+// RunDownload is the main entry point for downloads executed by the Engine pool
+func RunDownload(ctx context.Context, cfg *types.DownloadRecord) error {
+	start := time.Now()
+	if cfg.Runtime == nil {
+		cfg.Runtime = types.DefaultRuntimeConfig()
+	}
+	// Engine expects cfg.OutputPath and cfg.Filename to be fully resolved by the processing layer
+	destPath := cfg.OutputPath
+	finalFilename := cfg.Filename
+	finalDestPath := filepath.Join(destPath, finalFilename)
+
+	// Local mirrors slice to avoid modifying config (race condition)
+	mirrors := append([]string(nil), cfg.Mirrors...)
+
+	// Check if this is a resume (explicitly marked by TUI)
+	var savedState *types.DownloadRecord
+
+	if cfg.IsResume && cfg.DestPath != "" {
+		savedState = cfg
+
+		// Restore mirrors from state if found
+		if savedState != nil && len(savedState.Mirrors) > 0 {
+			// Create map of existing mirrors to avoid duplicates
+			existing := make(map[string]bool)
+			for _, m := range mirrors {
+				existing[m] = true
+			}
+
+			// Add restored mirrors
+			for _, m := range savedState.Mirrors {
+				if !existing[m] {
+					mirrors = append(mirrors, m)
+					existing[m] = true
+				}
+			}
+			utils.Debug("Restored %d mirrors from state", len(savedState.Mirrors))
+		}
+	}
+	isResume := cfg.IsResume && savedState != nil && savedState.DestPath != ""
+
+	if isResume {
+		// Resume: use saved destination path directly (don't generate new unique name)
+		finalDestPath = savedState.DestPath
+		finalFilename = filepath.Base(finalDestPath)
+		utils.Debug("Resuming download, using saved destPath: %s", finalDestPath)
+	}
+	// A cleanup failure or a crash can leave both published and working names
+	// pointing to one inode. Never open that working name for another transfer.
+	published, err := utils.SameFilePaths(finalDestPath, finalDestPath+types.IncompleteSuffix)
+	if err != nil {
+		return err
+	}
+	if published {
+		return types.ErrCompleted
+	}
+	utils.Debug("Destination path: %s", finalDestPath)
+
+	var progState *progress.DownloadProgress
+	if cfg.ProgressState != nil {
+		progState = progress.CfgProgress(cfg)
+		progState.SetFilename(finalFilename)
+		progState.SetDestPath(finalDestPath)
+	}
+
+	currentRateLimit := func() (int64, bool) {
+		if progState != nil {
+			return progState.GetRateLimit()
+		}
+		return cfg.RateLimit, cfg.RateLimitSet
+	}
+
+	// Send download started message
+	if cfg.ProgressCh != nil {
+		rateLimit, rateLimitSet := currentRateLimit()
+		safeSendProgress(cfg.ProgressCh, types.DownloadEvent{
+			Type: types.EventStarted, Artifact: cfg.Artifact,
+			DownloadID:   cfg.ID,
+			URL:          cfg.URL,
+			Filename:     finalFilename,
+			Total:        cfg.TotalSize, // Relies on TotalSize from Config
+			DestPath:     finalDestPath,
+			State:        cfg,
+			RateLimit:    rateLimit,
+			RateLimitSet: rateLimitSet,
+			Workers:      cfg.Runtime.Workers,
+			MinChunkSize: cfg.Runtime.MinChunkSize,
+		}, ctx.Done())
+	}
+
+	// Update shared state if we have a valid size
+	if progState != nil && cfg.TotalSize > 0 {
+		progState.SetTotalSize(cfg.TotalSize)
+	}
+
+	effectiveTotalSize := cfg.TotalSize
+	if progState != nil && effectiveTotalSize <= 0 {
+		_, stateTotal, _, _, _, _ := progState.GetProgress()
+		if stateTotal > 0 {
+			effectiveTotalSize = stateTotal
+		}
+	}
+
+	// Choose downloader based on probe results. Range-capable transfers stay in
+	// the range pipeline even with one worker so fresh downloads remain resumable.
+	var downloadErr error
+	useConcurrent := cfg.SupportsRange
+
+	if useConcurrent {
+		utils.Debug("Using concurrent downloader")
+
+		// We probe all candidate mirrors (mirrors) to filter out invalid ones
+		var activeMirrors []string
+		if len(mirrors) > 0 {
+			utils.Debug("Probing %d mirrors", len(mirrors))
+			// Always check primary + mirrors to ensure we are using the best set
+			allToCheck := append([]string{cfg.URL}, mirrors...)
+			runCfg := &types.RuntimeConfig{
+				ProxyURL:  cfg.Runtime.ProxyURL,
+				CustomDNS: cfg.Runtime.CustomDNS,
+			}
+			valid, errs := probe.ProbeMirrorsWithProxy(ctx, allToCheck, runCfg)
+
+			// Log errors
+			for u, e := range errs {
+				utils.Debug("Mirror probe failed for %s: %v", u, e)
+			}
+
+			// Filter valid mirrors (excluding primary as it is handled separately)
+			for _, v := range valid {
+				if v != cfg.URL {
+					activeMirrors = append(activeMirrors, v)
+				}
+			}
+			utils.Debug("Found %d active mirrors from %d candidates", len(activeMirrors), len(mirrors))
+		}
+
+		d := concurrent.NewConcurrentDownloader(cfg.ID, cfg.ProgressCh, progState, cfg.Runtime)
+		d.ImportThrottleState(cfg)
+		d.Headers = cfg.Headers // Forward custom headers from browser extension
+		d.Limiter = cfg.Limiter
+		d.RateLimitBps = cfg.RateLimit
+		d.RateLimitSet = cfg.RateLimitSet
+		utils.Debug("Calling Download with mirrors: %v", mirrors)
+		// Pass effectiveTotalSize to avoid unnecessary bootstrap if state already knows the size
+		downloadErr = d.Download(ctx, cfg.URL, mirrors, activeMirrors, finalDestPath, effectiveTotalSize)
+		d.ExportThrottleState(cfg)
+		if d.TotalSize > 0 {
+			effectiveTotalSize = d.TotalSize
+		}
+
+		var downloaded int64
+		if progState != nil {
+			downloaded = progState.Bytes.Downloaded.Load()
+		}
+
+		// Only confirmed lack of range support warrants restarting from byte zero.
+		if shouldFallbackToSingle(downloadErr, downloaded) {
+			utils.Debug("Concurrent download failed: %v - falling back to single-threaded", downloadErr)
+			useConcurrent = false // Trigger sequential block below
+			cfg.SupportsRange = false
+
+			// Reset progress state cleanly for single-stream restart from byte 0
+			if progState != nil {
+				progState.SessionReset()
+			}
+
+			// Truncate the working file to zero to prevent stale tail bytes
+			// from the failed concurrent session.
+			surgePath := finalDestPath + types.IncompleteSuffix
+			if err := os.Truncate(surgePath, 0); err != nil {
+				return fmt.Errorf("reset working file for range fallback: %w", err)
+			}
+			// The range checkpoint describes bytes discarded by the restart.
+			// Retain metadata and headers, but invalidate its offsets and bitmap.
+			if checkpoint, err := store.LoadState(cfg.URL, finalDestPath); err == nil && checkpoint != nil {
+				checkpoint.Tasks = nil
+				checkpoint.ChunkBitmap = nil
+				checkpoint.ActualChunkSize = 0
+				checkpoint.Downloaded = 0
+				checkpoint.Elapsed = 0
+				checkpoint.FileHash = ""
+				if err := store.SaveStateWithOptions(cfg.URL, finalDestPath, checkpoint, store.SaveStateOptions{SkipFileHash: true}); err != nil {
+					return fmt.Errorf("invalidate range checkpoint for fallback: %w", err)
+				}
+			}
+			cfg.IsResume = false
+			cfg.Tasks = nil
+			cfg.ChunkBitmap = nil
+			cfg.Downloaded = 0
+			if progState != nil {
+				progState.TakePendingResumeState()
+			}
+		}
+	}
+
+	if !useConcurrent {
+		// Fallback to single-threaded downloader
+		utils.Debug("Using single-threaded downloader")
+		d := single.NewSingleDownloader(cfg.ID, cfg.ProgressCh, progState, cfg.Runtime)
+		d.ImportThrottleState(cfg)
+		defer d.ExportThrottleState(cfg)
+		d.Headers = cfg.Headers // Forward custom headers from browser extension
+		d.Limiter = cfg.Limiter
+		// Pass effectiveTotalSize here as well
+		downloadErr = d.Download(ctx, cfg.URL, finalDestPath, effectiveTotalSize, finalFilename)
+		if d.TotalSize > 0 {
+			effectiveTotalSize = d.TotalSize
+		}
+		if downloadErr != nil {
+			utils.Debug("Single-threaded download failed: %v", downloadErr)
+		} else {
+			utils.Debug("Single-threaded download completed: %d bytes", effectiveTotalSize)
+		}
+	}
+
+	// Return typed pause error rather than normalizing to nil so callers
+	// can distinguish a clean pause from successful completion or errors.
+	if errors.Is(downloadErr, types.ErrPaused) {
+		utils.Debug("Download paused cleanly")
+		return downloadErr
+	}
+
+	// Physical download success takes precedence over late-arriving pause signals.
+	if downloadErr == nil {
+		// The response length may be unknown or differ from the completed file.
+		// Completion is emitted before the lifecycle promotes the working file.
+		if info, err := os.Stat(finalDestPath + types.IncompleteSuffix); err == nil && info.Mode().IsRegular() {
+			effectiveTotalSize = info.Size()
+		} else if info, err := os.Stat(finalDestPath); err == nil && info.Mode().IsRegular() {
+			effectiveTotalSize = info.Size()
+		}
+		cfg.TotalSize = effectiveTotalSize
+		if cfg.Artifact.ExpectedSHA256 != "" {
+			if progState != nil {
+				progState.Verifying.Store(true)
+			}
+			cfg.Artifact.Verification = "verifying"
+			if cfg.ProgressCh != nil {
+				safeSendProgress(cfg.ProgressCh, types.DownloadEvent{Type: types.EventSystem, DownloadID: cfg.ID, Message: "Verifying SHA-256", Artifact: cfg.Artifact}, ctx.Done())
+			}
+			digest, err := hashArtifact(ctx, finalDestPath+types.IncompleteSuffix)
+			if progState != nil {
+				progState.Verifying.Store(false)
+			}
+			if err != nil {
+				return err
+			}
+			cfg.Artifact.SHA256 = digest
+			if digest != cfg.Artifact.ExpectedSHA256 {
+				cfg.Artifact.Verification = "mismatch"
+				return types.ErrIntegrityMismatch
+			}
+			cfg.Artifact.Verification = "verified"
+		}
+		var elapsed time.Duration
+		if progState != nil {
+			_, elapsed = progState.FinalizeSession(effectiveTotalSize)
+		} else {
+			elapsed = time.Since(start)
+		}
+
+		// Persist to history before sending event
+		// Compute average download speed in bytes/sec
+		var avgSpeed float64
+		if elapsed.Seconds() > 0 {
+			avgSpeed = float64(effectiveTotalSize) / elapsed.Seconds()
+		}
+
+		if cfg.ProgressCh != nil {
+			rateLimit, rateLimitSet := currentRateLimit()
+			// EventComplete is terminal-reliable and must not be dropped due to canceled context.
+			safeSendProgress(cfg.ProgressCh, types.DownloadEvent{
+				Type: types.EventComplete, Artifact: cfg.Artifact,
+				DownloadID:   cfg.ID,
+				Filename:     finalFilename,
+				Elapsed:      elapsed,
+				Total:        effectiveTotalSize,
+				AvgSpeed:     avgSpeed,
+				RateLimit:    rateLimit,
+				RateLimitSet: rateLimitSet,
+			}, nil)
+		}
+		return nil
+	}
+
+	if errors.Is(downloadErr, context.Canceled) || errors.Is(downloadErr, context.DeadlineExceeded) {
+		utils.Debug("Download canceled cleanly")
+		return downloadErr
+	}
+
+	return downloadErr
+}
+
+// shouldFallbackToSingle permits a restart only for confirmed range rejection.
+// Pause, cancellation and disk-full errors take precedence in joined errors.
+func shouldFallbackToSingle(downloadErr error, downloaded int64) bool {
+	if downloadErr == nil {
+		return false
+	}
+	if errors.Is(downloadErr, types.ErrPaused) {
+		return false
+	}
+	if errors.Is(downloadErr, context.Canceled) || errors.Is(downloadErr, context.DeadlineExceeded) {
+		return false
+	}
+	if types.IsInsufficientDiskSpace(downloadErr) {
+		return false
+	}
+	if errors.Is(downloadErr, types.ErrRangeUnsupported) {
+		return true
+	}
+	return false
+}
+
+// Download is the CLI entry point (non-TUI) - convenience wrapper
+func Download(ctx context.Context, url string, outPath string, progressCh chan<- types.DownloadEvent, id string) error {
+	cfg := types.DownloadRecord{
+		URL:           url,
+		OutputPath:    outPath,
+		ID:            id,
+		ProgressCh:    progressCh,
+		ProgressState: nil,
+	}
+	// Default runtime config
+	cfg.Runtime = types.DefaultRuntimeConfig()
+	return RunDownload(ctx, &cfg)
+}

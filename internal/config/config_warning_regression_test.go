@@ -10,31 +10,32 @@ import (
 	"testing"
 )
 
-// TestLoadSettings_CorruptJSON_PopulatesStartupWarning is the primary regression
+// TestLoadSettings_CorruptTOML_PopulatesStartupWarning is the primary regression
 // test for bug 2: corrupt settings must set StartupWarnings, not return silent defaults.
-func TestLoadSettings_CorruptJSON_PopulatesStartupWarning(t *testing.T) {
+func TestLoadSettings_CorruptTOML_PopulatesStartupWarning(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("AppData", t.TempDir())
 
 	surgeDir := GetSurgeDir()
 	if err := os.MkdirAll(surgeDir, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(surgeDir, "settings.json"), []byte("{not valid json!!!"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(surgeDir, "settings.toml"), []byte("[not valid toml!!!"), 0o644); err != nil {
 		t.Fatalf("write corrupt settings: %v", err)
 	}
 
 	settings, err := LoadSettings()
 
 	if err != nil {
-		t.Fatalf("LoadSettings must not return an error for corrupt JSON, got: %v", err)
+		t.Fatalf("LoadSettings must not return an error for corrupt TOML, got: %v", err)
 	}
 	if settings == nil {
-		t.Fatal("LoadSettings returned nil settings for corrupt JSON")
+		t.Fatal("LoadSettings returned nil settings for corrupt TOML")
 	}
 
 	// THE REGRESSION: StartupWarnings must NOT be empty for a corrupt file.
 	if len(settings.StartupWarnings) == 0 {
-		t.Fatal("corrupt settings.json produced no StartupWarnings - config problems would be silently hidden")
+		t.Fatal("corrupt settings.toml produced no StartupWarnings - config problems would be silently hidden")
 	}
 
 	// The warning should mention both the corruption and the reset action.
@@ -47,36 +48,38 @@ func TestLoadSettings_CorruptJSON_PopulatesStartupWarning(t *testing.T) {
 	}
 }
 
-// TestLoadSettings_TruncatedJSON_PopulatesStartupWarning covers the crash-during-write
+// TestLoadSettings_TruncatedTOML_PopulatesStartupWarning covers the crash-during-write
 // scenario (atomically incomplete file).
-func TestLoadSettings_TruncatedJSON_PopulatesStartupWarning(t *testing.T) {
+func TestLoadSettings_TruncatedTOML_PopulatesStartupWarning(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("AppData", t.TempDir())
 
 	surgeDir := GetSurgeDir()
 	if err := os.MkdirAll(surgeDir, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	truncated := `{"general": {"default_download_dir": "/home/user/Downloads", "warn_on_duplicate": tr`
-	if err := os.WriteFile(filepath.Join(surgeDir, "settings.json"), []byte(truncated), 0o644); err != nil {
+	truncated := "[general]\ndefault_download_dir = \"/home/user/Downloads\"\nwarn_on_duplicate = tr"
+	if err := os.WriteFile(filepath.Join(surgeDir, "settings.toml"), []byte(truncated), 0o644); err != nil {
 		t.Fatalf("write truncated settings: %v", err)
 	}
 
 	settings, err := LoadSettings()
 
 	if err != nil {
-		t.Fatalf("LoadSettings must not return an error for truncated JSON, got: %v", err)
+		t.Fatalf("LoadSettings must not return an error for truncated TOML, got: %v", err)
 	}
 	if settings == nil {
-		t.Fatal("LoadSettings returned nil for truncated JSON")
+		t.Fatal("LoadSettings returned nil for truncated TOML")
 	}
 	if len(settings.StartupWarnings) == 0 {
-		t.Fatal("truncated settings.json produced no StartupWarnings - config problems would be silently hidden")
+		t.Fatal("truncated settings.toml produced no StartupWarnings - config problems would be silently hidden")
 	}
 }
 
 // TestLoadSettings_ValidSettings_NoStartupWarnings ensures clean configs stay quiet.
 func TestLoadSettings_ValidSettings_NoStartupWarnings(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("AppData", t.TempDir())
 
 	defaults := DefaultSettings()
 	if err := SaveSettings(defaults); err != nil {
@@ -99,7 +102,8 @@ func TestLoadSettings_ValidSettings_NoStartupWarnings(t *testing.T) {
 // no settings file exists - this is expected and must not produce warnings.
 func TestLoadSettings_MissingFile_NoStartupWarnings(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-	// No file created - GetSurgeDir() path doesn't exist, settings.json absent.
+	t.Setenv("AppData", t.TempDir())
+	// No file created - GetSurgeDir() path doesn't exist, settings.toml absent.
 
 	settings, err := LoadSettings()
 	if err != nil {
@@ -203,16 +207,17 @@ func TestValidate_ClearsOldWarningsOnRevalidation(t *testing.T) {
 	}
 }
 
-// TestLoadSettings_CorruptJSON_ReturnsDefaultValues verifies that the returned
+// TestLoadSettings_CorruptTOML_ReturnsDefaultValues verifies that the returned
 // settings are actually defaults, not a partially-parsed struct.
-func TestLoadSettings_CorruptJSON_ReturnsDefaultValues(t *testing.T) {
+func TestLoadSettings_CorruptTOML_ReturnsDefaultValues(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("AppData", t.TempDir())
 
 	surgeDir := GetSurgeDir()
 	if err := os.MkdirAll(surgeDir, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(surgeDir, "settings.json"), []byte("GARBAGE"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(surgeDir, "settings.toml"), []byte("GARBAGE"), 0o644); err != nil {
 		t.Fatalf("write corrupt settings: %v", err)
 	}
 

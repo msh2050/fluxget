@@ -49,6 +49,7 @@ export function buildPortScanCandidates(
   startPort: number,
   portCount: number,
   preferredUrls: Array<string | null | undefined> = [],
+  baseHost: string = '127.0.0.1',
 ): string[] {
   const candidates: string[] = [];
   const seen = new Set<string>();
@@ -62,7 +63,7 @@ export function buildPortScanCandidates(
 
   preferredUrls.forEach(addCandidate);
   for (let port = startPort; port < startPort + portCount; port++) {
-    addCandidate(`http://127.0.0.1:${port}`);
+    addCandidate(`http://${baseHost}:${port}`);
   }
 
   return candidates;
@@ -115,6 +116,7 @@ interface DownloadRequestBodyOptions {
   directory: string;
   headers: Record<string, string>;
   skipApproval?: boolean;
+  skipDuplicateWarning?: boolean;
 }
 
 export function buildDownloadRequestBody(opts: DownloadRequestBodyOptions): Record<string, unknown> {
@@ -123,6 +125,7 @@ export function buildDownloadRequestBody(opts: DownloadRequestBodyOptions): Reco
     filename: opts.filename,
     headers: Object.keys(opts.headers).length > 0 ? opts.headers : undefined,
     skip_approval: opts.skipApproval === true ? true : undefined,
+    skip_duplicate_warning: opts.skipDuplicateWarning === true ? true : undefined,
   };
 
   if (opts.directory) body.path = opts.directory;
