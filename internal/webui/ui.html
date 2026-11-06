@@ -1100,7 +1100,14 @@ function renderView() {
     case 'settings':  content = renderSettings(); break;
     default: content = renderDashboard();
   }
+  // The scroll container (.fg-content) is recreated on every render, so keep
+  // its scroll position when re-rendering the same view (progress ticks).
+  const prev = main.querySelector('.fg-content');
+  const keepScroll = prev && main.dataset.view === state.view ? prev.scrollTop : 0;
   main.innerHTML = content;
+  main.dataset.view = state.view;
+  const next = main.querySelector('.fg-content');
+  if (next && keepScroll) next.scrollTop = keepScroll;
 
   if (state.view === 'dashboard') {
     renderSpeedGraph('speed-graph');
@@ -1111,6 +1118,9 @@ function renderView() {
 let renderQueued = false;
 function scheduleRender() {
   if (renderQueued) return;
+  // Settings don't depend on download events; re-rendering would wipe
+  // whatever the user is typing.
+  if (state.view === 'settings') return;
   renderQueued = true;
   requestAnimationFrame(() => {
     renderQueued = false;
